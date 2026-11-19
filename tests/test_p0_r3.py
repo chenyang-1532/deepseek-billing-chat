@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -197,6 +198,45 @@ try:
        len(set(contents)) == 9, sorted(set(contents)))
 finally:
     shutil.rmtree(udir, ignore_errors=True)
+
+print("═══ 5. inflight 僵尸额度 TTL 自愈（审查 R5/P2） ═══")
+# 根因：StreamingResponse 的 gen() 是惰性生成器，从未被消费则 finally 不执行
+# （未启动的生成器 close()/GC 都不跑 finally），release 永不调用；
+# 原实现无 TTL → CAP=3 漏 3 次该 uid 永久 429，只能重启进程恢复。
+_test_uid = 7770001
+_orig_ent = A._GW_INFLIGHT.pop(_test_uid, None)
+try:
+    r = [A._gw_inflight_acquire(_test_uid) for _ in range(4)]
+    ck("连续泄漏 3 次后第 4 次被拒", r == [True, True, True, False], r)
+    ck("泄漏后 inflight=[3, ts] 且无自愈路径前的再拒", A._gw_inflight_acquire(_test_uid) is False)
+    # 模拟僵尸：last_ts 拨回 400s 前（> ZOMBIE 330s）
+    A._GW_INFLIGHT[_test_uid][1] = time.time() - 400
+    r5 = A._gw_inflight_acquire(_test_uid)
+    ck("超 330s 僵尸额度回收 → 第 5 次自愈成功且归 1",
+       r5 is True and A._GW_INFLIGHT[_test_uid][0] == 1, A._GW_INFLIGHT.get(_test_uid))
+    # 正常路径：release ×4 归 0，之后可正常 acquire
+    A._GW_INFLIGHT[_test_uid] = [3, time.time()]
+    for _ in range(4):
+        A._gw_inflight_release(_test_uid)
+    ck("正常 release ×4 → count 归 0", A._GW_INFLIGHT[_test_uid][0] == 0, A._GW_INFLIGHT[_test_uid])
+    ck("归 0 后可正常 acquire", A._gw_inflight_acquire(_test_uid) is True)
+    # 未超 TTL 不回收（防误杀正常长回答）
+    A._GW_INFLIGHT[_test_uid] = [1, time.time() - 100]
+    ck("100s < 330s 不回收（不误杀长回答）", A._gw_inflight_acquire(_test_uid) is True
+       and A._GW_INFLIGHT[_test_uid][0] == 2, A._GW_INFLIGHT[_test_uid])
+    # Python 语义根因证据：未启动生成器的 finally 确实不执行
+    def _unstarted_gen():
+        try:
+            yield 1
+        finally:
+            raise AssertionError("未消费生成器不应执行 finally")
+    _unstarted_gen().close()
+    ck("未启动生成器 close() 不触发 finally（根因语义确认）", True)
+finally:
+    if _orig_ent is not None:
+        A._GW_INFLIGHT[_test_uid] = _orig_ent
+    else:
+        A._GW_INFLIGHT.pop(_test_uid, None)
 
 print("\n总结果: 过 %d / 挂 %d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

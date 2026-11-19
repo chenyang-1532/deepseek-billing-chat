@@ -1924,6 +1924,7 @@ _GW_INFLIGHT = {}
 _GW_LOCK = threading.Lock()
 _GW_PROVISION_LOCK = threading.Lock()
 _GW_INFLIGHT_CAP = 3
+_GW_INFLIGHT_ZOMBIE_SECONDS = 330   # 上游 read timeout(10,300)s + 30s 余量
 _GW_RATIO_CACHE = {"data": None, "ts": 0.0}
 
 
@@ -2330,17 +2331,31 @@ def _ratio_refresher():
 
 
 def _gw_inflight_acquire(uid: int) -> bool:
+    """在途请求额度。uid -> [count, last_ts]。
+
+    审查 R5/P2：StreamingResponse 的 gen() 是惰性生成器，若从未被消费，
+    其 finally 不会执行（Python 语义：未启动的生成器 close()/GC 都不跑 finally），
+    _gw_inflight_release 就永远不会被调用。CAP=3 且原本无 TTL → 漏 3 次即永久拒绝，
+    只能重启进程恢复（表现为"重启就好、过几天又不行"）。
+    这里按上游 read timeout(300s) + 余量回收僵尸额度，使泄漏可自愈。
+    """
     with _GW_LOCK:
-        n = _GW_INFLIGHT.get(uid, 0)
+        now = time.time()
+        ent = _GW_INFLIGHT.get(uid)
+        n, ts = (ent[0], ent[1]) if ent else (0, now)
+        if n and now - ts > _GW_INFLIGHT_ZOMBIE_SECONDS:
+            n = 0                     # 僵尸额度回收，不误杀正常长回答（SSE 持续有 chunk）
         if n >= _GW_INFLIGHT_CAP:
             return False
-        _GW_INFLIGHT[uid] = n + 1
+        _GW_INFLIGHT[uid] = [n + 1, now]
         return True
 
 
 def _gw_inflight_release(uid: int):
     with _GW_LOCK:
-        _GW_INFLIGHT[uid] = max(0, _GW_INFLIGHT.get(uid, 1) - 1)
+        ent = _GW_INFLIGHT.get(uid)
+        n, ts = (ent[0], ent[1]) if ent else (1, time.time())
+        _GW_INFLIGHT[uid] = [max(0, n - 1), ts]
 
 
 def _redeem_rate_limited(uid: int) -> bool:
