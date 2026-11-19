@@ -34,7 +34,7 @@ def req(path, data=None, method=None):
 print("── A. 时段倍率核心逻辑 ──")
 import app as A
 from _guard import guard, assert_restart_allowed
-guard()
+guard(A.DB_PATH)
 
 # A1 无规则默认
 A.set_setting(A.GW_TIME_MULT_KEY, json.dumps({"default": 1.0, "rules": []}))

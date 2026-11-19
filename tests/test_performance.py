@@ -3,6 +3,12 @@ import sys
 """第十一部分：性能测试（真实请求打到完整计费链路）
 会话 cookie 按站点 sign() 算法本地构造（仅用于压测登录环节，计费链路完全真实）。
 指标：成功率 / 平均 / P95 / P99 延迟 / 错误率 / 服务进程 CPU·内存 / 余额正确性
+
+R5（审查 R3/P0-测试安全）：
+- 数据库路径不再硬编码，必须 RT_SITE_DB / RT_NAPI_DB 显式传入，缺失即 SKIP；
+- 任何 sqlite3.connect 之前先过 guard()，生产机直接退出码 2 拒绝；
+- 清理段用 try/finally 包住用例体——中途异常也必须删掉直插的压测账号/token，
+  不留孤儿 unlimited_quota Key 在库中。
 """
 import concurrent.futures as cf
 import json
@@ -13,14 +19,21 @@ import subprocess
 import time
 import urllib.request
 
-import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _guard import guard  # noqa: E402
+
 TAG = os.environ.get("RT_TAG", "")
 
-BASE = "http://127.0.0.1:3000"
-SITE = "/tmp/chatsite-test"
-SITE_DB = SITE + "/data.db"
-NAPI = "/opt/newapi/one-api.db"
-SECRET = open(SITE + "/secret.key", "rb").read()
+BASE = os.environ.get("RT_BASE", "http://127.0.0.1:3000")
+SITE = os.environ.get("RT_SITE_DIR", "")
+SITE_DB = os.environ.get("RT_SITE_DB", "")
+NAPI = os.environ.get("RT_NAPI_DB", "")
+if not (SITE_DB and NAPI):
+    print("[SKIP] RT_SITE_DB / RT_NAPI_DB 未设置，跳过性能测试（防止误写生产库）")
+    sys.exit(0)
+guard(SITE_DB, NAPI)          # 必须在任何 connect 之前
+SITE = SITE or os.path.dirname(SITE_DB)
+SECRET = open(os.path.join(SITE, "secret.key"), "rb").read()
 QUSD, USD2CNY = 500000, 7.2
 PASS, FAIL = 0, 0
 
@@ -155,58 +168,71 @@ def run_load(n_users, req_per_user):
     }
 
 
-cpu0, mem0 = proc_stats("uvicorn app:app")
+# R5：try/finally 包住整个用例体——中途异常也必须执行清理段，
+# 不留直插账号 / unlimited_quota 孤儿 Key 在库中（审查 P0-测试安全）
 results = {}
-for n_users, rpu in ((10, 2), (50, 2), (100, 2)):
-    r = run_load(n_users, rpu)
-    results["users%d" % n_users] = r
-    print("  %3d用户×%d请求: 成功%d/%d 错误率%.1f%% 平均%.0fms P95=%.0fms P99=%.0fms 墙钟%.1fs 吞吐%.1frps 负余额用户%d"
-          % (n_users, rpu, r["success"], r["requests"], r["error_rate"], r["avg_ms"], r["p95_ms"],
-             r["p99_ms"], r["wall_s"], r["throughput_rps"], r["neg_balance_users"]))
-cpu1, mem1 = proc_stats("uvicorn app:app")
+q_ms = 0.0
+cpu0, mem0 = proc_stats("uvicorn app:app")
+try:
+    for n_users, rpu in ((10, 2), (50, 2), (100, 2)):
+        r = run_load(n_users, rpu)
+        results["users%d" % n_users] = r
+        print("  %3d用户×%d请求: 成功%d/%d 错误率%.1f%% 平均%.0fms P95=%.0fms P99=%.0fms 墙钟%.1fs 吞吐%.1frps 负余额用户%d"
+              % (n_users, rpu, r["success"], r["requests"], r["error_rate"], r["avg_ms"], r["p95_ms"],
+                 r["p99_ms"], r["wall_s"], r["throughput_rps"], r["neg_balance_users"]))
+    cpu1, mem1 = proc_stats("uvicorn app:app")
 
-print("\n─── 服务资源占用 ───")
-print("  uvicorn: CPU %.1f%%→%.1f%%  内存 %.0fMB→%.0fMB" % (cpu0, cpu1, mem0, mem1))
-cpu_na, mem_na = proc_stats("./new-api")
-print("  new-api: CPU %.1f%%  内存 %.0fMB" % (cpu_na, mem_na))
+    print("\n─── 服务资源占用 ───")
+    print("  uvicorn: CPU %.1f%%→%.1f%%  内存 %.0fMB→%.0fMB" % (cpu0, cpu1, mem0, mem1))
+    cpu_na, mem_na = proc_stats("./new-api")
+    print("  new-api: CPU %.1f%%  内存 %.0fMB" % (cpu_na, mem_na))
 
-ck("100并发下无负余额", results["users100"]["neg_balance_users"] == 0)
-ck("10并发错误率<5%", results["users10"]["error_rate"] < 5, results["users10"]["error_rate"])
-ck("50并发错误率<10%", results["users50"]["error_rate"] < 10, results["users50"]["error_rate"])
-ck("100并发错误率<20%", results["users100"]["error_rate"] < 20, results["users100"]["error_rate"])
+    ck("100并发下无负余额", results["users100"]["neg_balance_users"] == 0)
+    ck("10并发错误率<5%", results["users10"]["error_rate"] < 5, results["users10"]["error_rate"])
+    ck("50并发错误率<10%", results["users50"]["error_rate"] < 10, results["users50"]["error_rate"])
+    ck("100并发错误率<20%", results["users100"]["error_rate"] < 20, results["users100"]["error_rate"])
 
-# ── 大量记录查询性能 ──
-t1 = time.time()
-c = sqlite3.connect(NAPI, timeout=15)
-c.execute("SELECT COUNT(*) FROM logs WHERE type=2").fetchone()
-q_ms = (time.time() - t1) * 1000
-print("  流水表聚合查询: %.1fms（当前 logs %d 行）" % (q_ms, c.execute("SELECT COUNT(*) FROM logs").fetchone()[0]))
-c.close()
-
-# ── 清理 ──
-site = sqlite3.connect(SITE_DB, timeout=30)
-napi = sqlite3.connect(NAPI, timeout=30)
-uids = [r[0] for r in site.execute("SELECT id FROM users WHERE username LIKE 'rttest%s_perf_'" % TAG).fetchall()]
-nids = [r[0] for r in site.execute("SELECT napi_uid FROM gateway_map WHERE uid IN (%s)" % ",".join(map(str, uids))).fetchall()] if uids else []
-site.execute("DELETE FROM gateway_map WHERE uid IN (%s)" % ",".join(map(str, uids or [0])))
-site.execute("DELETE FROM users WHERE username LIKE 'rttest%s_perf_'" % TAG)
-site.commit()
-for nid in nids:
-    napi.execute("DELETE FROM logs WHERE user_id=?", (nid,))
-    napi.execute("DELETE FROM tokens WHERE user_id=?", (nid,))
-    napi.execute("DELETE FROM users WHERE id=?", (nid,))
-napi.commit()
-site.close()
-napi.close()
-print("rttest_perf_* 已清理")
+    # ── 大量记录查询性能 ──
+    t1 = time.time()
+    c = sqlite3.connect(NAPI, timeout=15)
+    c.execute("SELECT COUNT(*) FROM logs WHERE type=2").fetchone()
+    q_ms = (time.time() - t1) * 1000
+    print("  流水表聚合查询: %.1fms（当前 logs %d 行）" % (q_ms, c.execute("SELECT COUNT(*) FROM logs").fetchone()[0]))
+    c.close()
+except Exception as e:
+    FAIL += 1
+    ck("性能测试主体未异常", False, repr(e))
+finally:
+    # ── 清理（保证执行） ──
+    try:
+        site = sqlite3.connect(SITE_DB, timeout=30)
+        napi = sqlite3.connect(NAPI, timeout=30)
+        uids = [r[0] for r in site.execute("SELECT id FROM users WHERE username LIKE 'rttest%s_perf_'" % TAG).fetchall()]
+        nids = [r[0] for r in site.execute("SELECT napi_uid FROM gateway_map WHERE uid IN (%s)" % ",".join(map(str, uids))).fetchall()] if uids else []
+        site.execute("DELETE FROM gateway_map WHERE uid IN (%s)" % ",".join(map(str, uids or [0])))
+        site.execute("DELETE FROM users WHERE username LIKE 'rttest%s_perf_'" % TAG)
+        site.commit()
+        for nid in nids:
+            napi.execute("DELETE FROM logs WHERE user_id=?", (nid,))
+            napi.execute("DELETE FROM tokens WHERE user_id=?", (nid,))
+            napi.execute("DELETE FROM users WHERE id=?", (nid,))
+        napi.commit()
+        site.close()
+        napi.close()
+        print("rttest_perf_* 已清理")
+    except Exception as _ce:
+        print("⚠️ 清理段异常（可能残留 rttest%s_perf_* 直插账号，需手工核查！）: %r" % (TAG, _ce))
 print("══════════════")
 print("性能测试: ✅通过 %d  ❌失败 %d" % (PASS, FAIL))
 
 os.makedirs("/root/.codebuddy/artifact/delivery/test_results", exist_ok=True)
-with open("/root/.codebuddy/artifact/delivery/test_results/perf_result.json", "w") as f:
-    json.dump({"results": results, "uvicorn_cpu": [cpu0, cpu1], "uvicorn_mem_mb": [mem0, mem1],
-               "newapi_cpu": cpu_na, "newapi_mem_mb": mem_na, "logs_query_ms": round(q_ms, 1)}, f, ensure_ascii=False, indent=2)
-print("结果已存 delivery/test_results/perf_result.json")
+try:
+    with open("/root/.codebuddy/artifact/delivery/test_results/perf_result.json", "w") as f:
+        json.dump({"results": results, "uvicorn_cpu": [cpu0, cpu1], "uvicorn_mem_mb": [mem0, mem1],
+                   "newapi_cpu": cpu_na, "newapi_mem_mb": mem_na, "logs_query_ms": round(q_ms, 1)}, f, ensure_ascii=False, indent=2)
+    print("结果已存 delivery/test_results/perf_result.json")
+except Exception as _je:
+    print("结果文件未写出（主体中途异常时中间变量可能缺失）: %r" % _je)
 
 
 # P1-13：失败必须非零退出

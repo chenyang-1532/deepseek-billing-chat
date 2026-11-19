@@ -1,0 +1,35 @@
+{
+  "ts": 1795117074.888066,
+  "fetched_at": "2026-11-20T03:37:54",
+  "url": "https://api-docs.deepseek.com/quick_start/pricing",
+  "parsed": {
+    "deepseek-flash": {
+      "in_hit": [
+        0.003,
+        0.006
+      ],
+      "in_miss": [
+        0.15,
+        0.3
+      ],
+      "out": [
+        0.6,
+        1.2
+      ]
+    },
+    "deepseek-v4-pro": {
+      "in_hit": [
+        0.022,
+        0.044
+      ],
+      "in_miss": [
+        0.66,
+        1.32
+      ],
+      "out": [
+        1.98,
+        3.96
+      ]
+    }
+  }
+}

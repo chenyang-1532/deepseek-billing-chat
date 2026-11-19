@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# 密钥与站点数据（审查 R3/P2：没有 .gitignore 时一次 git add -A 就会把它们提交进去）
+secret.key
+secret.key.*
+*.lock
+.admin_password
+data.db
+official_price_snapshot.html
+official_price_snapshot.html.meta.json
+
+# 用户数据
+snapshots/

@@ -13,6 +13,11 @@ cd "$(dirname "$0")/.."
 export RT_TAG="${RT_TAG:-runner$(date +%H%M%S)}"
 export RT_ALLOWED_DB_DIRS="${RT_ALLOWED_DB_DIRS:-/opt/newapi}"   # 沙箱测试实例声明；生产机请勿声明
 export RT_ALLOW_RESTART="${RT_ALLOW_RESTART:-1}"                 # 沙箱测试实例允许重启；生产机必须显式关闭
+# R5（审查 R3/P0-测试安全）：performance 套件必须显式拿到测试库路径，
+# 未设置时该套件自SKIP——生产机即使跑到这里也写不进任何库。
+export RT_SITE_DIR="${RT_SITE_DIR:-/tmp/chatsite-test}"
+export RT_SITE_DB="${RT_SITE_DB:-$RT_SITE_DIR/data.db}"
+export RT_NAPI_DB="${RT_NAPI_DB:-/opt/newapi/one-api.db}"
 FAIL=0
 RESULTS=()
 

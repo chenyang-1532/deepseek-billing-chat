@@ -23,7 +23,7 @@ def mkzip(entries):
 
 
 S = "chat_sessions/"
-guard()
+guard(A.DB_PATH)
 sid = str(uuid.uuid4())
 sess = json.dumps({"id": sid, "title": "t", "updated_at": "1", "messages": []}).encode()
 

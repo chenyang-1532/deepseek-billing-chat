@@ -846,7 +846,21 @@ def api_backup_get(request: Request):
         if row is None:
             return Response(status_code=404)
         data = _build_archive(c, user["id"])
-    return Response(content=data, media_type="application/zip")
+        # R5（审查 R3）：回传各会话最新 rev，供新版前端拉取后重建 base_revs 缓存
+        revs = {
+            r["sid"]: (r["rev"] or 0)
+            for r in c.execute(
+                "SELECT sid, rev FROM cloud_sessions WHERE uid=? AND deleted=0", (user["id"],)
+            ).fetchall()
+        }
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": "attachment; filename=cloud-backup.zip",
+            "X-Cloud-Revs": json.dumps(revs, separators=(",", ":")),
+        },
+    )
 
 
 def _parse_ts(value: str):
@@ -1078,6 +1092,12 @@ def api_restore_get(request: Request):
     )
 
 
+def _snap_key(n: str):
+    """快照文件名排序键：'1700000000001-ab12cd34.zip' → (ms, 名字)。
+    兼容审查 R2 前的旧格式 '{now_ms}.zip'（无 '-' 后缀段）。"""
+    return (int(n[:-4].split("-")[0]), n)
+
+
 def _save_snapshot(uid: int, data: bytes, now_ms: int) -> None:
     """把用户上传的完整导出包原样存到磁盘（审计用；恢复走 /api/restore 服务端合并状态）。"""
     try:
@@ -1087,11 +1107,10 @@ def _save_snapshot(uid: int, data: bytes, now_ms: int) -> None:
         tmp = os.path.join(udir, ".tmp-%s" % uuid.uuid4().hex)
         with open(tmp, "wb") as f:
             f.write(data)
-        os.replace(tmp, os.path.join(udir, f"{now_ms}.zip"))
-        snaps = sorted(
-            (f for f in os.listdir(udir) if f.endswith(".zip")),
-            key=lambda n: int(n[:-4]),
-        )
+        # R5（审查 R3）：最终文件名也带随机后缀——同毫秒并发上传各留一份，
+        # 不再互相覆盖（原 '{now_ms}.zip' 同 ms 直接覆盖，8 份只剩 1 份）
+        os.replace(tmp, os.path.join(udir, "%d-%s.zip" % (now_ms, uuid.uuid4().hex[:8])))
+        snaps = sorted((f for f in os.listdir(udir) if f.endswith(".zip")), key=_snap_key)
         for old in snaps[:-SNAP_KEEP]:
             try:
                 os.remove(os.path.join(udir, old))
@@ -1106,10 +1125,7 @@ def _latest_snapshot(uid: int) -> bytes | None:
     """取该用户最新的一份完整导出包。"""
     udir = os.path.join(SNAP_DIR, str(uid))
     try:
-        snaps = sorted(
-            (f for f in os.listdir(udir) if f.endswith(".zip")),
-            key=lambda n: int(n[:-4]),
-        )
+        snaps = sorted((f for f in os.listdir(udir) if f.endswith(".zip")), key=_snap_key)
         if not snaps:
             return None
         with open(os.path.join(udir, snaps[-1]), "rb") as f:
@@ -2035,12 +2051,22 @@ def _parse_official_page(text: str) -> dict | None:
 
 def fetch_official_prices() -> tuple[dict, bool]:
     """实时抓取官方定价页；成功返回 (数据, True)，失败沿用缓存/默认并返回 (数据, False)。
-    告警（审查 P1-06）：成功后对比旧价，变动>5% 落 price_change_alert；失败且缓存>24h 落 price_stale_alert。"""
+    告警（审查 P1-06）：成功后对比旧价，变动>5% 落 price_change_alert；失败且缓存>24h 落 price_stale_alert。
+    R5（审查 R3）：每次成功抓取把**原始响应**原样落盘 BASE/official_price_snapshot.html
+    （+ .meta.json 记录抓取时间），作为 CacheRatio / 模型倍数的可查证据，不经过任何改写。"""
     try:
         req = urllib.request.Request(OFFICIAL_PRICE_URL, headers={"User-Agent": "Mozilla/5.0 (billing-sync)"})
         text = urllib.request.urlopen(req, timeout=15).read().decode(errors="replace")
         parsed = _parse_official_page(text)
         if parsed:
+            try:
+                with open(os.path.join(BASE, "official_price_snapshot.html"), "w", encoding="utf-8") as _f:
+                    _f.write(text)
+                with open(os.path.join(BASE, "official_price_snapshot.html.meta.json"), "w", encoding="utf-8") as _f:
+                    json.dump({"ts": time.time(), "fetched_at": site_now().isoformat(timespec="seconds"),
+                               "url": OFFICIAL_PRICE_URL, "parsed": parsed}, _f, ensure_ascii=False, indent=2)
+            except OSError as _se:
+                print("[official-price] ⚠️ 官方价快照落盘失败（不影响计费）: %s" % _se)
             _check_price_stale(clear=True)
             _check_price_change(parsed)
             data = {"ts": time.time(), "models": parsed}

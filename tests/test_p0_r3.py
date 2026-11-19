@@ -150,26 +150,50 @@ ck("pro cache 比值 = %s" % exp_pro, cache.get("deepseek-v4-pro") == exp_pro,
    cache.get("deepseek-v4-pro"))
 ck("比值 ≤ 0.05（宁可少收不多收）", all(v <= 0.05 for v in cache.values() if v), cache)
 
+# R5（审查 R3）：CacheRatio 0.02 vs new-api 内置 0.25 之争，以官方页原始响应为据。
+# tests/fixtures/official_prices_snapshot.html 是 fetch_official_prices() 抓到的原始页面存档，
+# 站点运行时每次成功抓取也会落盘 BASE/official_price_snapshot.html。断言：
+# ① 存档快照用 _parse_official_page 解析出的价格与 OFFICIAL_PRICES_DEFAULT 一致；
+# ② 命中价/未命中价 = CacheRatio 写入值（0.02 / 0.033333），官方页原文背书。
+_snap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "official_prices_snapshot.html")
+if os.path.exists(_snap_path):
+    _parsed = A._parse_official_page(open(_snap_path, encoding="utf-8").read())
+    ck("官方价快照可解析且与默认价一致", bool(_parsed) and all(
+        _parsed.get(m, {}).get(k) == d.get(m, {}).get(k)
+        for m in d for k in ("in_hit", "in_miss", "out")),
+        {m: {k: (_parsed or {}).get(m, {}).get(k), "默认": d[m][k]} for m in d for k in ("in_hit", "in_miss", "out")})
+    ck("快照比值反推 = CacheRatio 写入值（官方页原文背书 0.02）", bool(_parsed) and all(
+        round(min(_parsed[m]["in_hit"][i] / _parsed[m]["in_miss"][i] for i in (0, 1)), 6) == cache.get(m)
+        for m in cache if m in _parsed and _parsed[m].get("in_hit") and _parsed[m].get("in_miss")),
+        {m: cache.get(m) for m in cache})
+else:
+    ck("官方价快照存档存在（tests/fixtures/）", False, _snap_path)
+
 print("═══ 4. 并发上传存档不互相覆盖 ═══")
 udir = tempfile.mkdtemp(prefix="rt_snap_")
 try:
     orig = A.SNAP_DIR
     A.SNAP_DIR = udir
-    A._save_snapshot(99999901, b"A" * 10, 1700000000000)
+    A._save_snapshot(99999901, b"Z" * 10, 1700000000000)
     with concurrent.futures.ThreadPoolExecutor(8) as ex:
         fs = [ex.submit(A._save_snapshot, 99999901, bytes([65 + i]) * 10, 1700000000001)
               for i in range(8)]
         for f in fs:
             f.result()
     A.SNAP_DIR = orig
-    # 结构：SNAP_DIR/<uid>/<ts>.zip（并发时每个快照独立文件名，互不覆盖）
+    # 结构：SNAP_DIR/<uid>/<ts>-<rand>.zip（并发时每个快照独立文件名，互不覆盖）
     ufiles = sorted(os.listdir(os.path.join(udir, "99999901")))
-    ck("并发 8 次上传全部无异常完成（保留策略 SNAP_KEEP=%d，最终 ≤%d 份）" % (A.SNAP_KEEP, A.SNAP_KEEP),
-       1 <= len(ufiles) <= A.SNAP_KEEP, (len(ufiles), ufiles))
+    # R5（审查 R3）：断言收紧——同毫秒 8 次并发上传必须全部留存（1 份基线 + 8 份并发），
+    # 原断言 `1 <= len(ufiles)` 把同 ms 覆盖 bug（8 份只剩 1 份）判成了绿
+    ck("并发 8 次同 ms 上传全部留存（1 基线 + 8 并发 = 9 份，SNAP_KEEP=%d 内）" % A.SNAP_KEEP,
+       len(ufiles) == 9, (len(ufiles), ufiles))
     ck("全部为独立 .zip（无固定 .tmp 覆盖）", all(f.endswith(".zip") for f in ufiles), ufiles)
-    # 每个快照内容完整（10 字节），未串写
-    ok = all(len(open(os.path.join(udir, "99999901", f), "rb").read()) == 10 for f in ufiles)
+    # 每个快照内容完整（10 字节），未串写；且 8 份并发内容互不相同
+    contents = [open(os.path.join(udir, "99999901", f), "rb").read() for f in ufiles]
+    ok = all(len(c) == 10 for c in contents)
     ck("全部快照内容完整无串写", ok)
+    ck("8 份并发快照内容互不相同（真唯一而非覆盖后同内容）",
+       len(set(contents)) == 9, sorted(set(contents)))
 finally:
     shutil.rmtree(udir, ignore_errors=True)
 

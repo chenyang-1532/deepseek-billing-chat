@@ -10,6 +10,13 @@ import sys
 
 
 def guard(*db_paths) -> None:
+    # R5（审查 R3）：无参调用视为编程错误——空列表 bad=[] 会永远放行，
+    # 等于假防护。必须显式传入待检查的库路径。
+    if not db_paths:
+        sys.stdout.write(
+            "\033[91m[TEST-GUARD] guard() 必须传入待检查的库路径（无参=永远放行=假防护）\033[0m\n")
+        sys.stdout.flush()
+        sys.exit(2)
     allowed = [p.strip() for p in os.environ.get("RT_ALLOWED_DB_DIRS", "").split(",") if p.strip()]
 
     def ok(p):
