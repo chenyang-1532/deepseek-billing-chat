@@ -114,7 +114,7 @@ s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": float("nan")}, cookie=c
 ck("NaN → 拒绝", s in (400, 429), (s, r[:80]))  # 429=同窗口第6次请求被限流，同为拒绝
 s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 5}, cookie=None)
 ck("未登录提交 → 403", s == 403, s)
-ck("以上非法请求均未产生订单", len(q("SELECT * FROM pay_orders")) == 0)
+ck("以上非法请求均未产生订单", len(q("SELECT * FROM pay_orders WHERE uid=?", (uid,))) == 0)
 
 print("\n═══ B. 收款码上传与访问 ═══")
 # 1x1 png

@@ -38,6 +38,7 @@ cp -a /path/to/secret.key /backup/secret.key   # 0600 权限一并保留
 | 变量/文件 | 含义 |
 |---|---|
 | `ADMIN_PASSWORD` | 管理面板密码（systemd 服务文件内，泄露按已泄露处理：轮换见 §6） |
+| `SITE_TZ` | **站点时区（默认 Asia/Shanghai）**：时段倍率规则、"今日消费"起点、订单/流水时间戳的基准。Docker/云主机默认 UTC 会导致规则整体偏 8 小时——**务必显式设置** `SITE_TZ=Asia/Shanghai`（systemd: `Environment=SITE_TZ=Asia/Shanghai`；docker: `-e SITE_TZ=Asia/Shanghai`）。启动日志会打印生效时区。官方峰谷判定例外：固定按 UTC（DeepSeek 官方口径） |
 | `NEWAPI_DB` | new-api 库路径（默认 `/opt/newapi/one-api.db`），站点直连其 options/users 表 |
 | `GATEWAY_ENABLED` | 网关计费总开关（环境变量），配合 `gateway.on` 文件双保险 |
 | `data.db` 设置表 | `gw_default_model`（强制改写的模型）、`gw_multipliers`（每模型倍数）、时段倍率规则等，管理面板可改 |
@@ -85,7 +86,7 @@ server {
 | 任务 | 操作 |
 |---|---|
 | 看余额对账 | 管理面板 → 状态页（`/admin`）；不变量：`new-api users.quota == Σ充值 − Σ消费` |
-| 官方价同步 | 后台每 10 分钟自动抓取 api-docs.deepseek.com 并重算三组倍率；面板定价区显示数据时间与变动/stale 红色告警 |
+| 官方价同步 | 后台每 10 分钟自动抓取 api-docs.deepseek.com 并重算三组倍率；面板定价区显示数据时间与变动/stale 红色告警；**峰谷=UTC 周一至五 01:00-04:00 与 06:00-10:00，法定节假日全天谷时（`CN_HOLIDAYS` 每年按国务院通知更新一次，需指定负责人）** |
 | 充值审批 | 面板审批 `pay_orders`（pending→processing 原子占单，可安全重复点） |
 | 兑换码 | 面板生成（一次性响应页）；状态机 unused→processing→used，崩溃自动恢复 |
 | 用户会话全失效 | 删/清空 `secret.key` 即可（自动轮换新密钥） |

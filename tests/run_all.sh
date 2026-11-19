@@ -41,6 +41,7 @@ run money_security python3.11 tests/test_money_security.py
 cooldown
 run p0_saga       python3.11 tests/test_p0_saga.py
 run p0_r3         python3.11 tests/test_p0_r3.py
+run p0_acceptance python3.11 tests/test_p0_acceptance.py
 run p1_sid        python3.11 tests/test_p1_sid.py
 run p1_cloud      python3.11 tests/test_p1_cloud.py
 run p1_price      python3.11 tests/test_p1_price.py

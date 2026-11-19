@@ -72,7 +72,7 @@ function build(inp){
     .then(function(r){return r.json().then(function(j){return {s:r.status,j:j}})})
     .then(function(o){
       btn.disabled=false;
-      if(o.s===200&&o.j&&o.j.ok){msg.className='ps-m ok';msg.textContent=o.j.msg||'已提交';amt.value='';try{var st=o.j.status;if(st&&st!=='pending'&&st!=='processing'){localStorage.removeItem('ps_pay_crid')}}catch(e){}
+      if(o.s===200&&o.j&&o.j.ok){msg.className='ps-m ok';msg.textContent=o.j.msg||'已提交';amt.value='';try{if(o.j&&o.j.ok){localStorage.removeItem('ps_pay_crid')}}catch(e){}
         setTimeout(loadOrders,300);}
       else{msg.className='ps-m err';msg.textContent=(o.j&&o.j.msg)||'提交失败，请稍后再试'}
     }).catch(function(){btn.disabled=false;msg.className='ps-m err';msg.textContent='网络异常，请稍后再试'});

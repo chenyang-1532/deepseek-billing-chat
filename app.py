@@ -30,6 +30,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import (
@@ -41,6 +42,20 @@ from starlette.concurrency import run_in_threadpool
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "data.db")
 STATIC_DIR = os.path.join(BASE, "static")
+
+# ── 站点统一时区（审查 R3/P1-7）──
+# 时段倍率规则、"今日消费"起点、订单/流水时间戳全部用 SITE_TZ，不依赖宿主环境
+# （Docker/云主机默认 UTC，会把站长填的北京时间规则整体偏 8 小时）。
+# 官方峰谷窗口例外：DeepSeek 官方口径就是 UTC，_is_peak_now 保持 utcnow。
+SITE_TZ = ZoneInfo(os.environ.get("SITE_TZ", "Asia/Shanghai"))
+
+
+def site_now() -> datetime:
+    """站点统一时间（北京 wall clock，naive——保持既有落库/展示字符串格式不变）"""
+    return datetime.now(SITE_TZ).replace(tzinfo=None)
+
+
+print("[tz] SITE_TZ=%s（时段倍率/今日消费/时间戳基准；峰谷判定固定 UTC）" % SITE_TZ)
 # 管理密码：必须通过环境变量显式设置；未设置时随机生成并落盘，绝不使用弱默认值
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 if not ADMIN_PASSWORD:
@@ -73,17 +88,34 @@ def _load_secret() -> bytes:
         key = open(key_file, "rb").read()
         old_len = len(key)
         if old_len >= 32:
+            try:
+                os.chmod(key_file, 0o600)   # 修历史遗留的宽松权限（不轮换，不踢用户）
+            except OSError:
+                pass
             return key
         # 空/过短密钥可被 HMAC 伪造会话（审查 P0-A）：自动轮换，旧会话全部失效。
-        # 不直接 raise——服务起不来只会诱导运维 touch 一个空文件，把漏洞固化。
+        # 不直接 raise——服务起不来只会诱导运维 touch 一个空文件，把漏洞固化；
+        # 但写入失败必须 fail-closed，绝不允许带着弱密钥对外服务。
         key = secrets.token_hex(32).encode()
-        tmp = key_file + ".rotate"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp = "%s.rotate.%d.%s" % (key_file, os.getpid(), secrets.token_hex(4))
         try:
-            os.write(fd, key)
-        finally:
-            os.close(fd)
-        os.replace(tmp, key_file)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, key)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, key_file)
+        except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise RuntimeError("secret.key 无法写入，拒绝以弱密钥启动: %s" % e)
+        # 回读以落盘内容为准（多 worker 收敛到同一密钥，避免"登录随机失效"）
+        key = open(key_file, "rb").read()
+        if len(key) < 32:
+            raise RuntimeError("secret.key 写入后校验失败，拒绝启动")
         print("[security] secret.key 长度=%d 不足 32，已自动轮换(新 key %d 字节)；旧会话已失效" % (old_len, len(key)))
         return key
     # 原子创建（O_EXCL 防并发双写）并强制 0600，不依赖 umask
@@ -202,7 +234,7 @@ def init_db():
         )
 
 def today() -> str:
-    return date.today().isoformat()
+    return site_now().date().isoformat()
 
 def get_setting(key: str, default: str = "") -> str:
     with db() as c:
@@ -287,7 +319,7 @@ def days_left(user) -> int:
     if not user["expiry"]:
         return 0
     try:
-        d = (date.fromisoformat(user["expiry"]) - date.today()).days
+        d = (date.fromisoformat(user["expiry"]) - site_now().date()).days
         return max(d, 0)
     except ValueError:
         return 0
@@ -566,7 +598,7 @@ async def api_register(request: Request):
         try:
             c.execute(
                 "INSERT INTO users(username,pw_hash,created_at) VALUES(?,?,?)",
-                (u, hash_pw(p), datetime.now().isoformat(timespec="seconds")),
+                (u, hash_pw(p), site_now().isoformat(timespec="seconds")),
             )
         except sqlite3.IntegrityError:
             return JSONResponse({"ok": False, "msg": "用户名已存在"})
@@ -1203,7 +1235,7 @@ def admin_page(request: Request):
     if gw_enabled():
         try:
             with napi_connect() as nc:
-                today_start = int(datetime.combine(date.today(), datetime.min.time()).timestamp())
+                today_start = int(datetime.combine(site_now().date(), datetime.min.time()).timestamp())
                 # 每个站点用户的余额与用量
                 wallet_rows = {}
                 with db() as c:
@@ -1466,7 +1498,8 @@ def admin_page(request: Request):
             tmult_sec = (
                 '<div class="sec-h" style="margin-top:16px"><h3 style="font-size:14px">时段倍率（不同时间不同价）</h3>'
                 f'<span class="hint">最终售价 = 官方实时价 × 模型倍数 × 时段倍数；规则按顺序匹配（支持跨零点，如 22:00-06:00）；'
-                f'时段切换每分钟自动检测，最多 1 分钟内生效</span></div>'
+                f'时段切换每分钟自动检测，最多 1 分钟内生效。'
+                f'<b>以下时间均为北京时间（Asia/Shanghai，SITE_TZ 可改）</b>；官方峰谷判定固定按 UTC</span></div>'
                 + f'<div class="flash ok" style="margin-bottom:8px">当前生效：<b>×{tmult:g}</b>'
                 f'（{"规则「" + html.escape(trule) + "」" if trule != "默认" else "默认倍数"}）'
                 f' · 峰谷官方价档：{"官方峰时" if tier_peak else "官方谷时"}</div>'
@@ -1699,7 +1732,7 @@ async def admin_action(request: Request, uid: int = Form(...), action: str = For
         row = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         if row is None:
             return RedirectResponse("/admin", status_code=303)
-        now = datetime.now().isoformat(timespec="seconds")
+        now = site_now().isoformat(timespec="seconds")
         if action == "approve":
             if row["status"] == "approved":
                 # 已开通用户不响应「通过」，防止重复点击导致无限加时间
@@ -1915,10 +1948,36 @@ def _gw_estimate_quota(body: bytes, model: str) -> int:
 
 
 # ── 官方价 × 倍数 定价引擎 ──
-def _is_peak_now() -> bool:
-    """官方峰时：UTC 周一至周五 01:00-04:00 与 06:00-10:00（节假日保守按峰时计）"""
-    now = datetime.utcnow()
+# 中国法定节假日（官方口径：节假日全天谷时，审查 R3 P1）。落在周末的日期无影响（周末本就全谷）。
+# ⚠️ 每年由站长按国务院办公厅通知更新一次（部署指南 §五 有提醒）。
+CN_HOLIDAYS = {
+    # 2025
+    "2025-01-01",
+    "2025-01-28", "2025-01-29", "2025-01-30", "2025-01-31", "2025-02-01", "2025-02-02", "2025-02-03", "2025-02-04",
+    "2025-04-04", "2025-04-05", "2025-04-06",
+    "2025-05-01", "2025-05-02", "2025-05-03", "2025-05-04", "2025-05-05",
+    "2025-05-31", "2025-06-01", "2025-06-02",
+    "2025-10-01", "2025-10-02", "2025-10-03", "2025-10-04", "2025-10-05", "2025-10-06", "2025-10-07", "2025-10-08",
+    # 2026（按国务院 2026 部分节假日安排，春节 2/15-2/21、劳动节 5/1-5/5、国庆 10/1-10/7 等）
+    "2026-01-01", "2026-01-02", "2026-01-03",
+    "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21",
+    "2026-04-04", "2026-04-05", "2026-04-06",
+    "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
+    "2026-06-19", "2026-06-20", "2026-06-21",
+    "2026-09-25", "2026-09-26", "2026-09-27",
+    "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07",
+}
+
+
+def _is_peak_now(now: datetime | None = None) -> bool:
+    """官方峰时：UTC 周一至周五 01:00-04:00 与 06:00-10:00，法定节假日全天谷时
+    （官方原文：Peak hours are 01:00-04:00 and 06:00-10:00 UTC, Monday through Friday,
+    excluding Chinese public holidays. All other hours are off-peak, including weekends
+    and Chinese public holidays in full.）"""
+    now = now or datetime.utcnow()
     if now.weekday() >= 5:
+        return False
+    if now.strftime("%Y-%m-%d") in CN_HOLIDAYS:
         return False
     h = now.hour + now.minute / 60.0
     return any(lo <= h < hi for lo, hi in _PEAK_WINDOWS_UTC)
@@ -2083,7 +2142,7 @@ def _hhmm_to_min(s: str) -> int:
 def _active_time_mult(now: datetime | None = None) -> tuple[float, str]:
     """当前时刻生效的时段倍数。规则按保存顺序匹配，第一条命中即生效（支持跨零点窗口如 22:00-06:00，
     start==end 视为全天）；无命中规则时使用默认倍数。返回 (倍数, 规则名)。"""
-    now = now or datetime.now()
+    now = now or site_now()
     cur = now.hour * 60 + now.minute
     tm = get_time_mults()
     for r in tm["rules"]:
@@ -2276,7 +2335,7 @@ def napi_connect():
 def _wallet_tx(c, uid, tx_type, cny, balance_cny, note=""):
     c.execute(
         "INSERT INTO wallet_tx(uid,type,cny,balance_cny,note,created_at) VALUES(?,?,?,?,?,?)",
-        (uid, tx_type, cny, balance_cny, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        (uid, tx_type, cny, balance_cny, note, site_now().strftime("%Y-%m-%d %H:%M:%S")),
     )
 
 
@@ -2407,7 +2466,7 @@ def gw_add_quota(napi_uid: int, delta_quota: int, op_id: str | None = None) -> i
                     "INSERT INTO quota_ops(op_id, napi_uid, delta, done_at, payload_hash) "
                     "VALUES(?,?,?,?,?)",
                     (op_id, napi_uid, delta_quota,
-                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), payload_hash),
+                     site_now().strftime("%Y-%m-%d %H:%M:%S"), payload_hash),
                 )
             # 负向扣减改为单语句原子条件更新（审查 R1/P1-02）：余额不足整体失败回滚，
             # 禁止 MAX(0,...) 截断——否则实际扣 0 但 quota_ops 记完整负数，账目永久失配。
@@ -2447,7 +2506,7 @@ def api_wallet(request: Request):
     _, nid = gw_provision(user)
     with napi_connect() as nc:
         u = nc.execute("SELECT quota, used_quota, request_count FROM users WHERE id=?", (nid,)).fetchone()
-        today_start = int(datetime.combine(date.today(), datetime.min.time()).timestamp())
+        today_start = int(datetime.combine(site_now().date(), datetime.min.time()).timestamp())
         today = nc.execute(
             "SELECT COALESCE(SUM(quota),0) AS s FROM logs WHERE user_id=? AND type=2 AND created_at>=?",
             (nid, today_start),
@@ -2567,7 +2626,7 @@ async def api_wallet_redeem(request: Request):
             cur = c.execute(
                 "UPDATE redeem_codes SET status='processing', used_by=?, used_at=? "
                 "WHERE code=? AND (status='unused' OR status IS NULL)",
-                (uid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), code),
+                (uid, site_now().strftime("%Y-%m-%d %H:%M:%S"), code),
             )
             if cur.rowcount != 1:
                 return JSONResponse({"ok": False, "msg": "兑换码无效"})
@@ -2577,7 +2636,7 @@ async def api_wallet_redeem(request: Request):
             "INSERT OR IGNORE INTO wallet_tx(uid,type,cny,balance_cny,note,created_at,ref) "
             "VALUES(?,?,?,?,?,?,?)",
             (uid, "redeem_pending", face, None, "兑换码 " + code,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), op_id),
+             site_now().strftime("%Y-%m-%d %H:%M:%S"), op_id),
         )
     # ── 阶段二：跨库加款（op_id 幂等；quota_ops 与余额变更同一事务） ──
     newq = None
@@ -2629,7 +2688,7 @@ async def api_wallet_redeem(request: Request):
                 "INSERT OR IGNORE INTO wallet_tx(uid,type,cny,balance_cny,note,created_at,ref) "
                 "VALUES(?,?,?,?,?,?,?)",
                 (uid, "redeem", face, bal_snap, "兑换码 " + code,
-                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"), op_id),
+                 site_now().strftime("%Y-%m-%d %H:%M:%S"), op_id),
             )
             # 意图流水转正（兜底老数据：无 ref 的历史 redeem_pending 按 note 匹配）
             c.execute(
@@ -2889,7 +2948,7 @@ async def api_wallet_pay_request(request: Request):
                 "INSERT INTO pay_orders(uid, username, cny, status, created_at, client_request_id) "
                 "VALUES(?,?,?,'pending',?,?)",
                 (user["id"], user["username"], amount,
-                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"), crid),
+                 site_now().strftime("%Y-%m-%d %H:%M:%S"), crid),
             )
         except sqlite3.IntegrityError:
             dup = c.execute(
@@ -2989,7 +3048,7 @@ async def admin_wallet_adjust(request: Request, uid: int = Form(...), amount: st
                 "VALUES(?,?,?,?,?,?,?)",
                 (uid, "adjust", amount_cny, quota_to_cny(newq),
                  (note or ("充值" if amount_cny > 0 else "扣减"))[:100],
-                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "adjust:%s" % op_id),
+                 site_now().strftime("%Y-%m-%d %H:%M:%S"), "adjust:%s" % op_id),
             )
             if cur.rowcount == 0:
                 # 流水已存在但余额快照未回填（上次在此处崩溃）→ 补齐
@@ -3027,7 +3086,7 @@ async def admin_wallet_gen_codes(request: Request, cny: str = Form(""), count: s
                 code = "".join(secrets.choice(_alphabet) for _ in range(26))
                 cur = c.execute(
                     "INSERT OR IGNORE INTO redeem_codes(code, cny, created_at, status) VALUES(?,?,?,'unused')",
-                    (code, face, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    (code, face, site_now().strftime("%Y-%m-%d %H:%M:%S")),
                 )
                 if cur.rowcount == 1:
                     made.append(code)
@@ -3187,7 +3246,7 @@ async def admin_wallet_pay(request: Request, oid: int = Form(...), action: str =
                 # 原子占单：并发点两次通过时只有一个成功
                 cur = c.execute(
                     "UPDATE pay_orders SET status='rejected', handled_at=? WHERE id=? AND status='pending'",
-                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), oid),
+                    (site_now().strftime("%Y-%m-%d %H:%M:%S"), oid),
                 )
                 if cur.rowcount != 1:
                     raise ValueError("订单已被处理")
@@ -3195,7 +3254,7 @@ async def admin_wallet_pay(request: Request, oid: int = Form(...), action: str =
                 # 原子占单：pending→processing；已是 processing 说明上次 saga 未完成 → 续跑
                 cur = c.execute(
                     "UPDATE pay_orders SET status='processing', handled_at=? WHERE id=? AND status IN ('pending','processing')",
-                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), oid),
+                    (site_now().strftime("%Y-%m-%d %H:%M:%S"), oid),
                 )
                 if cur.rowcount != 1:
                     raise ValueError("订单已被处理")
@@ -3211,7 +3270,7 @@ async def admin_wallet_pay(request: Request, oid: int = Form(...), action: str =
                     "INSERT OR IGNORE INTO wallet_tx(uid,type,cny,balance_cny,note,created_at,ref) "
                     "VALUES(?,?,?,?,?,?,?)",
                     (row["uid"], "pay", row["cny"], quota_to_cny(newq),
-                     "扫码充值 #%s" % oid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "pay:%s" % oid),
+                     "扫码充值 #%s" % oid, site_now().strftime("%Y-%m-%d %H:%M:%S"), "pay:%s" % oid),
                 )
                 if cur.rowcount == 0:
                     c.execute(
@@ -3221,7 +3280,7 @@ async def admin_wallet_pay(request: Request, oid: int = Form(...), action: str =
                 # saga 收尾
                 c.execute(
                     "UPDATE pay_orders SET status='approved', handled_at=? WHERE id=? AND status='processing'",
-                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), oid),
+                    (site_now().strftime("%Y-%m-%d %H:%M:%S"), oid),
                 )
         print("[pay] 订单 #%s %s ¥%s user=%s" % (oid, action, row["cny"], row["username"]))
     except Exception as e:  # noqa: BLE001
