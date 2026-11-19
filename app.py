@@ -13,6 +13,7 @@
 import html
 import math
 import os
+import fcntl
 import threading
 import re
 import io
@@ -84,10 +85,19 @@ SNAP_KEEP = 30                               # 每个账号保留最近 30 个�
 
 def _load_secret() -> bytes:
     key_file = os.path.join(BASE, "secret.key")
-    if os.path.exists(key_file):
-        key = open(key_file, "rb").read()
-        old_len = len(key)
-        if old_len >= 32:
+    # R6（审查 A2/P0）：多 worker 场景下"replace 后回读"不是同步原语——回读与 replace
+    # 之间没有任何互斥，谁后谁赢看调度：实测 3 worker 15/20 轮各持一把 key（登录随机掉线、
+    # 日志无字）。用独立 .lock 文件 flock 串行化整个判定+轮换：持锁期间重读判定，
+    # 后到 worker 看到的已是合法 key，直接复用，不再产生第二次 replace。
+    lock_fd = os.open(key_file + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with open(key_file, "rb") as f:
+                key = f.read()
+        except FileNotFoundError:
+            key = b""
+        if len(key) >= 32:
             try:
                 os.chmod(key_file, 0o600)   # 修历史遗留的宽松权限（不轮换，不踢用户）
             except OSError:
@@ -96,6 +106,7 @@ def _load_secret() -> bytes:
         # 空/过短密钥可被 HMAC 伪造会话（审查 P0-A）：自动轮换，旧会话全部失效。
         # 不直接 raise——服务起不来只会诱导运维 touch 一个空文件，把漏洞固化；
         # 但写入失败必须 fail-closed，绝不允许带着弱密钥对外服务。
+        old_len = len(key)
         key = secrets.token_hex(32).encode()
         tmp = "%s.rotate.%d.%s" % (key_file, os.getpid(), secrets.token_hex(4))
         try:
@@ -112,21 +123,14 @@ def _load_secret() -> bytes:
             except OSError:
                 pass
             raise RuntimeError("secret.key 无法写入，拒绝以弱密钥启动: %s" % e)
-        # 回读以落盘内容为准（多 worker 收敛到同一密钥，避免"登录随机失效"）
-        key = open(key_file, "rb").read()
-        if len(key) < 32:
+        # 锁内回读：确认落盘内容与本次写入逐字节一致（防异常文件系统静默丢写）
+        disk = open(key_file, "rb").read()
+        if disk != key or len(disk) < 32:
             raise RuntimeError("secret.key 写入后校验失败，拒绝启动")
-        print("[security] secret.key 长度=%d 不足 32，已自动轮换(新 key %d 字节)；旧会话已失效" % (old_len, len(key)))
-        return key
-    # 原子创建（O_EXCL 防并发双写）并强制 0600，不依赖 umask
-    fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        key = secrets.token_hex(32).encode()
-        os.write(fd, key)
+        print("[security] secret.key 长度=%d 不足 32，已自动轮换(新 key %d 字节)；旧会话已失效" % (old_len, len(disk)))
+        return disk
     finally:
-        os.close(fd)
-    os.chmod(key_file, 0o600)
-    return key
+        os.close(lock_fd)
 
 SECRET = _load_secret()
 
@@ -1094,8 +1098,13 @@ def api_restore_get(request: Request):
 
 def _snap_key(n: str):
     """快照文件名排序键：'1700000000001-ab12cd34.zip' → (ms, 名字)。
-    兼容审查 R2 前的旧格式 '{now_ms}.zip'（无 '-' 后缀段）。"""
-    return (int(n[:-4].split("-")[0]), n)
+    兼容审查 R2 前的旧格式 '{now_ms}.zip'（无 '-' 后缀段）；
+    异常文件名（非数字前缀）排到最后且不参与删除（R6/审查 P2：容错不抛 ValueError）。"""
+    try:
+        return (int(n[:-4].split("-")[0]), n)
+    except ValueError:
+        # 异常文件名排最前（视为最旧）：SNAP_KEEP 裁剪最先删它，_latest_snapshot 不会选中它
+        return (float("-inf"), n)
 
 
 def _save_snapshot(uid: int, data: bytes, now_ms: int) -> None:
@@ -1999,6 +2008,27 @@ def _is_peak_now(now: datetime | None = None) -> bool:
     return any(lo <= h < hi for lo, hi in _PEAK_WINDOWS_UTC)
 
 
+def _check_holiday_freshness() -> None:
+    """R6（审查 P2）：CN_HOLIDAYS 覆盖到 2026 年末——过期后会**静默**把节假日按峰时
+    （多收）。每年国务院公告后由站长在 app.py 更新一次（部署指南 §五）；过期前 30 天起
+    打印红色告警并落 cn_holidays_stale_alert 供管理面板展示。"""
+    try:
+        last_year = max(int(x[:4]) for x in CN_HOLIDAYS)
+        today = site_now().date()
+        days_left = (datetime(last_year, 12, 31).date() - today).days
+        if days_left < 0:
+            set_setting("cn_holidays_stale_alert", json.dumps({"ts": time.time(), "last_year": last_year}))
+            print("[official-price] \033[91m⚠️ CN_HOLIDAYS 仅覆盖到 %d 年，节假日已开始按峰时计费（多收）！"
+                  "请按国务院最新通知更新后重启\033[0m" % last_year)
+        elif days_left < 30:
+            set_setting("cn_holidays_stale_alert", json.dumps({"ts": time.time(), "last_year": last_year}))
+            print("[official-price] ⚠️ CN_HOLIDAYS 将于 %d-12-31 过期（剩 %d 天），请准备按国务院通知更新" % (last_year, days_left))
+        else:
+            set_setting("cn_holidays_stale_alert", "")
+    except Exception as e:  # noqa: BLE001
+        print("[official-price] 节假日时效检查异常:", e)
+
+
 def _load_official_prices() -> dict:
     """官方价缓存（设置表持久化，抓取失败沿用上次/默认快照）"""
     raw = get_setting(GW_OFFICIAL_KEY, "")
@@ -2205,6 +2235,7 @@ def recompute_ratios(official: dict | None = None) -> str:
     写库后回读生效值确认一致才算 success。"""
     official = official or _load_official_prices()
     models = official.get("models") or {}
+    _check_holiday_freshness()   # R6（审查 P2）：节假日表过期告警（面板 + 日志）
     tier = 1 if _is_peak_now() else 0   # 0=谷 1=峰
     tmult, trule = _active_time_mult()
     mults = get_multipliers()
@@ -2350,6 +2381,10 @@ def gw_enabled() -> bool:
 # 定价同步线程（官方价每 10 分钟刷新 + 峰谷时段自动重算倍率）
 if gw_enabled():
     threading.Thread(target=_ratio_refresher, daemon=True).start()
+    try:
+        _check_holiday_freshness()   # R6（审查 P2）：启动即检查节假日表时效（过期红色告警 + 面板标记）
+    except Exception:
+        pass
 
 
 def napi_connect():

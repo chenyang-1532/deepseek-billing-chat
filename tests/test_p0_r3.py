@@ -58,6 +58,7 @@ try:
     mod = types.ModuleType("m")
     mod.os = os
     mod.secrets = __import__("secrets")
+    mod.fcntl = __import__("fcntl")   # R6：_load_secret 改 flock 串行化，需要 fcntl
     mod.BASE = tmpd
     exec(compile(_extract_fn("_load_secret"), "<t>", "exec"), mod.__dict__)
     key = mod._load_secret()

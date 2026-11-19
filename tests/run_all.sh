@@ -2,22 +2,25 @@
 # 统一测试 runner（审查 P1-13 验收门禁）：
 # - 串行跑全部套件，逐个捕获并输出退出码；
 # - 任一套件失败 → 汇总表 + 总退出码 1（否则 0）；
+# - 套件返回 2（被 guard 拒绝：生产库/未声明路径）→ 立即 exit 2 中止整轮；
 # - 套件间强制间隔 65s：注册/登录限流为 10·20 次/分钟/IP，
 #   连续注册会被 429 造成假失败，间隔规避。
-# 用法：RT_TAG=<唯一标签> ADMIN_PW=<管理密码> bash tests/run_all.sh
-# RT_ALLOWED_DB_DIRS：显式声明测试实例所在目录（审查 P1-测试安全），
-#   只有声明后 guard() 才允许测试访问 /tmp 之外的库路径；生产机不声明 → 一律退出码 2 拒绝。
-# RT_ALLOW_RESTART=1：显式允许重启类用例（如 reconciliation 的 new-api 重启恢复）。
+# 用法（沙箱/CI 显式声明全部测试实例路径）：
+#   RT_TAG=<标签> ADMIN_PW=<密码> \
+#   RT_ALLOWED_DB_DIRS=/opt/newapi RT_ALLOW_RESTART=1 \
+#   RT_SITE_DB=/tmp/chatsite-test/data.db RT_NAPI_DB=/opt/newapi/one-api.db \
+#   bash tests/run_all.sh
+# R6（审查 R5/C「门禁自废」）：默认值全部反转——生产机不传任何 RT_* 变量时，
+#   guard 无声明直接拒绝（exit 2）、restart 类用例跳过、performance 拿不到
+#   测试库路径自动 SKIP。绝不再默认把生产库路径写进环境。
 set -u
 cd "$(dirname "$0")/.."
 export RT_TAG="${RT_TAG:-runner$(date +%H%M%S)}"
-export RT_ALLOWED_DB_DIRS="${RT_ALLOWED_DB_DIRS:-/opt/newapi}"   # 沙箱测试实例声明；生产机请勿声明
-export RT_ALLOW_RESTART="${RT_ALLOW_RESTART:-1}"                 # 沙箱测试实例允许重启；生产机必须显式关闭
-# R5（审查 R3/P0-测试安全）：performance 套件必须显式拿到测试库路径，
-# 未设置时该套件自SKIP——生产机即使跑到这里也写不进任何库。
+export RT_ALLOWED_DB_DIRS="${RT_ALLOWED_DB_DIRS:-}"   # 默认拒绝：只有显式声明测试实例目录才放行
+export RT_ALLOW_RESTART="${RT_ALLOW_RESTART:-0}"      # 默认不重启线上 new-api
 export RT_SITE_DIR="${RT_SITE_DIR:-/tmp/chatsite-test}"
-export RT_SITE_DB="${RT_SITE_DB:-$RT_SITE_DIR/data.db}"
-export RT_NAPI_DB="${RT_NAPI_DB:-/opt/newapi/one-api.db}"
+export RT_SITE_DB="${RT_SITE_DB:-}"                   # 默认空 → test_performance SKIP（不碰任何库）
+export RT_NAPI_DB="${RT_NAPI_DB:-}"
 FAIL=0
 RESULTS=()
 
@@ -28,6 +31,11 @@ run() {
   local rc=$?
   RESULTS+=("$name exit=$rc")
   tail -3 "/tmp/rt_${name}.log"
+  if [ $rc -eq 2 ]; then
+    # guard 拒绝（生产库/未声明路径）：立即中止整轮，绝不继续触碰后续套件
+    echo "  🛑 $name 被 TEST-GUARD 拒绝（退出码 2）→ 中止整轮"
+    exit 2
+  fi
   if [ $rc -ne 0 ]; then
     echo "  ❌ $name 退出码 $rc"
     FAIL=1

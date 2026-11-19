@@ -59,6 +59,7 @@ for bad in (b"", b"A", b"x" * 31):
         mod = types.ModuleType("m")
         mod.os = os
         mod.secrets = __import__("secrets")
+        mod.fcntl = __import__("fcntl")   # R6：_load_secret 改 flock 串行化，需要 fcntl
         mod.BASE = td
         mod.base64 = _b64
         mod.hashlib = _h
@@ -154,10 +155,12 @@ ck("第二笔新 crid 建新单（不再被 pending 旧单锁死）",
 s3, r3 = api("POST", "/api/wallet/pay-request", {"cny": 5.5, "client_request_id": crid1}, CK)
 j3 = json.loads(r3)
 ck("同 crid 重放幂等返回原单", j3.get("order_id") == j1.get("order_id"), r3[:120])
-# bundle 清理语义：收到 ok 即清键
+# bundle 清理语义（R6/审查 F）：键名带金额（同额重试幂等、改额天然新键，409 不再死锁）+ 收到 ok 即清键
 bundle = open("/tmp/chatsite-test/static/static/js/main.fe540c06.js", encoding="utf-8").read()
+ck("bundle crid 键名带金额（ps_pay_crid_+v，改额不再 409 死锁）",
+   "client_request_id:(function(){var k='ps_pay_crid_'+v;" in bundle)
 ck("bundle 收到 ok 响应即清 crid（不再等终态）",
-   "if(o.j&&o.j.ok){localStorage.removeItem('ps_pay_crid')}" in bundle)
+   "try{localStorage.removeItem('ps_pay_crid_'+v);sessionStorage.removeItem('ps_pay_crid_'+v)}catch(e){}" in bundle)
 # 清理测试用户与订单
 uid = site.execute("SELECT id FROM users WHERE username=?", (U,)).fetchone()[0]
 site.execute("DELETE FROM pay_orders WHERE uid=?", (uid,))

@@ -68,11 +68,11 @@ function build(inp){
     var v=parseFloat(amt.value);
     if(!(v>=5)){msg.className='ps-m err';msg.textContent='金额不能低于 ¥5';return}
     btn.disabled=true;msg.className='ps-m wait';msg.textContent='提交中…';
-    fetch('/api/wallet/pay-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cny:v,client_request_id:(function(){var k='ps_pay_crid';try{var id=localStorage.getItem(k);if(!id){id=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,12);try{localStorage.setItem(k,id)}catch(e2){try{sessionStorage.setItem(k,id)}catch(e3){}}}return id}catch(e){try{var s=sessionStorage.getItem(k);if(s)return s}catch(e4){}return ''}})()})})
+    fetch('/api/wallet/pay-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cny:v,client_request_id:(function(){var k='ps_pay_crid_'+v;try{var id=localStorage.getItem(k)||sessionStorage.getItem(k)||'';if(!id){id=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,12);try{localStorage.setItem(k,id)}catch(e2){try{sessionStorage.setItem(k,id)}catch(e3){}}}return id}catch(e){try{var s=sessionStorage.getItem('ps_pay_crid_'+v);if(s)return s}catch(e4){}return ''}})()})})
     .then(function(r){return r.json().then(function(j){return {s:r.status,j:j}})})
     .then(function(o){
       btn.disabled=false;
-      if(o.s===200&&o.j&&o.j.ok){msg.className='ps-m ok';msg.textContent=o.j.msg||'已提交';amt.value='';try{if(o.j&&o.j.ok){localStorage.removeItem('ps_pay_crid')}}catch(e){}
+      if(o.s===200&&o.j&&o.j.ok){msg.className='ps-m ok';msg.textContent=o.j.msg||'已提交';amt.value='';try{localStorage.removeItem('ps_pay_crid_'+v);sessionStorage.removeItem('ps_pay_crid_'+v)}catch(e){}
         setTimeout(loadOrders,300);
         (function poll(n){if(n<=0)return;setTimeout(function(){loadOrders();poll(n-1)},15000)})(20);}
       else{msg.className='ps-m err';msg.textContent=(o.j&&o.j.msg)||'提交失败，请稍后再试'}
