@@ -1,103 +1,125 @@
-# DeepSeek Chat Demo 自服务器部署指南
+# MiandningAI 聊天站（v17.7）部署运维指南
 
-> 源码：[deepseek-ai/chat-demo](https://github.com/deepseek-ai/chat-demo) · MIT 协议 · 本包为 v0.1.1 官方源码在 Node 22.13 下 `pnpm build` 的产物，未做任何改动。
+> ⚠️ 本文档对应 **v17.7 服务端计费形态**（Python 后端 + SQLite + new-api 计费网关）。
+> 早期「纯静态、无后端、用户自带 Key」版本已淘汰——如果任何文档/交接材料仍那样描述，以本文为准。
 
-## 一、多用户隔离是怎么实现的（重要）
+## 一、系统形态（先读这个）
 
-这个应用是**纯静态、无后端**的，所有用户数据都不经过、也不存放在你的服务器上：
+| 组件 | 说明 |
+|---|---|
+| 主站点 `app.py` | 单文件 FastAPI 应用（uvicorn :3000），含注册/钱包/充值审批/云同步/管理面板 |
+| `data.db`（SQLite） | **核心数据**：用户、余额流水（wallet_tx）、充值订单（pay_orders）、兑换码、云端会话（cloud_sessions） |
+| `new-api`（:3001） | 计费网关：按 ModelRatio/CompletionRatio/CacheRatio 对 token 计费，库 `one-api.db` |
+| `mock_upstream.py`（:3002） | 测试用 mock 上游；**接入真实 DeepSeek Key 后由 https://api.deepseek.com 替代** |
+| `secret.key` | 会话签名密钥（0600）；空/过短自动轮换重建，**所有用户与管理员会话立即失效**（需重新登录） |
+| `snapshots/` | 每次云同步上传的完整导出包存档（每用户保留最近 30 份） |
+| `gateway.on` | 开关文件：存在才启用网关计费链路 |
 
-| 数据 | 存放位置 | 隔离方式 |
-|---|---|---|
-| API Key 和设置 | 用户自己浏览器的 `localStorage` | 按浏览器 + 站点域名隔离 |
-| 对话记录、附件 | 用户自己浏览器的 `IndexedDB` | 同上 |
-| 导入/导出 | ZIP 文件，用户手动操作 | 本地文件 |
+**关键安全事实（运维必须知晓）**：
 
-也就是说：**只要每个用户用自己的设备/浏览器访问，信息和 API Key 天然互相隔离**，A 用户看不到 B 用户的任何东西，服务器上没有任何数据库需要维护，也不存在用户数据泄露风险（服务器被黑也拿不到任何聊天记录）。
+1. **API Key 是站长的共享计费 Key**（通过 new-api 网关注入），不是用户各自的 Key。泄露 = 全站被薅 + 账单打在站长头上。
+2. **全部聊天内容都在服务器上**：`data.db` 的 `cloud_sessions` 表 + `snapshots/` 目录。服务器被拖库 = 全量聊天泄露。请按敏感数据对待。
+3. 用户余额、订单、流水都在 `data.db`——**不备份 = 无法对账 + 数据全丢**。
 
-两个必须注意的边界情况：
-
-1. **同一台电脑共用浏览器** 的两个人会共享同一份 localStorage/IndexedDB（不算隔离）。如需严格区分，建议各用各的浏览器 Profile 或各自设备。
-2. **API Key 是每人填自己的**。切勿把你的 Key 告诉用户或在群里发，否则所有人的费用都算你的账号。
-
-如果你需要「用户在服务器上注册登录、换设备也能同步聊天记录」这类能力，静态站做不到，需要另行开发后端（可作为二期）。
-
-## 二、部署步骤（3 步）
+## 二、必须备份的路径
 
 ```bash
-# 1. 上传解压（把 deepseek-chat-demo-dist.zip 传到服务器）
-unzip deepseek-chat-demo-dist.zip -d /var/www/
-# 得到 /var/www/dist（index.html + static/ + LICENSE）
-
-# 2. 用 Nginx 托管（配置见下）
-
-# 3. 浏览器打开你的域名，进入 设置 → 填入各自的 DeepSeek API Key 即可聊天
+# data.db 在线备份（wal 模式安全备份，不要直接 cp 运行中的文件）
+sqlite3 /path/to/data.db ".backup '/backup/data-$(date +%F).db'"
+sqlite3 /opt/newapi/one-api.db ".backup '/backup/newapi-$(date +%F).db'"
+cp -a /path/to/snapshots/ /backup/snapshots-$(date +%F)/
+cp -a /path/to/secret.key /backup/secret.key   # 0600 权限一并保留
 ```
 
-API Key 获取：[platform.deepseek.com](https://platform.deepseek.com) → API keys → 创建（按 token 计费，充值后使用）。
+建议每日 cron。恢复：停服 → 覆盖 → 启服。
 
-## 三、Nginx 配置示例
+## 三、环境变量与配置
+
+| 变量/文件 | 含义 |
+|---|---|
+| `ADMIN_PASSWORD` | 管理面板密码（systemd 服务文件内，泄露按已泄露处理：轮换见 §6） |
+| `NEWAPI_DB` | new-api 库路径（默认 `/opt/newapi/one-api.db`），站点直连其 options/users 表 |
+| `GATEWAY_ENABLED` | 网关计费总开关（环境变量），配合 `gateway.on` 文件双保险 |
+| `data.db` 设置表 | `gw_default_model`（强制改写的模型）、`gw_multipliers`（每模型倍数）、时段倍率规则等，管理面板可改 |
+
+## 四、部署步骤
+
+```bash
+# 1. 依赖
+apt install python3.11 python3-pip sqlite3
+pip3 install fastapi uvicorn requests
+
+# 2. new-api（计费网关）
+#    部署于 :3001，库文件默认 /opt/newapi/one-api.db
+#    建一个 DeepSeek 渠道（type 选 DeepSeek，填真实 Key）；测试环境用 mock 上游 :3002
+
+# 3. 主站点
+cd /opt/chatsite
+ADMIN_PASSWORD='<强密码>' setsid python3.11 -m uvicorn app:app --host 0.0.0.0 --port 3000
+touch /opt/chatsite/gateway.on    # 启用网关计费
+
+# 4. Nginx 反代（必须，见下）
+```
+
+### Nginx 反代（含 X-Forwarded-Proto，Cookie Secure 依赖它）
 
 ```nginx
 server {
-    listen 80;
-    server_name chat.yourdomain.com;          # 换成你的域名
-    root /var/www/dist;
-    index index.html;
-
-    gzip on;
-    gzip_types text/css application/javascript application/wasm image/svg+xml;
-    gzip_min_length 1024;
-
-    # 静态资源带内容哈希，可长期缓存
-    location /static/ {
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
-
+    listen 443 ssl;
+    server_name chat.miandning.xyz;
     location / {
-        try_files $uri $uri/ /index.html;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;   # 必须：站点据此发 Secure Cookie
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_read_timeout 360s;                       # 网关流式响应最长 300s
     }
 }
 ```
 
-上线后建议加 HTTPS（用 certbot 免费申请证书，`listen 443 ssl` 即可），避免部分浏览器对 HTTP 站点限制存储 API。
+`_req_secure()` 的 HTTPS 探测顺序：`X-Forwarded-Proto` 头 → `url.scheme`。只走反代时必须配置该头，否则登录 Cookie 不带 Secure。
 
-## 四、可选：用反向代理统一 API 出口
+## 五、日常运维
 
-默认构建直接从用户浏览器调用 `https://api.deepseek.com`。如果遇到跨域(CORS)报错，或希望 API 请求从你的域名统一走，可二选一：
+| 任务 | 操作 |
+|---|---|
+| 看余额对账 | 管理面板 → 状态页（`/admin`）；不变量：`new-api users.quota == Σ充值 − Σ消费` |
+| 官方价同步 | 后台每 10 分钟自动抓取 api-docs.deepseek.com 并重算三组倍率；面板定价区显示数据时间与变动/stale 红色告警 |
+| 充值审批 | 面板审批 `pay_orders`（pending→processing 原子占单，可安全重复点） |
+| 兑换码 | 面板生成（一次性响应页）；状态机 unused→processing→used，崩溃自动恢复 |
+| 用户会话全失效 | 删/清空 `secret.key` 即可（自动轮换新密钥） |
+| 管理登录被锁 | 连续 5 次失败锁 300 秒（内存计数），重启站点即清 |
 
-**方案 A：Nginx 反向代理（推荐，无需重新构建）**
+## 六、共享计费 Key 泄露处置流程
 
-```nginx
-    # 在上面的 server 块里追加
-    location /dsapi/ {
-        proxy_pass https://api.deepseek.com/;
-        proxy_ssl_server_name on;
-        proxy_set_header Host api.deepseek.com;
-    }
-```
+1. 立即在 new-api 后台**禁用/删除该渠道**（先止血，全站暂停服务）；
+2. 撤销/更换 DeepSeek 平台侧 Key，建新渠道；
+3. 查 `new-api` `logs` 表按时间窗核对异常消费，估算损失；
+4. 检查 `data.db` 管理登录审计日志与异常注册；
+5. 若怀疑服务器被入侵：轮换 `ADMIN_PASSWORD`（见下）+ `secret.key`（删除即自动重建）+ 服务器 SSH 凭据。
 
-然后重新构建前端，把 API 地址指到同域路径：
+**正式站管理密码轮换**（泄露或定期）：
 
 ```bash
-# 修改 rspack.config.ts 中默认值：
-#   apiOrigin = 'https://api.deepseek.com'  →  apiOrigin = '/dsapi'
-pnpm build
+NEWPW=$(python3 -c "import secrets;print(secrets.token_urlsafe(18))")
+sudo sed -i "s|ADMIN_PASSWORD=.*|ADMIN_PASSWORD=$NEWPW|" /etc/systemd/system/chat-site.service
+sudo systemctl daemon-reload && sudo systemctl restart chat-site
+echo "$NEWPW"   # 仅本次显示，立即转存密码管理器并清终端历史
 ```
 
-**方案 B：不改任何东西直接用**。官方托管版（github.io 域名）就是浏览器直连官方 API 的，一般域名的 HTTPS 站点也直接可用；只有真遇到 CORS 报错时才需要方案 A。
+## 七、测试与回归
 
-## 五、常见问题
+```bash
+export RT_TAG=<唯一标签> ADMIN_PW=<管理密码>
+export RT_ALLOWED_DB_DIRS=/opt/newapi   # 显式声明测试实例目录（防误跑生产机）
+export RT_ALLOW_RESTART=1               # 仅测试环境允许 new-api 重启类用例
+bash tests/run_all.sh                   # 统一门禁：12 套件串行，任一失败总退出码 1
+```
 
-| 问题 | 处理 |
-|---|---|
-| 打开是空白页 | 确认部署的是 `dist` 目录本身（`index.html` 必须在站点根），而不是外层多套了一层文件夹 |
-| 提示 402 | 用户的 DeepSeek 账户余额不足，去平台充值 |
-| 提示 429 | 触发并发上限（flash 单账号 2500 并发），与前端无关 |
-| 想换 API 地址 | 见上文方案 A，改 `rspack.config.ts` 的 `apiOrigin` 后 `pnpm build` |
-| 升级版本 | `git clone` 最新源码 → `pnpm install && pnpm build` → 覆盖 `dist` 目录，用户浏览器缓存会自动失效（文件名带哈希） |
+**禁止在生产机执行**：所有 `tests/` 脚本会写数据库、删除测试用户、（在显式允许时）重启 new-api 进程。`_guard()` 会在数据库路径不在 `/tmp/` 且未声明 `RT_ALLOWED_DB_DIRS` 时以退出码 2 拒绝执行。
 
-## 六、合规提醒
+## 八、已知边界
 
-- 发行包内已包含 MIT 许可证副本（`LICENSE`），请保留该文件。
-- 本站只托管界面；所有模型调用费用由填 Key 的用户各自承担。
+- `prompt_cache_hit_tokens` 按官方缓存命中价计费（`CacheRatio`：flash 0.02 / v4-pro ≈0.033333，取两时段较小值——宁可少收不错收）；**需确认 new-api 版本支持缓存分档**，且渠道级 `setting.cache_ratio` 未覆盖全局值（当前渠道为空 = 生效全局）。
+- 接入真实 DeepSeek Key 前，token 统计与缓存命中行为由 mock 上游模拟，**不能替代真实验收**（最终验收须用真实 Key 跑一笔带缓存命中的长对话，核对 `logs.quota` 与分档手算值误差 ≤1%）。

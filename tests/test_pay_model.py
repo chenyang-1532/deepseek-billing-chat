@@ -13,11 +13,13 @@ import urllib.error
 import urllib.parse
 
 import os
+from _guard import guard, assert_restart_allowed
 TAG = os.environ.get("RT_TAG", "")
 
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
 BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test"
+guard(SITE)
 SITE_DB = SITE + "/data.db"
 NAPI = "/opt/newapi/one-api.db"
 QUSD = 500000

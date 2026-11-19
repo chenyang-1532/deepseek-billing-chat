@@ -2,10 +2,12 @@
 """审查 R2/P1-15 云同步冲突处理回归：
 服务端 rev 权威、base_revs 并发冲突检测、时钟回拨容忍、恢复一致快照"""
 import io, json, os, sys, sqlite3, urllib.request, urllib.error, urllib.parse, uuid, zipfile
+from _guard import guard, assert_restart_allowed
 
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
 BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test/data.db"
+guard(SITE)
 TAG = os.environ.get("RT_TAG", "")
 U = "rttest%s_cloud" % TAG
 PWD = "cloud123456"

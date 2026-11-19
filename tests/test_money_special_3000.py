@@ -10,12 +10,14 @@ import urllib.request
 import urllib.parse
 
 import os
+from _guard import guard, assert_restart_allowed
 TAG = os.environ.get("RT_TAG", "")
 
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
 BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test"
 NAPI_DB = "/opt/newapi/one-api.db"
+guard(SITE, NAPI_DB)
 PASS, FAIL = 0, 0
 
 

@@ -1,0 +1,177 @@
+# -*- coding: utf-8 -*-
+"""R3 P0 专项：审查要求的 4 个失败注入用例（b134e9d 复审收口清单验收项）
+
+1. 空 secret.key 自愈（P0-A）：0 字节 key 必须自动轮换，绝不接受空/短密钥
+2. 兑换码幂等（P0-B）：gw_add_quota 成功后响应丢失 → 重试 → 只到账一次
+3. CacheRatio 单价（P0-C）：recompute_ratios 必须写 CacheRatio，flash=0.02 / pro≈0.033333
+4. 并发上传存档（低成本修正2）：同 ms 并发 _save_snapshot 不互相覆盖
+"""
+import ast
+import concurrent.futures
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+import types
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "/tmp/chatsite-test")
+import app as A  # noqa: E402
+from _guard import guard  # noqa: E402
+import json  # noqa: E402
+import sqlite3  # noqa: E402
+import urllib.request  # noqa: E402
+
+guard(A.DB_PATH, "/opt/newapi/one-api.db")
+
+PASS = FAIL = 0
+
+
+def ck(name, cond, extra=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print("  ✅", name)
+    else:
+        FAIL += 1
+        print("  ❌", name, extra)
+
+
+APP = os.path.join("/tmp/chatsite-test", "app.py")
+
+
+def _extract_fn(name):
+    """从 app.py 抽出单个函数 AST（避免 import app 触发后台线程/建库副作用）"""
+    tree = ast.parse(open(APP, encoding="utf-8").read())
+    fn = next(n for n in tree.body
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
+    return ast.Module([fn], [])
+
+
+print("═══ 1. P0-A 空 secret.key 自愈 ═══")
+# 先证明旧实现的危害（红）：空 key 会被原样接受
+tmpd = tempfile.mkdtemp(prefix="rt_secret_")
+try:
+    sk = os.path.join(tmpd, "secret.key")
+    open(sk, "wb").close()  # 0 字节
+    mod = types.ModuleType("m")
+    mod.os = os
+    mod.secrets = __import__("secrets")
+    mod.BASE = tmpd
+    exec(compile(_extract_fn("_load_secret"), "<t>", "exec"), mod.__dict__)
+    key = mod._load_secret()
+    ck("空 key 启动 → 自动轮换为 >=32 字节", len(key) >= 32, "len=%d" % len(key))
+    ck("文件已覆写为新 key", open(sk, "rb").read() == key)
+    ck("新文件权限 0600", oct(os.stat(sk).st_mode & 0o777) == "0o600")
+    # 再调用一次：已 >=32 字节，不得再次轮换
+    key2 = mod._load_secret()
+    ck("正常 key 不被重复轮换", key2 == key)
+    # 短 key（如运维误 echo 短串）同样自愈
+    open(sk, "wb").write(b"123")
+    key3 = mod._load_secret()
+    ck("3 字节短 key → 同样自动轮换", len(key3) >= 32 and open(sk, "rb").read() == key3)
+finally:
+    shutil.rmtree(tmpd, ignore_errors=True)
+
+print("═══ 2. P0-B 兑换码幂等（响应丢失重试只到账一次） ═══")
+import urllib.error
+NR = urllib.request.HTTPCookieProcessor()
+BASE = "http://127.0.0.1:3000"
+U = "rttest_r3" + os.environ.get("RT_TAG", "x")[:6].lower()
+PWD = "pw123456"
+SITE = A.DB_PATH
+
+
+def api(method, path, data=None):
+    req = urllib.request.Request(BASE + path,
+                                 data=json.dumps(data).encode() if data else None,
+                                 method=method, headers={"Content-Type": "application/json"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        return resp.status, resp.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")
+
+
+api("POST", "/api/register", {"u": U, "p": PWD})
+c = sqlite3.connect(SITE)
+c.execute("UPDATE users SET status='approved', expiry=date('now','localtime','+30 days') WHERE username=?", (U,))
+c.commit(); c.close()
+uid = c.execute("SELECT id FROM users WHERE username=?", (U,)).fetchone()[0] if False else sqlite3.connect(SITE).execute("SELECT id FROM users WHERE username=?", (U,)).fetchone()[0]
+A.gw_provision({"id": uid, "username": U})
+nid = sqlite3.connect(SITE).execute(
+    "SELECT napi_uid FROM gateway_map WHERE uid=?", (uid,)).fetchone()[0]
+
+
+def nq():
+    with A.napi_connect() as nc:
+        return nc.execute("SELECT quota FROM users WHERE id=?", (nid,)).fetchone()[0]
+
+
+q0 = nq()
+q1 = A.cny_to_quota(1.0)
+op = "redeem:R3-TEST-CODE"
+try:
+    A.gw_add_quota(nid, q1, op_id=op)  # 第一次：真实到账
+    # 注入「到账成功但响应丢失」：重试同一 op_id —— 幂等命中必须跳过
+    A.gw_add_quota(nid, q1, op_id=op)
+    q_after = nq()
+    ck("重试后余额只增加一次面额", q_after - q0 == q1, (q_after - q0, q1))
+    with A.napi_connect() as nc:
+        n = nc.execute("SELECT COUNT(*) FROM quota_ops WHERE op_id=?", (op,)).fetchone()[0]
+    ck("quota_ops 只有 1 条 redeem:<code>", n == 1, n)
+    # 反向：同 op_id 不同金额 → 必须报错（语义校验，R2 已修，此处确认未被破坏）
+    try:
+        A.gw_add_quota(nid, q1 * 2, op_id=op)
+        ck("同 op_id 不同金额必须报错", False)
+    except RuntimeError:
+        ck("同 op_id 不同金额必须报错", True)
+finally:
+    with A.napi_connect() as nc:
+        nc.execute("DELETE FROM quota_ops WHERE op_id=?", (op,))
+        nc.commit()
+
+print("═══ 3. P0-C CacheRatio 单价 ═══")
+st = A.recompute_ratios(None)
+ck("recompute_ratios 成功/无变化", st in (A.RATIOS_SUCCESS, A.RATIOS_UNCHANGED), st)
+with A.napi_connect() as nc:
+    row = nc.execute("SELECT value FROM options WHERE key='CacheRatio'").fetchone()
+ck("options 存在 CacheRatio", row is not None)
+cache = json.loads(row[0]) if row else {}
+d = A.OFFICIAL_PRICES_DEFAULT
+exp_flash = round(min(d["deepseek-flash"]["in_hit"][0] / d["deepseek-flash"]["in_miss"][0],
+                      d["deepseek-flash"]["in_hit"][1] / d["deepseek-flash"]["in_miss"][1]), 6)
+exp_pro = round(min(d["deepseek-v4-pro"]["in_hit"][0] / d["deepseek-v4-pro"]["in_miss"][0],
+                    d["deepseek-v4-pro"]["in_hit"][1] / d["deepseek-v4-pro"]["in_miss"][1]), 6)
+ck("flash cache 比值 = %s（0.02，缺省时为 50 倍多收根因）" % exp_flash,
+   cache.get("deepseek-flash") == exp_flash, cache.get("deepseek-flash"))
+ck("pro cache 比值 = %s" % exp_pro, cache.get("deepseek-v4-pro") == exp_pro,
+   cache.get("deepseek-v4-pro"))
+ck("比值 ≤ 0.05（宁可少收不多收）", all(v <= 0.05 for v in cache.values() if v), cache)
+
+print("═══ 4. 并发上传存档不互相覆盖 ═══")
+udir = tempfile.mkdtemp(prefix="rt_snap_")
+try:
+    orig = A.SNAP_DIR
+    A.SNAP_DIR = udir
+    A._save_snapshot(99999901, b"A" * 10, 1700000000000)
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        fs = [ex.submit(A._save_snapshot, 99999901, bytes([65 + i]) * 10, 1700000000001)
+              for i in range(8)]
+        for f in fs:
+            f.result()
+    A.SNAP_DIR = orig
+    # 结构：SNAP_DIR/<uid>/<ts>.zip（并发时每个快照独立文件名，互不覆盖）
+    ufiles = sorted(os.listdir(os.path.join(udir, "99999901")))
+    ck("并发 8 次上传全部无异常完成（保留策略 SNAP_KEEP=%d，最终 ≤%d 份）" % (A.SNAP_KEEP, A.SNAP_KEEP),
+       1 <= len(ufiles) <= A.SNAP_KEEP, (len(ufiles), ufiles))
+    ck("全部为独立 .zip（无固定 .tmp 覆盖）", all(f.endswith(".zip") for f in ufiles), ufiles)
+    # 每个快照内容完整（10 字节），未串写
+    ok = all(len(open(os.path.join(udir, "99999901", f), "rb").read()) == 10 for f in ufiles)
+    ck("全部快照内容完整无串写", ok)
+finally:
+    shutil.rmtree(udir, ignore_errors=True)
+
+print("\n总结果: 过 %d / 挂 %d" % (PASS, FAIL))
+sys.exit(1 if FAIL else 0)

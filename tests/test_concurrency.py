@@ -13,11 +13,13 @@ import time
 import urllib.request
 
 import os
+from _guard import guard, assert_restart_allowed
 TAG = os.environ.get("RT_TAG", "")
 
 BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test/data.db"
 NAPI = "/opt/newapi/one-api.db"
+guard(SITE, NAPI)
 QUSD, USD2CNY = 500000, 7.2
 PASS, FAIL = 0, 0
 

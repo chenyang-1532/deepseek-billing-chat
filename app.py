@@ -70,7 +70,22 @@ SNAP_KEEP = 30                               # 每个账号保留最近 30 个�
 def _load_secret() -> bytes:
     key_file = os.path.join(BASE, "secret.key")
     if os.path.exists(key_file):
-        return open(key_file, "rb").read()
+        key = open(key_file, "rb").read()
+        old_len = len(key)
+        if old_len >= 32:
+            return key
+        # 空/过短密钥可被 HMAC 伪造会话（审查 P0-A）：自动轮换，旧会话全部失效。
+        # 不直接 raise——服务起不来只会诱导运维 touch 一个空文件，把漏洞固化。
+        key = secrets.token_hex(32).encode()
+        tmp = key_file + ".rotate"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, key)
+        finally:
+            os.close(fd)
+        os.replace(tmp, key_file)
+        print("[security] secret.key 长度=%d 不足 32，已自动轮换(新 key %d 字节)；旧会话已失效" % (old_len, len(key)))
+        return key
     # 原子创建（O_EXCL 防并发双写）并强制 0600，不依赖 umask
     fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -2108,29 +2123,39 @@ def recompute_ratios(official: dict | None = None) -> str:
     tier = 1 if _is_peak_now() else 0   # 0=谷 1=峰
     tmult, trule = _active_time_mult()
     mults = get_multipliers()
-    mr_map, cr_map = {}, {}
+    mr_map, cr_map, cache_map = {}, {}, {}
     for m in SITE_MODELS:
         base = models.get(OFFICIAL_PRICE_MAP.get(m, "deepseek-flash")) or OFFICIAL_PRICES_DEFAULT[OFFICIAL_PRICE_MAP.get(m, "deepseek-flash")]
         n = float(mults.get(m, 1.0)) * tmult
         mr_map[m] = _ratio_from_price(base["in_miss"][tier], n)
         cr_map[m] = _ratio_from_price(base["out"][tier], n)
+        # P0-C：缓存命中计价比 = 官方缓存命中价 / 未命中价（与 ModelRatio 同源同时段）。
+        # 两个模型比值不同（flash 0.02 / pro ≈0.0333），按 map 逐模型写入；
+        # 比值取两个时段中的较小值——宁可少收（按更低的缓存价），绝不多收。
+        cache_map[m] = round(min(
+            base["in_hit"][0] / base["in_miss"][0],
+            base["in_hit"][1] / base["in_miss"][1],
+        ), 6)
     try:
         with napi_connect() as nc:
             rows = {r["key"]: r["value"] for r in nc.execute(
-                "SELECT key, value FROM options WHERE key IN ('ModelRatio','CompletionRatio')")}
+                "SELECT key, value FROM options WHERE key IN ('ModelRatio','CompletionRatio','CacheRatio')")}
             try:
                 old_mr = json.loads(rows.get("ModelRatio") or "{}")
                 old_cr = json.loads(rows.get("CompletionRatio") or "{}")
+                old_cache = json.loads(rows.get("CacheRatio") or "{}")
             except json.JSONDecodeError:
-                old_mr, old_cr = {}, {}
+                old_mr, old_cr, old_cache = {}, {}, {}
             # 合并：其他模型（可能被共享 new-api 的其他项目配置）原样保留
             merged_mr = dict(old_mr); merged_mr.update(mr_map)
             merged_cr = dict(old_cr); merged_cr.update(cr_map)
-            if old_mr == merged_mr and old_cr == merged_cr:
+            merged_cache = dict(old_cache); merged_cache.update(cache_map)
+            if old_mr == merged_mr and old_cr == merged_cr and old_cache == merged_cache:
                 _GW_RATIO_CACHE["data"] = (mr_map, cr_map)
                 _GW_RATIO_CACHE["ts"] = time.time()
                 return RATIOS_UNCHANGED
-            for key, val in (("ModelRatio", merged_mr), ("CompletionRatio", merged_cr)):
+            for key, val in (("ModelRatio", merged_mr), ("CompletionRatio", merged_cr),
+                             ("CacheRatio", merged_cache)):
                 if key in rows:
                     nc.execute("UPDATE options SET value=? WHERE key=?", (json.dumps(val), key))
                 else:
@@ -2140,17 +2165,19 @@ def recompute_ratios(official: dict | None = None) -> str:
         print("[official-price] 倍率写回失败:", e)
         return RATIOS_FAILURE
     # 提交后 durable 确认（审查 R1/P1-04）：用新连接读已提交生效值，
-    # 并校验全部 SITE_MODELS × ModelRatio/CompletionRatio，而非单模型单事务快照。
+    # 并校验全部 SITE_MODELS × ModelRatio/CompletionRatio/CacheRatio（P0-C），而非单模型单事务快照。
     try:
         with napi_connect() as nc2:
             rows2 = {r["key"]: r["value"] for r in nc2.execute(
-                "SELECT key, value FROM options WHERE key IN ('ModelRatio','CompletionRatio')")}
+                "SELECT key, value FROM options WHERE key IN ('ModelRatio','CompletionRatio','CacheRatio')")}
         mr_eff = json.loads(rows2.get("ModelRatio") or "{}")
         cr_eff = json.loads(rows2.get("CompletionRatio") or "{}")
-        ok = all(mr_eff.get(m) == mr_map[m] and cr_eff.get(m) == cr_map[m] for m in SITE_MODELS)
+        cache_eff = json.loads(rows2.get("CacheRatio") or "{}")
+        ok = all(mr_eff.get(m) == mr_map[m] and cr_eff.get(m) == cr_map[m]
+                 and cache_eff.get(m) == cache_map[m] for m in SITE_MODELS)
         if not ok:
-            print("[official-price] ⚠️ 提交后回读不一致: eff_mr=%s expect=%s" % (
-                {m: mr_eff.get(m) for m in SITE_MODELS}, mr_map))
+            print("[official-price] ⚠️ 提交后回读不一致: eff_mr=%s expect=%s cache_eff=%s" % (
+                {m: mr_eff.get(m) for m in SITE_MODELS}, mr_map, cache_eff))
     except Exception as e:  # noqa: BLE001
         print("[official-price] 回读确认失败:", e)
         ok = False

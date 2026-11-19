@@ -5,9 +5,14 @@
 # - 套件间强制间隔 65s：注册/登录限流为 10·20 次/分钟/IP，
 #   连续注册会被 429 造成假失败，间隔规避。
 # 用法：RT_TAG=<唯一标签> ADMIN_PW=<管理密码> bash tests/run_all.sh
+# RT_ALLOWED_DB_DIRS：显式声明测试实例所在目录（审查 P1-测试安全），
+#   只有声明后 guard() 才允许测试访问 /tmp 之外的库路径；生产机不声明 → 一律退出码 2 拒绝。
+# RT_ALLOW_RESTART=1：显式允许重启类用例（如 reconciliation 的 new-api 重启恢复）。
 set -u
 cd "$(dirname "$0")/.."
 export RT_TAG="${RT_TAG:-runner$(date +%H%M%S)}"
+export RT_ALLOWED_DB_DIRS="${RT_ALLOWED_DB_DIRS:-/opt/newapi}"   # 沙箱测试实例声明；生产机请勿声明
+export RT_ALLOW_RESTART="${RT_ALLOW_RESTART:-1}"                 # 沙箱测试实例允许重启；生产机必须显式关闭
 FAIL=0
 RESULTS=()
 
@@ -35,6 +40,10 @@ cooldown
 run money_security python3.11 tests/test_money_security.py
 cooldown
 run p0_saga       python3.11 tests/test_p0_saga.py
+run p0_r3         python3.11 tests/test_p0_r3.py
+run p1_sid        python3.11 tests/test_p1_sid.py
+run p1_cloud      python3.11 tests/test_p1_cloud.py
+run p1_price      python3.11 tests/test_p1_price.py
 cooldown
 run pay_model     python3.11 tests/test_pay_model.py
 cooldown

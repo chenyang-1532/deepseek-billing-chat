@@ -4,6 +4,7 @@ import io, json, os, sys, zipfile, uuid
 
 sys.path.insert(0, "/tmp/chatsite-test")
 import app as A  # noqa: E402
+from _guard import guard, assert_restart_allowed
 
 results = []
 
@@ -22,6 +23,7 @@ def mkzip(entries):
 
 
 S = "chat_sessions/"
+guard()
 sid = str(uuid.uuid4())
 sess = json.dumps({"id": sid, "title": "t", "updated_at": "1", "messages": []}).encode()
 

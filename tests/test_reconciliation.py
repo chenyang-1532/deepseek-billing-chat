@@ -10,10 +10,12 @@ import time
 import urllib.request
 
 import os
+from _guard import guard, assert_restart_allowed
 TAG = os.environ.get("RT_TAG", "")
 
 BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test/data.db"
+guard(SITE)
 NAPI = "/opt/newapi/one-api.db"
 QUSD, USD2CNY = 500000, 7.2
 PASS, FAIL = 0, 0
@@ -168,12 +170,18 @@ def port_up():
     except Exception:
         return False
 
-# 全局文件锁：并行全量测试时重启段全局串行，避免代理间互踩
+# 审查 P0-测试安全：重启真实 new-api 进程必须三重前置全过，否则整段 skip。
+# 生产机绝对禁止——pkill -f 'new-api' 会杀掉线上计费服务。
+if not assert_restart_allowed():
+    print("[SKIP] 跳过重启恢复段（映射/余额持久性不变量已由上方 API 级检查覆盖）")
+    raise SystemExit(0)  # 以退出码 0 视为 skip，不判失败
 lockf = open("/tmp/napi_restart.lock", "w")
 fcntl.flock(lockf, fcntl.LOCK_EX)
 try:
-    # 1) 停止实例；由常驻守护循环统一拉起，避免双实例端口竞争
-    subprocess.run("pkill -f 'new-api'", shell=True, executable="/bin/bash")
+    # 1) 停止本机测试实例；由常驻守护循环统一拉起，避免双实例端口竞争。
+    # pkill 匹配词收紧为精确二进制路径，避免误杀 tail/编辑器等命令行含 new-api 的无关进程
+    subprocess.run("pkill -f '/opt/newapi/new-api' || pkill -xf 'new-api --port 3001'",
+                   shell=True, executable="/bin/bash")
     deadline = time.time() + 20
     while time.time() < deadline and port_up():
         time.sleep(0.5)

@@ -5,6 +5,7 @@ import json, os, sys, time, sqlite3
 
 sys.path.insert(0, "/tmp/chatsite-test")
 import app as A  # noqa: E402
+from _guard import guard, assert_restart_allowed
 
 results = []
 
@@ -15,6 +16,7 @@ def ck(name, cond, extra=None):
 
 
 SITE = "/tmp/chatsite-test/data.db"
+guard(SITE)
 
 
 def set_setting_raw(key, val):

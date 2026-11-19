@@ -33,6 +33,8 @@ def req(path, data=None, method=None):
 # ── A. 逻辑单元测试（直接 import app 模块）──
 print("── A. 时段倍率核心逻辑 ──")
 import app as A
+from _guard import guard, assert_restart_allowed
+guard()
 
 # A1 无规则默认
 A.set_setting(A.GW_TIME_MULT_KEY, json.dumps({"default": 1.0, "rules": []}))

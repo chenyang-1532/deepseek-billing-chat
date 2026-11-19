@@ -28,14 +28,14 @@
 ## 核心设计（供审查参考）
 
 1. **网关统一改写**：`_gw_proxy` 强制把请求体 `model` 改写为站点默认模型（设置键 `gw_default_model`，默认 deepseek-flash），用户无感知，后台可切换、切换即时生效。
-2. **实时定价引擎**：`fetch_official_prices()` 每 10 分钟抓官方价 → `_peak_window()` 判峰/谷 → `recompute_ratios()` 按「官方价 × 模型倍数 × 时段倍数」重算 ModelRatio/CompletionRatio 写入 new-api options；值无变化不写库。
+2. **实时定价引擎**：`fetch_official_prices()` 每 10 分钟抓官方价 → `_peak_window()` 判峰/谷 → `recompute_ratios()` 按「官方价 × 模型倍数 × 时段倍数」重算 ModelRatio/CompletionRatio/**CacheRatio**（缓存命中比=命中价/未命中价，取两时段较小值）写入 new-api options；值无变化不写库，写库后新连接回读全模型确认。
 3. **时段倍率**：面板可配置时段规则（支持跨零点、最多 10 条、按序匹配），`get_time_mults()` 提供运行时查询，规则变更即时重算。
 4. **充值双通道**：26 位卡密（无 I/O/0/1）+ 扫码支付（¥5 起充、站长上传二维码、用户提交→站长审批到账，`pay_orders` 表 pending→approved/rejected 幂等审批，二维码魔数校验）。
 5. **三道扣费闸**：余额预检 / 估算预检 / 并发上限，防透支、防并发竞态。
 
 ## 运行形态
 
-- 站点 `:3000`（app.py）· new-api `:3001`（计费网关）· mock 上游 `:3002`
+- 站点 `:3000`（app.py）· new-api `:3001`（计费网关）· mock 上游 `:3002`（**当前为 mock 验收环境**；接入真实 DeepSeek Key 后上游切换为 https://api.deepseek.com，上线前必须用真实 Key 完成带缓存命中请求的计费验收，mock 的 token 统计/缓存行为不能替代）
 - 守护：`/tmp/supervisor.sh` setsid 常驻循环；网关开关 = 站点目录 `gateway.on` 文件
 - 敏感/运行时文件（data.db、secret.key、.admin_password）不入库
 

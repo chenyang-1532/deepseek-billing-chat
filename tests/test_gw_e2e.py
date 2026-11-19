@@ -4,12 +4,14 @@ import sys
 import asyncio, http.cookiejar, json, sqlite3, sys, urllib.request
 
 import os
+from _guard import guard, assert_restart_allowed
 TAG = os.environ.get("RT_TAG", "")
 
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
 BASE = "http://127.0.0.1:3000"
 SITE_DB = "/tmp/chatsite-test/data.db"
 NAPI = "/opt/newapi/one-api.db"
+guard(SITE_DB, NAPI)
 U = "rttest%s_gw_e2e" % TAG
 PWD = "gwe2e123"
 

@@ -58,6 +58,8 @@ CK = [x for x in (h.get_all("Set-Cookie") or []) if "session" in x][0].split(";"
 uid = q("SELECT id FROM users WHERE username=?", (U,))[0]["id"]
 
 import http.cookiejar
+from _guard import guard, assert_restart_allowed
+guard(SITE, NAPI)
 jar = http.cookiejar.CookieJar()
 ADM = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), NR)
 try:
