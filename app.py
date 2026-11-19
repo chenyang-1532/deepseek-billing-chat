@@ -1099,7 +1099,8 @@ def api_restore_get(request: Request):
 def _snap_key(n: str):
     """快照文件名排序键：'1700000000001-ab12cd34.zip' → (ms, 名字)。
     兼容审查 R2 前的旧格式 '{now_ms}.zip'（无 '-' 后缀段）；
-    异常文件名（非数字前缀）排到最后且不参与删除（R6/审查 P2：容错不抛 ValueError）。"""
+    异常文件名（非数字前缀）排最前（视为最旧，R6/审查 P2：容错不抛 ValueError）——
+    SNAP_KEEP 裁剪时最先删它，_latest_snapshot 也不会选中它。"""
     try:
         return (int(n[:-4].split("-")[0]), n)
     except ValueError:
@@ -2962,6 +2963,20 @@ async def gw_anthropic_put(path: str, request: Request):
 
 
 # ── 扫码充值（用户提交 → 管理员审核到账；卡密兑换并行保留） ──
+def _pay_dup_response(dup):
+    """幂等命中原订单的统一响应。
+    审查 R7/P2：status=rejected 时明确告知「已驳回」，避免用户误以为新申请已提交；
+    仍返回 ok=True 让前端按约定清掉 crid 键——下次提交自动生成新幂等键 → 新订单，
+    不会被旧键锁死。"""
+    msg = "该充值申请已存在（原订单 #%s），请勿重复提交" % dup["id"]
+    if dup["status"] == "rejected":
+        msg = "原充值订单 #%s 已被驳回，如需充值请重新提交" % dup["id"]
+    return JSONResponse({
+        "ok": True, "order_id": dup["id"], "cny": dup["cny"],
+        "status": dup["status"], "created_at": dup["created_at"], "msg": msg,
+    })
+
+
 @app.post("/api/wallet/pay-request")
 async def api_wallet_pay_request(request: Request):
     user = get_user(request)
@@ -3006,12 +3021,8 @@ async def api_wallet_pay_request(request: Request):
                     {"ok": False, "msg": "该幂等键已绑定其他金额（¥%s），请刷新页面重新发起" % dup["cny"]},
                     status_code=409,
                 )
-            print("[pay] 幂等命中 crid=%s 返回原订单 #%s" % (crid[:8], dup["id"]))
-            return JSONResponse({
-                "ok": True, "order_id": dup["id"], "cny": dup["cny"],
-                "status": dup["status"], "created_at": dup["created_at"],
-                "msg": "该充值申请已存在（原订单 #%s），请勿重复提交" % dup["id"],
-            })
+            print("[pay] 幂等命中 crid=%s 返回原订单 #%s status=%s" % (crid[:8], dup["id"], dup["status"]))
+            return _pay_dup_response(dup)
         pending = c.execute(
             "SELECT COUNT(*) AS n FROM pay_orders WHERE uid=? AND status='pending'", (user["id"],)
         ).fetchone()["n"]
@@ -3038,11 +3049,7 @@ async def api_wallet_pay_request(request: Request):
                     {"ok": False, "msg": "该幂等键已绑定其他金额（¥%s），请刷新页面重新发起" % dup["cny"]},
                     status_code=409,
                 )
-            return JSONResponse({
-                "ok": True, "order_id": dup["id"], "cny": dup["cny"],
-                "status": dup["status"], "created_at": dup["created_at"],
-                "msg": "该充值申请已存在（原订单 #%s），请勿重复提交" % dup["id"],
-            })
+            return _pay_dup_response(dup)
         oid = c.execute("SELECT last_insert_rowid() AS i").fetchone()["i"]
     print("[pay] 新充值申请 #%s user=%s ¥%s" % (oid, user["username"], amount))
     return JSONResponse({"ok": True, "order_id": oid, "cny": amount,

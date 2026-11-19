@@ -8,8 +8,8 @@ secret.key.*
 *.lock
 .admin_password
 data.db
-official_price_snapshot.html
-official_price_snapshot.html.meta.json
+/official_price_snapshot.html
+/official_price_snapshot.html.meta.json
 
 # 用户数据
 snapshots/
