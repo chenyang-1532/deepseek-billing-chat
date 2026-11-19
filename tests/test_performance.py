@@ -1,0 +1,213 @@
+import sys
+# -*- coding: utf-8 -*-
+"""第十一部分：性能测试（真实请求打到完整计费链路）
+会话 cookie 按站点 sign() 算法本地构造（仅用于压测登录环节，计费链路完全真实）。
+指标：成功率 / 平均 / P95 / P99 延迟 / 错误率 / 服务进程 CPU·内存 / 余额正确性
+"""
+import concurrent.futures as cf
+import json
+import os
+import sqlite3
+import statistics
+import subprocess
+import time
+import urllib.request
+
+import os
+TAG = os.environ.get("RT_TAG", "")
+
+BASE = "http://127.0.0.1:3000"
+SITE = "/tmp/chatsite-test"
+SITE_DB = SITE + "/data.db"
+NAPI = "/opt/newapi/one-api.db"
+SECRET = open(SITE + "/secret.key", "rb").read()
+QUSD, USD2CNY = 500000, 7.2
+PASS, FAIL = 0, 0
+
+
+def ck(name, cond, extra=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print("  ✅ " + name)
+    else:
+        FAIL += 1
+        print("  ❌ " + name + (" | " + str(extra) if extra else ""))
+
+
+def make_cookie(uid):
+    import base64, hashlib, hmac
+    body = base64.urlsafe_b64encode(json.dumps({"uid": uid, "exp": time.time() + 86400}).encode()).decode().rstrip("=")
+    sig = hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()
+    return "session=%s.%s" % (body, sig)
+
+
+def api(method, path, data=None, cookie=None, timeout=90):
+    body = json.dumps(data).encode() if isinstance(data, dict) else None
+    req = urllib.request.Request(BASE + path, data=body, method=method)
+    if isinstance(data, dict):
+        req.add_header("Content-Type", "application/json")
+    if cookie:
+        req.add_header("Cookie", cookie)
+    try:
+        r = urllib.request.urlopen(req, timeout=timeout)
+        return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except Exception:
+        return 0, b""
+
+
+def proc_stats(pattern):
+    out = subprocess.run(["ps", "-o", "pid,%cpu,rss,args", "-e"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if pattern in line and "grep" not in line:
+            parts = line.split()
+            return float(parts[1]), int(parts[2]) / 1024.0
+    return 0.0, 0.0
+
+
+print("═══ 准备 N 个压测账号（DB直插，绕过注册限流；计费链路全真实） ═══")
+import hashlib
+PW = hashlib.sha256(b"perftest123").hexdigest()  # 与站点 hash 算法一致即可（不登录，仅占位）
+
+
+def prep_users(n):
+    site = sqlite3.connect(SITE_DB, timeout=30)
+    napi = sqlite3.connect(NAPI, timeout=30)
+    users = []
+    today = time.strftime("%Y-%m-%d")
+    for i in range(n):
+        u = "rttest%s_perf_%d" % (TAG, i)
+        row = site.execute("SELECT id FROM users WHERE username=?", (u,)).fetchone()
+        if row:
+            uid = row[0]
+        else:
+            site.execute("INSERT INTO users(username,pw_hash,status,expiry,created_at) VALUES(?,?,?,?,?)",
+                         (u, PW, "approved", today, today))
+            uid = site.execute("SELECT id FROM users WHERE username=?", (u,)).fetchone()[0]
+        site.commit()
+        mrow = site.execute("SELECT napi_uid FROM gateway_map WHERE uid=?", (uid,)).fetchone()
+        if mrow:
+            nid = mrow[0]
+        else:
+            uname = "site%d_%s" % (uid, u[:16])
+            napi.execute("INSERT INTO users(username,password,display_name,role,status,quota) VALUES(?,?,?,1,1,?)",
+                         (uname[:32], os.urandom(8).hex(), u[:20], 69444))
+            nid = napi.execute("SELECT id FROM users WHERE username=?", (uname[:32],)).fetchone()[0]
+            key = os.urandom(24).hex()
+            napi.execute("INSERT INTO tokens(user_id,key,status,name,created_time,accessed_time,expired_time,remain_quota,unlimited_quota) "
+                         "VALUES(?,?,1,?,?,?,-1,0,1)", (nid, key, "site-%d" % uid, int(time.time()), int(time.time())))
+            site.execute("INSERT INTO gateway_map(uid,napi_uid,token_key) VALUES(?,?,?)", (uid, nid, key))
+            site.commit()
+        napi.execute("UPDATE users SET quota=69444 WHERE id=?", (nid,))
+        napi.commit()
+        users.append((uid, nid))
+    site.close()
+    napi.close()
+    return users
+
+
+BODY = {"model": "deepseek-flash", "max_tokens": 1000, "stream": False,
+        "messages": [{"role": "user", "content": "性能测试请求" * 20}]}
+
+
+def run_load(n_users, req_per_user):
+    users = prep_users(n_users)
+    lat = []
+    ok = 0
+    t0 = time.time()
+
+    def one(idx):
+        uid, _ = users[idx % len(users)]
+        t1 = time.time()
+        s, _b = api("POST", "/anthropic/v1/messages", BODY, cookie=make_cookie(uid))
+        return s, (time.time() - t1) * 1000
+
+    with cf.ThreadPoolExecutor(max_workers=n_users) as pool:
+        results = list(pool.map(one, range(n_users * req_per_user)))
+    wall = time.time() - t0
+    time.sleep(1.5)
+    for s, ms in results:
+        if s == 200:
+            ok += 1
+        lat.append(ms)
+    # 每用户余额复核
+    site = sqlite3.connect(SITE_DB, timeout=30)
+    napi = sqlite3.connect(NAPI, timeout=30)
+    bad_bal = 0
+    for uid, nid in users:
+        q = napi.execute("SELECT quota FROM users WHERE id=?", (nid,)).fetchone()[0]
+        if q < 0:
+            bad_bal += 1
+    napi.close()
+    site.close()
+    lat.sort()
+    p95 = lat[int(len(lat) * 0.95) - 1] if lat else 0
+    p99 = lat[min(int(len(lat) * 0.99), len(lat) - 1)] if lat else 0
+    return {
+        "n_users": n_users, "requests": len(lat), "success": ok,
+        "error_rate": round(100 * (1 - ok / len(lat)), 2),
+        "avg_ms": round(statistics.mean(lat), 1),
+        "p95_ms": round(p95, 1), "p99_ms": round(p99, 1),
+        "wall_s": round(wall, 2), "throughput_rps": round(len(lat) / wall, 2),
+        "neg_balance_users": bad_bal,
+    }
+
+
+cpu0, mem0 = proc_stats("uvicorn app:app")
+results = {}
+for n_users, rpu in ((10, 2), (50, 2), (100, 2)):
+    r = run_load(n_users, rpu)
+    results["users%d" % n_users] = r
+    print("  %3d用户×%d请求: 成功%d/%d 错误率%.1f%% 平均%.0fms P95=%.0fms P99=%.0fms 墙钟%.1fs 吞吐%.1frps 负余额用户%d"
+          % (n_users, rpu, r["success"], r["requests"], r["error_rate"], r["avg_ms"], r["p95_ms"],
+             r["p99_ms"], r["wall_s"], r["throughput_rps"], r["neg_balance_users"]))
+cpu1, mem1 = proc_stats("uvicorn app:app")
+
+print("\n─── 服务资源占用 ───")
+print("  uvicorn: CPU %.1f%%→%.1f%%  内存 %.0fMB→%.0fMB" % (cpu0, cpu1, mem0, mem1))
+cpu_na, mem_na = proc_stats("./new-api")
+print("  new-api: CPU %.1f%%  内存 %.0fMB" % (cpu_na, mem_na))
+
+ck("100并发下无负余额", results["users100"]["neg_balance_users"] == 0)
+ck("10并发错误率<5%", results["users10"]["error_rate"] < 5, results["users10"]["error_rate"])
+ck("50并发错误率<10%", results["users50"]["error_rate"] < 10, results["users50"]["error_rate"])
+ck("100并发错误率<20%", results["users100"]["error_rate"] < 20, results["users100"]["error_rate"])
+
+# ── 大量记录查询性能 ──
+t1 = time.time()
+c = sqlite3.connect(NAPI, timeout=15)
+c.execute("SELECT COUNT(*) FROM logs WHERE type=2").fetchone()
+q_ms = (time.time() - t1) * 1000
+print("  流水表聚合查询: %.1fms（当前 logs %d 行）" % (q_ms, c.execute("SELECT COUNT(*) FROM logs").fetchone()[0]))
+c.close()
+
+# ── 清理 ──
+site = sqlite3.connect(SITE_DB, timeout=30)
+napi = sqlite3.connect(NAPI, timeout=30)
+uids = [r[0] for r in site.execute("SELECT id FROM users WHERE username LIKE 'rttest%s_perf_'" % TAG).fetchall()]
+nids = [r[0] for r in site.execute("SELECT napi_uid FROM gateway_map WHERE uid IN (%s)" % ",".join(map(str, uids))).fetchall()] if uids else []
+site.execute("DELETE FROM gateway_map WHERE uid IN (%s)" % ",".join(map(str, uids or [0])))
+site.execute("DELETE FROM users WHERE username LIKE 'rttest%s_perf_'" % TAG)
+site.commit()
+for nid in nids:
+    napi.execute("DELETE FROM logs WHERE user_id=?", (nid,))
+    napi.execute("DELETE FROM tokens WHERE user_id=?", (nid,))
+    napi.execute("DELETE FROM users WHERE id=?", (nid,))
+napi.commit()
+site.close()
+napi.close()
+print("rttest_perf_* 已清理")
+print("══════════════")
+print("性能测试: ✅通过 %d  ❌失败 %d" % (PASS, FAIL))
+
+os.makedirs("/root/.codebuddy/artifact/delivery/test_results", exist_ok=True)
+with open("/root/.codebuddy/artifact/delivery/test_results/perf_result.json", "w") as f:
+    json.dump({"results": results, "uvicorn_cpu": [cpu0, cpu1], "uvicorn_mem_mb": [mem0, mem1],
+               "newapi_cpu": cpu_na, "newapi_mem_mb": mem_na, "logs_query_ms": round(q_ms, 1)}, f, ensure_ascii=False, indent=2)
+print("结果已存 delivery/test_results/perf_result.json")
+
+
+# P1-13：失败必须非零退出
+sys.exit(1 if FAIL else 0)
