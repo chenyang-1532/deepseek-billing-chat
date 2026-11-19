@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """审查 P0 修复故障注入专项：P0-1 审批 saga / P0-3 调账幂等 / P0-4 支付幂等"""
-import json, sys, time, sqlite3, hashlib, secrets, urllib.request, urllib.error, uuid
+import json, sys, time, sqlite3, hashlib, secrets, urllib.request, urllib.error, uuid, threading
 
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
 BASE = "http://127.0.0.1:3000"
@@ -98,12 +98,35 @@ def broken_tx(c, uid_, *a, **k):
     raise RuntimeError("注入故障: 流水库不可写")
 A._wallet_tx = broken_tx
 # 直接调 saga 的前两步（模拟真实路由内部步骤）：幂等加款
+# delta 必须与重试路由的 cny_to_quota(0.5) 完全一致（审查 R1：quota_ops 语义校验，
+# 同 op_id 绑定不同 delta 会被拒绝——这正是需要验证的安全行为）
+delta_real = A.cny_to_quota(0.5)
 try:
-    A.gw_add_quota(nid, 500, op_id="adjust:%s" % op3)
+    A.gw_add_quota(nid, delta_real, op_id="adjust:%s" % op3)
     A._wallet_tx(sqlite3.connect(SITE), uid, "adjust", 0.5, 0, "x", )  # 会抛
 except RuntimeError as e:
     pass
 A._wallet_tx = orig_tx
+
+# 审查 R1 新增回归：quota_ops 幂等命中不校验语义 = 静默吞掉不同操作
+# 1) 同 op_id 不同金额 → 必须报错，且余额不变
+try:
+    A.gw_add_quota(nid, delta_real + 999, op_id="adjust:%s" % op3)
+    ck("P0-3 同op_id不同金额必须报错(拒绝语义冲突)", False, "未抛异常")
+except RuntimeError:
+    ck("P0-3 同op_id不同金额必须报错(拒绝语义冲突)", True)
+# 2) 同 op_id 不同 uid → 必须报错
+try:
+    A.gw_add_quota(nid + 999999, delta_real, op_id="adjust:%s" % op3)
+    ck("P0-3 同op_id不同uid必须报错(拒绝语义冲突)", False, "未抛异常")
+except RuntimeError:
+    ck("P0-3 同op_id不同uid必须报错(拒绝语义冲突)", True)
+# 3) 同 op_id 语义一致重放 → 幂等返回当前余额（加款恰好一次）
+try:
+    A.gw_add_quota(nid, delta_real, op_id="adjust:%s" % op3)
+    ck("P0-3 同op_id同语义重放幂等返回", True)
+except RuntimeError as e:
+    ck("P0-3 同op_id同语义重放幂等返回", False, str(e))
 bal_after_fail = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"] or 0
 # 管理员重试（HTTP 实际路由，同一 op_id）——应只补流水不再加款
 s, r, _ = api("POST", "/admin/wallet/adjust", {"uid": uid, "amount": "0.5", "note": "saga重试", "op_id": op3}, ACK, form=True)
@@ -113,7 +136,33 @@ tx3 = q("SELECT * FROM wallet_tx WHERE ref=?", ("adjust:%s" % op3,))
 ck("P0-3 重试后流水恰有一条(ref唯一凭据)", len(tx3) == 1, len(tx3))
 ck("P0-3 流水余额快照已回填", tx3 and tx3[0]["balance_cny"] is not None, dict(tx3[0]) if tx3 else None)
 # 回滚
-A.gw_add_quota(nid, -500, op_id="rb2:%s" % op3)
+A.gw_add_quota(nid, -delta_real, op_id="rb2:%s" % op3)
+
+# ── 负向扣减原子性（审查 R1/P1-02：禁止 MAX(0,...) 截断） ──
+bal0 = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"] or 0
+# 1) 余额不足扣减 → 必须报错，余额分毫不变（不再被截断到 0）
+try:
+    A.gw_add_quota(nid, -(bal0 + 100), op_id="negtest:%s" % op3)
+    ck("P0-3 余额不足扣减必须报错(不再截断为0)", False, "未抛异常")
+except RuntimeError:
+    ck("P0-3 余额不足扣减必须报错(不再截断为0)", True)
+bal1 = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"] or 0
+ck("P0-3 余额不足扣减失败后余额不变", bal1 == bal0, (bal0, bal1))
+# 2) 并发两笔扣减总和超过余额 → 恰好一笔成功一笔失败，余额不为负、无丢失更新
+_d = bal0 // 2 + 10
+_errs = []
+def _neg():
+    try:
+        A.gw_add_quota(nid, -_d, op_id="negc%s:%s" % (threading.get_ident(), op3))
+    except RuntimeError:
+        _errs.append(1)
+_ths = [threading.Thread(target=_neg) for _ in range(2)]
+[t.start() for t in _ths]; [t.join() for t in _ths]
+bal2 = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"] or 0
+ck("P0-3 并发超扣恰一笔成功一笔失败", len(_errs) == 1 and bal0 - _d == bal2, (len(_errs), bal0, bal2))
+ck("P0-3 扣减后余额不为负", bal2 >= 0, bal2)
+# 恢复余额供后续用例
+A.gw_add_quota(nid, bal0 - bal2, op_id="restore:%s" % op3)
 
 # ── P0-4：支付申请幂等（同 crid 重复提交返回原订单） ──
 crid = uuid.uuid4().hex

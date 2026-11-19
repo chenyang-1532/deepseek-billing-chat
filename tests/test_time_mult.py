@@ -6,7 +6,6 @@ import json, re, sys, time, urllib.request, urllib.parse, http.cookiejar, sqlite
 from datetime import datetime, timedelta
 
 sys.path.insert(0, "/tmp/chatsite-test")
-os_env_admin = "ADMIN_PW"
 PASS = FAIL = 0
 def ok(name, cond, detail=""):
     global PASS, FAIL
@@ -136,7 +135,7 @@ ok("B6 幂等：无变化返回 unchanged 且不写库", changed == A.RATIOS_UNC
 
 # ── C. HTTP 管理路由集成 ──
 print("── C. 管理路由 HTTP 集成（:3000）──")
-st, body = req("/admin/login", form({"pw": "ADMIN_PW"}), "POST")
+st, body = req("/admin/login", form({"pw": ADMIN_PW}), "POST")
 ok("C1 管理员登录", st == 200, st)
 
 # C2 面板出现时段倍率区块

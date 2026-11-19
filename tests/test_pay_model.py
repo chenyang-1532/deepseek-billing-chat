@@ -2,7 +2,7 @@
 """
 新功能综合专项：扫码充值流程 + 站点模型改写 + 官方价×倍数定价
 """
-import io
+import io, uuid
 import json
 import math
 import re
@@ -79,7 +79,7 @@ def q(sql, args=(), db=SITE_DB):
 
 
 # ── 准备 ──
-_, _, h = api("POST", "/admin/login", {"pw": "ADMIN_PW"}, form=True)
+_, _, h = api("POST", "/admin/login", {"pw": ADMIN_PW}, form=True)
 ckadm = get_cookie(h)
 ck("管理员登录", "admin=" in ckadm)
 
@@ -98,7 +98,7 @@ bal0 = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"]
 
 time.sleep(62)  # 避开上一轮遗留的限流窗口
 print("\n═══ A. 扫码充值：参数校验 ═══")
-s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 4.99}, cookie=cku)
+s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 4.99, "client_request_id": "crida0499low"}, cookie=cku)
 ck("¥4.99 < 起充¥5 → 拒绝", s == 400 and "低于" in r or "5" in r, (s, r[:80]))
 s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 0}, cookie=cku)
 ck("¥0 → 拒绝", s == 400, (s, r[:80]))
@@ -163,6 +163,11 @@ ck("普通用户上传 → 303 回面板（无 qr_ok）", "qr_ok" not in loc, lo
 time.sleep(62)  # A 段 7 次请求触发 5/分 限流，等窗口重置
 print("\n═══ C. 充值申请 → 审批到账闭环 ═══")
 s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 5.5}, cookie=cku)
+ck("无 client_request_id → 400（P0-4 强制幂等键）", s == 400, (s, r[:80]))
+s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 5.5, "client_request_id": "short!!"}, cookie=cku)
+ck("非法 client_request_id → 400", s == 400, (s, r[:80]))
+_crid1 = uuid.uuid4().hex
+s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 5.5, "client_request_id": _crid1}, cookie=cku)
 j = json.loads(r)
 ck("提交 ¥5.5 申请成功", s == 200 and j.get("ok"), (s, r[:100]))
 oid = j.get("order_id")
@@ -206,7 +211,8 @@ kinds = [x.get("kind") for x in j.get("logs", [])]
 ck("用户钱包流水含 扫码充值 事件", "wallet" in kinds and any("扫码充值" in str(x.get("model", "")) for x in j["logs"] if x.get("kind") == "wallet"), kinds)
 
 # 拒绝流程
-s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 6}, cookie=cku)
+_crid2 = uuid.uuid4().hex
+s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 6, "client_request_id": _crid2}, cookie=cku)
 oid2 = json.loads(r)["order_id"]
 bal3 = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"]
 s, _, hh = api("POST", "/admin/wallet/pay", {"oid": oid2, "action": "reject"}, cookie=ckadm, form=True)

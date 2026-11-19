@@ -68,7 +68,7 @@ function build(inp){
     var v=parseFloat(amt.value);
     if(!(v>=5)){msg.className='ps-m err';msg.textContent='金额不能低于 ¥5';return}
     btn.disabled=true;msg.className='ps-m wait';msg.textContent='提交中…';
-    fetch('/api/wallet/pay-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cny:v,client_request_id:(function(){var k='ps_pay_crid';try{var id=localStorage.getItem(k);if(!id){id=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,12);localStorage.setItem(k,id)}return id}catch(e){return 'fb-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8)}})()})})
+    fetch('/api/wallet/pay-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cny:v,client_request_id:(function(){var k='ps_pay_crid';try{var id=localStorage.getItem(k);if(!id){id=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,12);try{localStorage.setItem(k,id)}catch(e2){try{sessionStorage.setItem(k,id)}catch(e3){}}}return id}catch(e){try{var s=sessionStorage.getItem(k);if(s)return s}catch(e4){}return ''}})()})})
     .then(function(r){return r.json().then(function(j){return {s:r.status,j:j}})})
     .then(function(o){
       btn.disabled=false;

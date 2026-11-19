@@ -160,7 +160,7 @@ async def main():
             # 5. 后台：调整余额 + 生成充值码
             page2 = await ctx.new_page()
             await page2.goto(BASE + "/admin")
-            await page2.fill('input[name=pw]', "ADMIN_PW")
+            await page2.fill('input[name=pw]', ADMIN_PW)
             await page2.click('button')
             await asyncio.sleep(1.5)
             body = await page2.evaluate("() => (document.body.textContent||'')")

@@ -129,8 +129,17 @@ def init_db():
                 cny REAL NOT NULL,
                 created_at TEXT,
                 used_by INTEGER,
-                used_at TEXT
+                used_at TEXT,
+                status TEXT
             )"""
+        )
+        # 迁移：老库补 status 列并回填（兑换 saga，审查 R2：unused→processing→used 持久状态机）
+        _rc_cols = [r[1] for r in c.execute("PRAGMA table_info(redeem_codes)").fetchall()]
+        if "status" not in _rc_cols:
+            c.execute("ALTER TABLE redeem_codes ADD COLUMN status TEXT")
+        c.execute(
+            "UPDATE redeem_codes SET status=CASE WHEN used_by IS NOT NULL THEN 'used' ELSE 'unused' END "
+            "WHERE status IS NULL"
         )
         c.execute(
             """CREATE TABLE IF NOT EXISTS wallet_tx(
@@ -611,12 +620,26 @@ async def api_request_renewal(request: Request):
 # ---------- 聊天记录云端同步（按会话合并 + 墓碑删除，防多设备互相覆盖） ----------
 SESS_DIR = "chat_sessions/"
 _SID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")   # P1-12：会话 id 白名单（防 Zip Slip/路径逃逸）
+# P1-12（审查 R2）：归档内图片文件名白名单——不含分隔符/控制字符，不以点开头（防 ".."）
+_SAFE_FNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,79}$")
 
 
 def _safe_sid(sid) -> str | None:
     """会话 id 只允许字母数字下划线连字符，拒绝 ../、分隔符等（P1-12）"""
     s = str(sid or "")
     return s if _SID_RE.match(s) else None
+
+
+def _valid_img_entry(name: str) -> tuple[str, str] | None:
+    """归档图片条目校验（审查 R2/P1-12）：必须形如 chat_sessions/<合法sid>_files/<白名单文件名>，
+    通过则返回 (sid, 全名)，否则 None。文件名与 sid 分别白名单，杜绝嵌套路径/穿越。"""
+    if not name.startswith(SESS_DIR) or "_files/" not in name:
+        return None
+    sid_part, fname = name[len(SESS_DIR):].split("_files/", 1)
+    sid = _safe_sid(sid_part)
+    if sid is None or not _SAFE_FNAME_RE.match(fname):
+        return None
+    return sid, name
 MANIFEST_NAME = "manifest.json"
 INDEX_NAME = "chat_session_index.json"
 ARCHIVE_VERSION = 3
@@ -635,9 +658,14 @@ def _ensure_cloud_sessions(c):
             images BLOB,
             updated_at TEXT DEFAULT '',
             deleted INTEGER DEFAULT 0,
+            rev INTEGER DEFAULT 0,
             PRIMARY KEY(uid, sid)
         )"""
     )
+    # P1-15（审查 R2）：服务端单调递增 rev 作为版本权威，客户端 updated_at 仅作展示
+    _cs_cols = [r[1] for r in c.execute("PRAGMA table_info(cloud_sessions)").fetchall()]
+    if "rev" not in _cs_cols:
+        c.execute("ALTER TABLE cloud_sessions ADD COLUMN rev INTEGER DEFAULT 0")
 
 
 def _split_archive(data: bytes):
@@ -647,17 +675,19 @@ def _split_archive(data: bytes):
     for name in zf.namelist():
         if name.startswith(SESS_DIR) and name.endswith(".json"):
             rest = name[len(SESS_DIR):]
-            if "/" in rest:
+            if "/" in rest or "\\" in rest:
                 continue
+            # P1-12（审查 R2）：文件名 sid 与 JSON info["id"] 必须一致且均过白名单，
+            # 杜绝「文件名合法但内嵌 id 逃逸」的不一致构造
+            f_sid = _safe_sid(rest[:-5])
             try:
                 info = json.loads(zf.read(name))
             except Exception:
                 continue
-            if isinstance(info, dict) and info.get("id"):
-                _sid = _safe_sid(info["id"])
-                if _sid is None:
-                    continue  # 非法会话 id（含路径分隔符/..），拒绝入归档
-                out[_sid] = [zf.read(name), str(info.get("updated_at") or "")]
+            j_sid = _safe_sid(info.get("id")) if isinstance(info, dict) else None
+            if not f_sid or j_sid != f_sid:
+                continue  # 非法/不一致会话 id，拒绝入归档
+            out[f_sid] = [zf.read(name), str(info.get("updated_at") or "")]
     return out
 
 
@@ -728,7 +758,9 @@ def _build_archive(c, uid) -> bytes:
                 try:
                     iz = zipfile.ZipFile(io.BytesIO(r["images"]))
                     for n in iz.namelist():
-                        z.writestr(n, iz.read(n))
+                        # P1-12（审查 R2）：导出同样只放行双重白名单的图片条目（防历史脏数据逃逸）
+                        if _valid_img_entry(n):
+                            z.writestr(n, iz.read(n))
                 except Exception:
                     pass
         z.writestr(INDEX_NAME, json.dumps(index))
@@ -820,6 +852,13 @@ async def api_backup_post(request: Request):
     except Exception:
         del_ids = set()
     now_ms = int(time.time() * 1000)
+    # P1-15（审查 R2）：客户端可携带 base_revs（每会话上次同步到的服务端 rev），
+    # 服务端以 rev 为版本权威检测并发冲突；旧客户端未携带时退回 updated_at 比较。
+    try:
+        _br_raw = request.query_params.get("base_revs") or request.headers.get("x-base-revs") or ""
+        base_revs = {str(k): int(v) for k, v in json.loads(_br_raw).items()} if _br_raw else {}
+    except Exception:
+        base_revs = {}
     try:
         with db() as c:
             _ensure_cloud_sessions(c)
@@ -850,29 +889,36 @@ async def api_backup_post(request: Request):
             for name in names:
                 if name.startswith(SESS_DIR) and name.endswith(".json"):
                     rest = name[len(SESS_DIR):]
-                    if "/" in rest:
+                    if "/" in rest or "\\" in rest:
                         continue
-                    sid = rest[:-5]
+                    # P1-12（审查 R2）：文件名 sid 与 JSON info["id"] 三处一致
+                    # （归档文件名 == JSON id == 云端主键），任一非法/不一致直接拒绝
+                    f_sid = _safe_sid(rest[:-5])
                     try:
                         info = json.loads(zf.read(name))
                     except Exception:
                         continue
-                    if isinstance(info, dict) and _safe_sid(info.get("id")):
-                        incoming[_safe_sid(info["id"])] = {
-                            "json": zf.read(name),
-                            "upd": str(info.get("updated_at") or ""),
-                            "imgs": [],
-                        }
+                    j_sid = _safe_sid(info.get("id")) if isinstance(info, dict) else None
+                    if not f_sid or j_sid != f_sid:
+                        continue
+                    incoming[f_sid] = {
+                        "json": zf.read(name),
+                        "upd": str(info.get("updated_at") or ""),
+                        "imgs": [],
+                    }
             for name in names:
                 if not name.startswith(SESS_DIR) or "_files/" not in name:
                     continue
-                sid = _safe_sid(name[len(SESS_DIR):].split("_files/", 1)[0])
-                if sid and sid in incoming:
-                    incoming[sid]["imgs"].append((name, zf.read(name)))
+                # P1-12（审查 R2）：图片条目双重白名单（sid + 文件名），只落入本会话 _files/
+                v = _valid_img_entry(name)
+                if v and v[0] in incoming:
+                    incoming[v[0]]["imgs"].append((name, zf.read(name)))
             # 墓碑：客户端明确删除的会话，云端标记删除（保留 blob 以防万一）。
             # 只对云端真实存在且未删除的会话生效——从未上传过的 sid 一律忽略，
             # 防止客户端误判（如导入替换期间的误报）在云端制造垃圾墓碑并回传扩散。
             for sid in del_ids:
+                if not _safe_sid(sid):
+                    continue  # P1-12：非法 sid 不参与墓碑
                 live = c.execute(
                     "SELECT 1 FROM cloud_sessions WHERE uid=? AND sid=? AND deleted=0",
                     (user["id"], sid),
@@ -882,30 +928,48 @@ async def api_backup_post(request: Request):
                         "UPDATE cloud_sessions SET deleted=1 WHERE uid=? AND sid=?",
                         (user["id"], sid),
                     )
-            # 按会话合并：同一会话谁新用谁，互不覆盖
+            # 按会话合并（P1-15）：服务端 rev 为版本权威；冲突时保留云端并回传 conflicts
             changed = False
+            conflicts = []
             for sid, item in incoming.items():
                 row = c.execute(
-                    "SELECT updated_at, deleted FROM cloud_sessions WHERE uid=? AND sid=?",
+                    "SELECT updated_at, deleted, rev, session_json FROM cloud_sessions WHERE uid=? AND sid=?",
                     (user["id"], sid),
                 ).fetchone()
                 if row is not None and row["deleted"]:
                     # 云端已删除而本地还留着：响应里已有 tombstones，客户端会自行删除，
                     # 不再把 changed 置 True——否则每次推送都触发整包拉取，打断正在看对话的用户
                     continue
+                cur_rev = (row["rev"] or 0) if row is not None else 0
+                same = row is not None and row["session_json"] == item["json"]
+                if same:
+                    continue  # 内容未变：不动 rev，避免每次上传都虚增版本
                 if row is None:
                     c.execute(
-                        "INSERT INTO cloud_sessions(uid,sid,session_json,images,updated_at,deleted) "
-                        "VALUES(?,?,?,?,?,0)",
+                        "INSERT INTO cloud_sessions(uid,sid,session_json,images,updated_at,deleted,rev) "
+                        "VALUES(?,?,?,?,?,0,1)",
                         (user["id"], sid, item["json"], _imgs_zip(item["imgs"]), item["upd"]),
+                    )
+                elif sid in base_revs:
+                    # 新版客户端：rev 权威判定。base_rev 落后于云端 = 双设备并发编辑 → 冲突，
+                    # 保留云端版本，回传 conflicts 让客户端拉取合并（绝不以客户端时间戳新者胜）
+                    if base_revs[sid] != cur_rev:
+                        conflicts.append(sid)
+                        changed = True
+                        continue
+                    c.execute(
+                        "UPDATE cloud_sessions SET session_json=?, images=?, updated_at=?, rev=? "
+                        "WHERE uid=? AND sid=?",
+                        (item["json"], _imgs_zip(item["imgs"]), item["upd"], cur_rev + 1, user["id"], sid),
                     )
                 elif _cloud_newer(row["updated_at"] or "", item["upd"]):
                     changed = True  # 云端这条更新，客户端待会儿拉取
                 else:
+                    # 旧客户端（无 base_rev）：保留 updated_at 兼容路径，服务端 rev 单调递增
                     c.execute(
-                        "UPDATE cloud_sessions SET session_json=?, images=?, updated_at=? "
+                        "UPDATE cloud_sessions SET session_json=?, images=?, updated_at=?, rev=? "
                         "WHERE uid=? AND sid=?",
-                        (item["json"], _imgs_zip(item["imgs"]), item["upd"], user["id"], sid),
+                        (item["json"], _imgs_zip(item["imgs"]), item["upd"], cur_rev + 1, user["id"], sid),
                     )
             # 云端存在但本次上传没有的会话 → 客户端缺数据，需要拉取
             extra = c.execute(
@@ -933,24 +997,33 @@ async def api_backup_post(request: Request):
                     "SELECT sid FROM cloud_sessions WHERE uid=? AND deleted=1", (user["id"],)
                 ).fetchall()
             ]
+            revs = {
+                r["sid"]: (r["rev"] or 0)
+                for r in c.execute(
+                    "SELECT sid, rev FROM cloud_sessions WHERE uid=? AND deleted=0", (user["id"],)
+                ).fetchall()
+            }
     except _QuotaExceeded:
         return JSONResponse({"ok": False, "msg": "云端空间已满"}, status_code=413)
-    # 完整导出包原样存档（用于“恢复云端备份”：原包原样导入，不做任何合并）
+    # 完整导出包原样存档（审计用；恢复走服务端合并状态，见 /api/restore）
     _save_snapshot(user["id"], data, now_ms)
     return JSONResponse({
         "ok": True, "updated_at": now_ms, "changed": changed, "tombstones": tombs,
+        "conflicts": conflicts, "revs": revs,
     })
 
 
 @app.get("/api/restore")
 def api_restore_get(request: Request):
-    """取回该用户最新一份完整导出包（原样，等同手动导出的文件）。"""
+    """恢复云端备份：返回**服务端当前合并状态**的一致快照（审查 R2/P1-15），
+    而非最近一次原始上传包——原始上传可能落后于云端其他设备的更新。"""
     user = get_user(request)
     if user is None or not valid_paid_user(user):
         return Response(status_code=403)
-    data = _latest_snapshot(user["id"])
-    if data is None:
-        return Response(status_code=404)
+    with db() as c:
+        _ensure_cloud_sessions(c)
+        _migrate_legacy(c, user["id"])
+        data = _build_archive(c, user["id"])
     return Response(
         content=data,
         media_type="application/zip",
@@ -959,11 +1032,12 @@ def api_restore_get(request: Request):
 
 
 def _save_snapshot(uid: int, data: bytes, now_ms: int) -> None:
-    """把用户上传的完整导出包原样存到磁盘（与手动导出文件完全一致，可随时取回导入）。"""
+    """把用户上传的完整导出包原样存到磁盘（审计用；恢复走 /api/restore 服务端合并状态）。"""
     try:
         udir = os.path.join(SNAP_DIR, str(uid))
         os.makedirs(udir, exist_ok=True)
-        tmp = os.path.join(udir, ".tmp")
+        # P1-15（审查 R2）：临时文件名唯一化，并发上传不互相覆盖；写完原子 replace
+        tmp = os.path.join(udir, ".tmp-%s" % uuid.uuid4().hex)
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, os.path.join(udir, f"{now_ms}.zip"))
@@ -976,8 +1050,9 @@ def _save_snapshot(uid: int, data: bytes, now_ms: int) -> None:
                 os.remove(os.path.join(udir, old))
             except OSError:
                 pass
-    except OSError:
-        pass  # 存档失败不影响同步主流程
+    except OSError as e:
+        # P1-15（审查 R2）：快照失败必须留日志告警，不得静默
+        print("[backup] ⚠️ 快照存档失败 uid=%s err=%s（云同步主流程不受影响）" % (uid, e))
 
 
 def _latest_snapshot(uid: int) -> bytes | None:
@@ -1309,6 +1384,29 @@ def admin_page(request: Request):
             # ── 官方价 × 倍数 ──
             official = _load_official_prices()
             tier_peak = _is_peak_now()
+            # P1-06 告警展示：价格变动 / 数据陈旧
+            price_alert_html = ""
+            try:
+                _ch = get_setting(PRICE_CHANGE_KEY, "")
+                if _ch:
+                    _cd = json.loads(_ch)
+                    _items = _cd.get("items") or []
+                    if _items:
+                        price_alert_html += (
+                            '<div class="flash err">⚠️ 官方价变动超过 %d%%：%s（%s）——已自动按新价重算倍率</div>'
+                            % (PRICE_CHANGE_ALERT_PCT * 100, html.escape("; ".join(_items[:6])),
+                               time.strftime("%m-%d %H:%M", time.localtime(_cd.get("ts") or 0))))
+            except Exception:
+                pass
+            try:
+                _st = get_setting(PRICE_STALE_KEY, "")
+                if _st:
+                    _sd = json.loads(_st)
+                    price_alert_html += (
+                        '<div class="flash err">⚠️ 官方价格已超过 24 小时抓取失败，计费沿用 %s 快照价（后台每 10 分钟重试）</div>'
+                        % time.strftime("%m-%d %H:%M", time.localtime(_sd.get("since") or 0)))
+            except Exception:
+                pass
             mults = get_multipliers()
             tm_cfg = get_time_mults()
             tmult, trule = _active_time_mult()
@@ -1380,8 +1478,10 @@ def admin_page(request: Request):
             ratios_sec = (
                 '<section class="sec" id="sec-ratios"><div class="sec-h"><h2>定价（官方价 × 倍数）</h2>'
                 f'<span class="hint">官方价每 10 分钟自动抓取；当前时段：{"峰时" if tier_peak else "谷时"} · 数据时间 {official_ts}'
+                f'（峰时=UTC 周一至周五 01:00-04:00 与 06:00-10:00；法定节假日保守按峰时计费，周末/其余时段按谷时）'
                 ' · 倍数=在你的售价上相对官方价的倍率</span></div>'
                 + ratio_flash
+                + price_alert_html
                 + '<div class="ratios">' + ratio_items + '</div>'
                 + tmult_sec
                 + '<div class="ops" style="margin-top:8px">'
@@ -1823,15 +1923,25 @@ def _load_official_prices() -> dict:
 
 
 def _parse_official_page(text: str) -> dict | None:
-    """从官方定价页 HTML 解析 12 个价格（两模型×{命中,未命中,输出}×{谷,峰}），峰=谷×2 校验"""
+    """从官方定价页 HTML 解析 12 个价格（两模型×{命中,未命中,输出}×{谷,峰}），峰=谷×2 校验。
+    加固（审查 P1-06）：主锚点失败时尝试备用锚点；全部数值限合理上界。"""
+    seg = ""
+    for anchor in ("1M INPUT TOKENS", "Input (cache miss)", "INPUT TOKENS", "标准（缓存未命中）"):
+        i = text.find(anchor)
+        if i >= 0:
+            j = text.find("Concurrency Limit", i)
+            seg = text[max(0, i - 200): j if j > i else i + 4000]
+            break
+    if not seg:
+        return None
     try:
-        i = text.find("1M INPUT TOKENS")
-        j = text.find("Concurrency Limit", i)
-        seg = text[max(0, i - 200): j if j > i else i + 4000]
         vals = [float(v) for v in re.findall(r"\$\s*([0-9]+(?:\.[0-9]+)?)", seg)]
         if len(vals) < 12:
             return None
         vals = vals[:12]
+        # 数值上界（P1-06）：页面上任何价格超过 $1000 视为解析异常（页面结构变化/垃圾值）
+        if any(v <= 0 or v > 1000 for v in vals):
+            return None
         f_hit_off, p_hit_off, f_hit_pk, p_hit_pk = vals[0:4]
         f_miss_off, p_miss_off, f_miss_pk, p_miss_pk = vals[4:8]
         f_out_off, p_out_off, f_out_pk, p_out_pk = vals[8:12]
@@ -1850,18 +1960,68 @@ def _parse_official_page(text: str) -> dict | None:
 
 
 def fetch_official_prices() -> tuple[dict, bool]:
-    """实时抓取官方定价页；成功返回 (数据, True)，失败沿用缓存/默认并返回 (数据, False)"""
+    """实时抓取官方定价页；成功返回 (数据, True)，失败沿用缓存/默认并返回 (数据, False)。
+    告警（审查 P1-06）：成功后对比旧价，变动>5% 落 price_change_alert；失败且缓存>24h 落 price_stale_alert。"""
     try:
         req = urllib.request.Request(OFFICIAL_PRICE_URL, headers={"User-Agent": "Mozilla/5.0 (billing-sync)"})
         text = urllib.request.urlopen(req, timeout=15).read().decode(errors="replace")
         parsed = _parse_official_page(text)
         if parsed:
+            _check_price_stale(clear=True)
+            _check_price_change(parsed)
             data = {"ts": time.time(), "models": parsed}
             set_setting(GW_OFFICIAL_KEY, json.dumps(data))
             return data, True
     except Exception as e:  # noqa: BLE001
         print("[official-price] 抓取失败，沿用上次数据:", e)
+    _check_price_stale()
     return _load_official_prices(), False
+
+
+PRICE_CHANGE_KEY = "price_change_alert"   # 官方价变动>阈值告警 {"ts","items"}
+PRICE_STALE_KEY = "price_stale_alert"     # 官方价陈旧告警 {"ts","since"}
+PRICE_CHANGE_ALERT_PCT = 0.05             # 单价变动告警阈值 5%
+PRICE_STALE_SECONDS = 86400               # 快照超过 24h 未更新视为陈旧
+
+
+def _check_price_change(parsed: dict) -> None:
+    """对比上次缓存价，任一档位变动超过阈值即落告警（管理面板展示 + 日志）。"""
+    try:
+        old = _load_official_prices()
+        oldm = old.get("models") or {}
+        if not old.get("ts"):
+            return  # 无历史快照（首次抓取）不比较
+        alerts = []
+        for src, d in (parsed or {}).items():
+            o = oldm.get(src)
+            if not o:
+                continue
+            for k in ("in_hit", "in_miss", "out"):
+                for ti in (0, 1):
+                    a, b = o.get(k, [0, 0])[ti], d.get(k, [0, 0])[ti]
+                    if a > 0 and abs(b - a) / a > PRICE_CHANGE_ALERT_PCT:
+                        alerts.append("%s.%s[%s] $%g→$%g" % (src, k, "峰" if ti else "谷", a, b))
+        if alerts:
+            set_setting(PRICE_CHANGE_KEY, json.dumps({"ts": time.time(), "items": alerts}))
+            print("[official-price] ⚠️ 官方价变动告警(>%d%%): %s" % (PRICE_CHANGE_ALERT_PCT * 100, "; ".join(alerts)))
+    except Exception as e:  # noqa: BLE001
+        print("[official-price] 变动检查异常:", e)
+
+
+def _check_price_stale(clear: bool = False) -> None:
+    """抓取失败且缓存快照超过 24h → 落 stale 告警；成功抓取（clear=True）时清除。"""
+    try:
+        if clear:
+            set_setting(PRICE_STALE_KEY, "")
+            return
+        d = _load_official_prices()
+        ts = d.get("ts") or 0
+        if ts and time.time() - ts > PRICE_STALE_SECONDS:
+            set_setting(PRICE_STALE_KEY, json.dumps({"ts": time.time(), "since": ts}))
+            print("[official-price] ⚠️ 官方价数据陈旧(>%dh 未成功抓取)，沿用 %s 快照计费" % (
+                PRICE_STALE_SECONDS // 3600, time.strftime("%m-%d %H:%M", time.localtime(ts))))
+    except Exception as e:  # noqa: BLE001
+        print("[official-price] stale 检查异常:", e)
 
 
 def get_multipliers() -> dict:
@@ -1975,13 +2135,25 @@ def recompute_ratios(official: dict | None = None) -> str:
                     nc.execute("UPDATE options SET value=? WHERE key=?", (json.dumps(val), key))
                 else:
                     nc.execute("INSERT INTO options(key, value) VALUES(?,?)", (key, json.dumps(val)))
-            # 回读确认：new-api 生效值与本站期望一致才报成功
-            rows2 = {r["key"]: r["value"] for r in nc.execute(
-                "SELECT key, value FROM options WHERE key IN ('ModelRatio','CompletionRatio')")}
-            ok = json.loads(rows2.get("ModelRatio") or "{}").get(next(iter(SITE_MODELS))) == mr_map[next(iter(SITE_MODELS))]                 and json.loads(rows2.get("CompletionRatio") or "{}").get(next(iter(SITE_MODELS))) == cr_map[next(iter(SITE_MODELS))]
+            nc.commit()
     except Exception as e:  # noqa: BLE001
         print("[official-price] 倍率写回失败:", e)
         return RATIOS_FAILURE
+    # 提交后 durable 确认（审查 R1/P1-04）：用新连接读已提交生效值，
+    # 并校验全部 SITE_MODELS × ModelRatio/CompletionRatio，而非单模型单事务快照。
+    try:
+        with napi_connect() as nc2:
+            rows2 = {r["key"]: r["value"] for r in nc2.execute(
+                "SELECT key, value FROM options WHERE key IN ('ModelRatio','CompletionRatio')")}
+        mr_eff = json.loads(rows2.get("ModelRatio") or "{}")
+        cr_eff = json.loads(rows2.get("CompletionRatio") or "{}")
+        ok = all(mr_eff.get(m) == mr_map[m] and cr_eff.get(m) == cr_map[m] for m in SITE_MODELS)
+        if not ok:
+            print("[official-price] ⚠️ 提交后回读不一致: eff_mr=%s expect=%s" % (
+                {m: mr_eff.get(m) for m in SITE_MODELS}, mr_map))
+    except Exception as e:  # noqa: BLE001
+        print("[official-price] 回读确认失败:", e)
+        ok = False
     _GW_RATIO_CACHE["data"] = (mr_map, cr_map)
     _GW_RATIO_CACHE["ts"] = time.time()
     print("[official-price] 倍率已按 官方%s价×倍数(时段%s=%g) 重算: %s" % ("峰" if tier else "谷", trule, tmult, mr_map))
@@ -2168,13 +2340,34 @@ def gw_add_quota(napi_uid: int, delta_quota: int, op_id: str | None = None) -> i
                     "CREATE TABLE IF NOT EXISTS quota_ops("
                     "op_id TEXT PRIMARY KEY, napi_uid INTEGER, delta INTEGER, done_at TEXT)"
                 )
-                first = nc.execute(
-                    "INSERT OR IGNORE INTO quota_ops(op_id, napi_uid, delta, done_at) "
-                    "VALUES(?,?,?,?)",
-                    (op_id, napi_uid, delta_quota, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                ).rowcount == 1
-                if not first:
-                    # 操作号已存在：该笔加款此前已原子生效，绝不再执行（幂等返回当前余额）
+                # 历史表迁移：补 payload_hash 列（审查 R1：幂等命中必须校验操作语义）
+                cols = [r[1] for r in nc.execute("PRAGMA table_info(quota_ops)").fetchall()]
+                if "payload_hash" not in cols:
+                    try:
+                        nc.execute("ALTER TABLE quota_ops ADD COLUMN payload_hash TEXT")
+                    except Exception:  # noqa: BLE001
+                        pass
+                payload_hash = hashlib.sha256(
+                    ("%s|%d" % (napi_uid, delta_quota)).encode()
+                ).hexdigest()
+                prev = nc.execute(
+                    "SELECT napi_uid, delta, payload_hash FROM quota_ops WHERE op_id=?",
+                    (op_id,),
+                ).fetchone()
+                if prev is not None:
+                    # 语义校验（审查 R1）：同一 op_id 绑定的 (uid, delta) 必须与本次完全一致；
+                    # 不一致 = op_id 被误用/重放，立即报错告警，绝不静默返回"成功"。
+                    if prev["napi_uid"] != napi_uid or prev["delta"] != delta_quota:
+                        nc.rollback()
+                        print(
+                            "[quota] ⚠️ op_id=%s 语义冲突: 已记录(uid=%s,delta=%s) "
+                            "本次(uid=%s,delta=%s)，拒绝执行并告警"
+                            % (op_id, prev["napi_uid"], prev["delta"], napi_uid, delta_quota)
+                        )
+                        raise RuntimeError(
+                            "quota_ops 语义冲突: op_id=%s 已绑定不同的账户或金额，拒绝重复使用" % op_id
+                        )
+                    # 语义一致：该笔此前已原子生效，绝不再执行（幂等返回当前余额）
                     nc.rollback()
                     row = nc.execute(
                         "SELECT quota FROM users WHERE id=?", (napi_uid,)
@@ -2183,10 +2376,30 @@ def gw_add_quota(napi_uid: int, delta_quota: int, op_id: str | None = None) -> i
                         raise RuntimeError("new-api 用户不存在: %s" % napi_uid)
                     print("[quota] op_id=%s 已生效过，跳过重复加款(幂等)" % op_id)
                     return max(0, row["quota"] or 0)
-            nc.execute(
-                "UPDATE users SET quota = MAX(0, COALESCE(quota,0) + ?) WHERE id=?",
-                (delta_quota, napi_uid),
-            )
+                nc.execute(
+                    "INSERT INTO quota_ops(op_id, napi_uid, delta, done_at, payload_hash) "
+                    "VALUES(?,?,?,?,?)",
+                    (op_id, napi_uid, delta_quota,
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), payload_hash),
+                )
+            # 负向扣减改为单语句原子条件更新（审查 R1/P1-02）：余额不足整体失败回滚，
+            # 禁止 MAX(0,...) 截断——否则实际扣 0 但 quota_ops 记完整负数，账目永久失配。
+            if delta_quota < 0:
+                upd = nc.execute(
+                    "UPDATE users SET quota = COALESCE(quota,0) + ? "
+                    "WHERE id=? AND COALESCE(quota,0) + ? >= 0",
+                    (delta_quota, napi_uid, delta_quota),
+                )
+                if upd.rowcount == 0:
+                    nc.rollback()
+                    raise RuntimeError(
+                        "余额不足: 扣减 %d 超过用户 %s 当前余额" % (-delta_quota, napi_uid)
+                    )
+            else:
+                nc.execute(
+                    "UPDATE users SET quota = COALESCE(quota,0) + ? WHERE id=?",
+                    (delta_quota, napi_uid),
+                )
             row = nc.execute("SELECT quota FROM users WHERE id=?", (napi_uid,)).fetchone()
             if row is None:
                 raise RuntimeError("new-api 用户不存在: %s" % napi_uid)
@@ -2302,54 +2515,104 @@ async def api_wallet_redeem(request: Request):
     code = str(body.get("code") or "").strip().upper()
     if not code or len(code) > 32:
         return JSONResponse({"ok": False, "msg": "请输入兑换码"}, status_code=400)
-    # ── 阶段一：原子销码 + 写入 redeem_pending 意图流水（同一事务提交） ──
-    # WHERE used_by IS NULL + rowcount 校验保证同一张码并发下只有一方成功。
-    # 意图流水保证：即使进程在阶段二途中被 kill，数据库里也留有"码已销但钱未到"的
-    # 完整凭据（type='redeem_pending'），管理员可凭此人工补账，绝不静默丢钱。
+    # ── 兑换 saga（审查 R2/P1-03）：码有持久状态机 unused→processing→used，
+    # 加款以稳定业务键 op_id="redeem:<code>" 走 quota_ops 原子幂等；
+    # quota_ops 与余额变更同事务提交，故障后查询 quota_ops 可可靠区分
+    # 「已提交」/「未提交」——不确定时绝不释放已占码。
+    op_id = "redeem:" + code
+    uid = user["id"]
     face = None
     with db() as c:
-        row = c.execute("SELECT cny FROM redeem_codes WHERE code=?", (code,)).fetchone()
-        if row is None:
+        row = c.execute(
+            "SELECT cny, status, used_by FROM redeem_codes WHERE code=?", (code,)
+        ).fetchone()
+        if row is None or row["cny"] is None or not isinstance(row["cny"], (int, float)) or row["cny"] <= 0:
             return JSONResponse({"ok": False, "msg": "兑换码无效"})
-        if row["cny"] is None or not isinstance(row["cny"], (int, float)) or row["cny"] <= 0:
+        st = row["status"] or ("used" if row["used_by"] is not None else "unused")
+        if st == "used":
             return JSONResponse({"ok": False, "msg": "兑换码无效"})
+        if st == "processing":
+            # 上次兑换中断：只有占码本人可续跑（恢复任务），他人一律拒绝
+            if row["used_by"] != uid:
+                return JSONResponse({"ok": False, "msg": "兑换码无效"})
+        else:
+            # 原子占码：并发下只有一方 rowcount=1（status IS NULL 兼容历史/外部插入行）
+            cur = c.execute(
+                "UPDATE redeem_codes SET status='processing', used_by=?, used_at=? "
+                "WHERE code=? AND (status='unused' OR status IS NULL)",
+                (uid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), code),
+            )
+            if cur.rowcount != 1:
+                return JSONResponse({"ok": False, "msg": "兑换码无效"})
         face = float(row["cny"])
-        cur = c.execute(
-            "UPDATE redeem_codes SET used_by=?, used_at=? WHERE code=? AND used_by IS NULL",
-            (user["id"], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), code),
+        # 意图流水（凭据，不删除；ref 唯一幂等，重试不重复记录）
+        c.execute(
+            "INSERT OR IGNORE INTO wallet_tx(uid,type,cny,balance_cny,note,created_at,ref) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (uid, "redeem_pending", face, None, "兑换码 " + code,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), op_id),
         )
-        if cur.rowcount != 1:
-            return JSONResponse({"ok": False, "msg": "兑换码无效"})
-        _wallet_tx(c, user["id"], "redeem_pending", face, None, "兑换码 " + code)
-    # ── 阶段二：跨库加钱（不持站点库锁）；失败则补偿回滚销码+删除意图流水 ──
+    # ── 阶段二：跨库加款（op_id 幂等；quota_ops 与余额变更同一事务） ──
+    newq = None
     try:
         _, nid = gw_provision(user)
-        newq = gw_add_quota(nid, cny_to_quota(face))
+        newq = gw_add_quota(nid, cny_to_quota(face), op_id=op_id)
     except Exception as e:  # noqa: BLE001
-        print("[wallet] redeem 加钱失败，回滚销码 code=%s uid=%s err=%s" % (code, user["id"], e))
+        print("[wallet] redeem 加款异常 code=%s uid=%s err=%s，检查 quota_ops 判定是否已提交" % (code, uid, e))
         try:
-            with db() as c:
-                c.execute(
-                    "UPDATE redeem_codes SET used_by=NULL, used_at=NULL WHERE code=? AND used_by=?",
-                    (code, user["id"]),
-                )
-                c.execute(
-                    "DELETE FROM wallet_tx WHERE uid=? AND type='redeem_pending' AND note=?",
-                    (user["id"], "兑换码 " + code),
-                )
+            with napi_connect() as nc:
+                hit = nc.execute("SELECT 1 FROM quota_ops WHERE op_id=?", (op_id,)).fetchone()
         except Exception as e2:  # noqa: BLE001
-            print("[wallet] redeem 回滚也失败 code=%s err=%s（redeem_pending 流水保留，需人工核查）" % (code, e2))
-        return JSONResponse({"ok": False, "msg": "兑换失败，请稍后重试"}, status_code=502)
-    # ── 阶段三：把意图流水转正为 redeem 并记录到账后余额 ──
+            print("[wallet] redeem 恢复判定查询失败 code=%s err=%s（保持 processing，绝不释放）" % (code, e2))
+            hit = None
+            # 判定不了 = 不确定：保持占码不释放，等恢复任务/人工核查
+            return JSONResponse({"ok": False, "msg": "兑换处理中断，请联系管理员核实（码已锁定防重复到账）"}, status_code=502)
+        if hit is not None:
+            # 加款其实已提交（异常发生在提交后）：按恢复续跑，补流水+置 used，绝不回滚销码
+            print("[wallet] redeem 恢复: 加款已提交(op_id=%s)，续跑收尾" % op_id)
+            try:
+                with napi_connect() as nc:
+                    r = nc.execute("SELECT quota FROM users WHERE id=?", (nid,)).fetchone()
+                newq = max(0, r["quota"] or 0) if r else None
+            except Exception:
+                newq = None
+            if newq is None:
+                return JSONResponse({"ok": False, "msg": "兑换处理中断，请联系管理员核实（码已锁定防重复到账）"}, status_code=502)
+        else:
+            # 确认未提交：补偿——码回 unused 可重试；意图流水转 redeem_fail（追加状态，不删除账务凭据）
+            try:
+                with db() as c:
+                    c.execute(
+                        "UPDATE redeem_codes SET status='unused', used_by=NULL, used_at=NULL "
+                        "WHERE code=? AND status='processing' AND used_by=?",
+                        (code, uid),
+                    )
+                    c.execute(
+                        "UPDATE wallet_tx SET type='redeem_fail' WHERE uid=? AND ref=? AND type='redeem_pending'",
+                        (uid, op_id),
+                    )
+            except Exception as e2:  # noqa: BLE001
+                print("[wallet] redeem 补偿失败 code=%s err=%s（processing 保留，需人工核查）" % (code, e2))
+            return JSONResponse({"ok": False, "msg": "兑换失败，请稍后重试"}, status_code=502)
+    # ── 阶段三：到账流水（ref 幂等）+ 码置 used ──
     try:
         with db() as c:
+            bal_snap = quota_to_cny(newq) if newq is not None else None
+            c.execute(
+                "INSERT OR IGNORE INTO wallet_tx(uid,type,cny,balance_cny,note,created_at,ref) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (uid, "redeem", face, bal_snap, "兑换码 " + code,
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"), op_id),
+            )
+            # 意图流水转正（兜底老数据：无 ref 的历史 redeem_pending 按 note 匹配）
             c.execute(
                 "UPDATE wallet_tx SET type='redeem', balance_cny=? "
-                "WHERE uid=? AND type='redeem_pending' AND note=?",
-                (quota_to_cny(newq), user["id"], "兑换码 " + code),
+                "WHERE uid=? AND type='redeem_pending' AND (ref=? OR (ref IS NULL AND note=?))",
+                (bal_snap, uid, op_id, "兑换码 " + code),
             )
+            c.execute("UPDATE redeem_codes SET status='used' WHERE code=?", (code,))
     except Exception as e:  # noqa: BLE001
-        print("[wallet] redeem 流水转正失败 uid=%s code=%s err=%s" % (user["id"], code, e))
+        print("[wallet] redeem 收尾失败（流水/置used） code=%s err=%s（加款已生效，凭据可对账）" % (code, e))
     return JSONResponse({"ok": True, "balance_cny": round(quota_to_cny(newq), 4)})
 
 
@@ -2413,9 +2676,21 @@ async def _gw_proxy(request: Request, method: str):
                 if _mt is None or _mt == "":
                     _j["max_tokens"] = GW_MAX_TOKENS_DEFAULT
                     body = json.dumps(_j, ensure_ascii=False).encode()
+                elif isinstance(_mt, bool) or isinstance(_mt, float):
+                    # 严格类型（审查 R1/P1-01）：bool/浮点直接拒绝，不得 int() 截断
+                    return JSONResponse(
+                        {"error": {"type": "invalid_request", "message": "max_tokens 必须为正整数"}},
+                        status_code=400,
+                    )
                 else:
-                    _mt = int(_mt)
-                    if _mt <= 0:
+                    if isinstance(_mt, str):
+                        if not re.fullmatch(r"\d+", _mt.strip()):
+                            return JSONResponse(
+                                {"error": {"type": "invalid_request", "message": "max_tokens 必须为正整数"}},
+                                status_code=400,
+                            )
+                        _mt = int(_mt.strip())
+                    if not isinstance(_mt, int) or _mt <= 0:
                         return JSONResponse(
                             {"error": {"type": "invalid_request", "message": "max_tokens 必须为正整数"}},
                             status_code=400,
@@ -2461,8 +2736,10 @@ async def _gw_proxy(request: Request, method: str):
         if request.headers.get(h):
             headers[h] = request.headers[h]
     try:
-        upstream = http_requests.request(
-            method, target, data=body, headers=headers, stream=True, timeout=(10, 300)
+        # P1-14（审查 R1）：同步 requests 必须移出事件循环，避免慢上游阻塞全站
+        upstream = await run_in_threadpool(
+            http_requests.request,
+            method, target, data=body, headers=headers, stream=True, timeout=(10, 300),
         )
     except Exception as e:  # noqa: BLE001
         _gw_inflight_release(user["id"])
@@ -2535,10 +2812,16 @@ async def api_wallet_pay_request(request: Request):
     try:
         body = json.loads(await request.body())
         amount = round(float(body.get("cny")), 2)
-        # 客户端幂等键（P0-4）：前端 PayQR 注入器生成并持久化，重试/双击复用同一键
-        crid = str(body.get("client_request_id") or "")[:64]
-        if crid and not re.fullmatch(r"[0-9a-zA-Z\-]{8,64}", crid):
-            crid = ""
+        # 客户端幂等键（P0-4，审查 R1 复审）：强制要求合法 client_request_id，
+        # 缺失/非法一律 400 拒绝——不得降级为无幂等键创建（否则旧客户端/隐私模式/直接调 API 仍可重复下单）
+        crid = str(body.get("client_request_id") or "").strip()
+        if not re.fullmatch(r"[0-9a-zA-Z\-]{8,64}", crid):
+            return JSONResponse(
+                {"ok": False, "msg": "缺少有效的客户端幂等键（client_request_id），请刷新页面后重试"},
+                status_code=400,
+            )
+    except json.JSONDecodeError:
+        return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
     except Exception:  # noqa: BLE001
         return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
     if not math.isfinite(amount) or not (GW_PAY_MIN_CNY <= amount <= GW_PAY_MAX_CNY):
@@ -2548,31 +2831,38 @@ async def api_wallet_pay_request(request: Request):
         )
     with db() as c:
         # 幂等 1：同用户同 client_request_id 已有订单 → 直接返回原订单（重试/双击不会建新单）
-        if crid:
-            dup = c.execute(
-                "SELECT id, cny, status, created_at FROM pay_orders "
-                "WHERE uid=? AND client_request_id=?", (user["id"], crid),
-            ).fetchone()
-            if dup is not None:
-                print("[pay] 幂等命中 crid=%s 返回原订单 #%s" % (crid[:8], dup["id"]))
-                return JSONResponse({
-                    "ok": True, "order_id": dup["id"], "cny": dup["cny"],
-                    "status": dup["status"], "created_at": dup["created_at"],
-                    "msg": "该充值申请已存在（原订单 #%s），请勿重复提交" % dup["id"],
-                })
+        # 金额指纹校验（审查 R1）：同 key 不同金额 = 参数冲突，返回 409 而非静默返回原订单
+        dup_rows = c.execute(
+            "SELECT id, cny, status, created_at FROM pay_orders "
+            "WHERE uid=? AND client_request_id=?", (user["id"], crid),
+        ).fetchall()
+        if dup_rows:
+            dup = dup_rows[0]
+            if abs(round(float(dup["cny"]), 2) - amount) > 1e-9:
+                print("[pay] ⚠️ 幂等键金额冲突 crid=%s 原单¥%s 本次¥%s" % (crid[:8], dup["cny"], amount))
+                return JSONResponse(
+                    {"ok": False, "msg": "该幂等键已绑定其他金额（¥%s），请刷新页面重新发起" % dup["cny"]},
+                    status_code=409,
+                )
+            print("[pay] 幂等命中 crid=%s 返回原订单 #%s" % (crid[:8], dup["id"]))
+            return JSONResponse({
+                "ok": True, "order_id": dup["id"], "cny": dup["cny"],
+                "status": dup["status"], "created_at": dup["created_at"],
+                "msg": "该充值申请已存在（原订单 #%s），请勿重复提交" % dup["id"],
+            })
         pending = c.execute(
             "SELECT COUNT(*) AS n FROM pay_orders WHERE uid=? AND status='pending'", (user["id"],)
         ).fetchone()["n"]
         if pending >= GW_PAY_MAX_PENDING:
             return JSONResponse(
                 {"ok": False, "msg": "您有多笔充值待确认，请等待管理员处理后再提交"}, status_code=429)
-        # 幂等 2：唯一索引 (uid, client_request_id) 兜底并发提交，撞唯一键返回既有订单
+        # 幂等 2：唯一索引 (uid, client_request_id) 兜底并发提交，撞唯一键返回既有订单（含金额校验）
         try:
             c.execute(
                 "INSERT INTO pay_orders(uid, username, cny, status, created_at, client_request_id) "
                 "VALUES(?,?,?,'pending',?,?)",
                 (user["id"], user["username"], amount,
-                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"), crid or None),
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"), crid),
             )
         except sqlite3.IntegrityError:
             dup = c.execute(
@@ -2581,6 +2871,11 @@ async def api_wallet_pay_request(request: Request):
             ).fetchone()
             if dup is None:
                 raise
+            if abs(round(float(dup["cny"]), 2) - amount) > 1e-9:
+                return JSONResponse(
+                    {"ok": False, "msg": "该幂等键已绑定其他金额（¥%s），请刷新页面重新发起" % dup["cny"]},
+                    status_code=409,
+                )
             return JSONResponse({
                 "ok": True, "order_id": dup["id"], "cny": dup["cny"],
                 "status": dup["status"], "created_at": dup["created_at"],
@@ -2704,7 +2999,7 @@ async def admin_wallet_gen_codes(request: Request, cny: str = Form(""), count: s
                 _alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
                 code = "".join(secrets.choice(_alphabet) for _ in range(26))
                 cur = c.execute(
-                    "INSERT OR IGNORE INTO redeem_codes(code, cny, created_at) VALUES(?,?,?)",
+                    "INSERT OR IGNORE INTO redeem_codes(code, cny, created_at, status) VALUES(?,?,?,'unused')",
                     (code, face, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                 )
                 if cur.rowcount == 1:

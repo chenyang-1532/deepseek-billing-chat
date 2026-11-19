@@ -1,0 +1,154 @@
+# -*- coding: utf-8 -*-
+"""审查 R2/P1-15 云同步冲突处理回归：
+服务端 rev 权威、base_revs 并发冲突检测、时钟回拨容忍、恢复一致快照"""
+import io, json, os, sys, sqlite3, urllib.request, urllib.error, urllib.parse, uuid, zipfile
+
+ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
+BASE = "http://127.0.0.1:3000"
+SITE = "/tmp/chatsite-test/data.db"
+TAG = os.environ.get("RT_TAG", "")
+U = "rttest%s_cloud" % TAG
+PWD = "cloud123456"
+results = []
+
+
+def ck(name, cond, extra=None):
+    results.append((name, bool(cond)))
+    print(("  ✅ " if cond else "  ❌ ") + name + ("" if cond else "  ← %s" % (extra,)))
+
+
+class NR(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+OP = urllib.request.build_opener(NR)
+
+
+def api(method, path, body=None, hdrs=None):
+    data = json.dumps(body).encode() if isinstance(body, dict) else body
+    hdr = {"Content-Type": "application/json"} if isinstance(body, dict) else {}
+    hdr.update(hdrs or {})
+    r = urllib.request.Request(BASE + path, data=data, method=method, headers=hdr)
+    try:
+        resp = OP.open(r, timeout=30)
+        return resp.status, resp.read(), resp.headers
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), e.headers
+
+
+def mkzip(sessions):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("manifest.json", json.dumps({"export_format_version": 3}))
+        for sid, sess in sessions.items():
+            z.writestr("chat_sessions/%s.json" % sid,
+                       json.dumps({"id": sid, "title": sess.get("title", "t"),
+                                   "updated_at": sess.get("updated_at", ""),
+                                   "messages": sess.get("messages", [])}))
+    return buf.getvalue()
+
+
+def q(sql, p=(), db=SITE):
+    c = sqlite3.connect(db, timeout=15)
+    c.row_factory = sqlite3.Row
+    rows = c.execute(sql, p).fetchall()
+    c.close()
+    return rows
+
+
+# ── 准备：注册 + 激活 + 登录 ──
+api("POST", "/api/register", {"u": U, "p": PWD})
+c = sqlite3.connect(SITE)
+c.execute("UPDATE users SET status='approved', expiry=date('now','localtime','+30 days') WHERE username=?", (U,))
+c.commit(); c.close()
+s, r, h = api("POST", "/api/login", {"u": U, "p": PWD})
+setc = h.get("Set-Cookie") or ""
+CK = setc.split(";")[0]
+ck("准备:注册并登录", s == 200 and CK, (s, setc[:40]))
+
+sid = str(uuid.uuid4())
+BUP = {"Content-Type": "application/octet-stream", "Cookie": CK}
+
+# 1. 首次上传 → rev=1
+z1 = mkzip({sid: {"updated_at": "2026-01-01T00:00:00Z", "messages": [{"role": "user", "content": "v1"}]}})
+s1, r1, _ = api("POST", "/api/backup?deleted=%5B%5D", z1, BUP)
+j1 = json.loads(r1)
+ck("首次上传成功", s1 == 200 and j1.get("ok"), (s1, r1[:120]))
+ck("首次上传 rev=1", (j1.get("revs") or {}).get(sid) == 1, j1.get("revs"))
+
+# 2. 相同内容重传 → rev 不虚增
+s2, r2, _ = api("POST", "/api/backup?deleted=%5B%5D", z1, BUP)
+j2 = json.loads(r2)
+ck("相同内容重传 rev 不虚增", (j2.get("revs") or {}).get(sid) == 1, j2.get("revs"))
+
+# 3. 正确 base_rev 更新 → 覆盖成功 rev=2
+z2 = mkzip({sid: {"updated_at": "2026-01-02T00:00:00Z", "messages": [{"role": "user", "content": "v2"}]}})
+s3, r3, _ = api("POST", "/api/backup?deleted=%5B%5D&base_revs=" + urllib.parse.quote(json.dumps({sid: 1})), z2, BUP)
+j3 = json.loads(r3)
+ck("base_rev 匹配时覆盖成功", j3.get("ok") and sid not in (j3.get("conflicts") or []), r3[:150])
+ck("覆盖后 rev=2", (j3.get("revs") or {}).get(sid) == 2, j3.get("revs"))
+
+# 4. 落后的 base_rev（双设备并发编辑）→ 冲突，云端保留
+z3 = mkzip({sid: {"updated_at": "2026-01-03T00:00:00Z", "messages": [{"role": "user", "content": "stale-device"}]}})
+s4, r4, _ = api("POST", "/api/backup?deleted=%5B%5D&base_revs=" + urllib.parse.quote(json.dumps({sid: 1})), z3, BUP)
+j4 = json.loads(r4)
+ck("落后 base_rev 触发冲突", sid in (j4.get("conflicts") or []), r4[:150])
+uid_row = q("SELECT id FROM users WHERE username=?", (U,))[0]["id"]
+row = q("SELECT session_json, rev FROM cloud_sessions WHERE uid=? AND sid=?", (uid_row, sid))
+ck("冲突时云端保留 rev2 内容", b"v2" in row[0]["session_json"] and row[0]["rev"] == 2, row[0]["rev"] if row else None)
+
+# 5. 时钟回拨（无 base_revs 旧客户端）：客户端 updated_at 更老 → 云端较新，不覆盖
+z4 = mkzip({sid: {"updated_at": "2020-01-01T00:00:00Z", "messages": [{"role": "user", "content": "old-clock"}]}})
+s5, r5, _ = api("POST", "/api/backup?deleted=%5B%5D", z4, BUP)
+j5 = json.loads(r5)
+row = q("SELECT session_json, rev FROM cloud_sessions WHERE uid=? AND sid=?", (uid_row, sid))
+ck("时钟回拨不覆盖云端", b"old-clock" not in row[0]["session_json"], dict(row[0]) if row else None)
+
+# 6. 毫秒精度差异不致死循环：相同时刻不同格式
+z5 = mkzip({sid: {"updated_at": "2026-01-02T00:00:00.000Z", "messages": [{"role": "user", "content": "v2"}]}})
+s6, r6, _ = api("POST", "/api/backup?deleted=%5B%5D", z5, BUP)
+j6 = json.loads(r6)
+ck("毫秒精度差异不触发反向覆盖", j6.get("ok"), r6[:120])
+
+# 7. 恢复一致性：restore 返回服务端合并状态（含 v2，不含 stale-device）
+s7, r7, _ = api("GET", "/api/restore", hdrs={"Cookie": CK})
+ok_restore = s7 == 200 and r7[:2] == b"PK"
+ck("restore 返回 zip", ok_restore, s7)
+if ok_restore:
+    zf = zipfile.ZipFile(io.BytesIO(r7))
+    names = zf.namelist()
+    body = zf.read("chat_sessions/%s.json" % sid).decode() if "chat_sessions/%s.json" % sid in names else ""
+    ck("restore 含云端权威内容(v2)", "v2" in body, body[:120])
+    ck("restore 不含被冲突拒绝的内容", "stale-device" not in body, body[:120])
+
+# 8. 并发上传（两线程，无 base_revs）：rev 单调、库中单行
+import threading
+zA = mkzip({sid: {"updated_at": "2026-01-04T00:00:00Z", "messages": [{"role": "user", "content": "concA"}]}})
+zB = mkzip({sid: {"updated_at": "2026-01-04T00:00:00Z", "messages": [{"role": "user", "content": "concB"}]}})
+errs = []
+def up(zx):
+    try:
+        s_, r_, _ = api("POST", "/api/backup?deleted=%5B%5D", zx, BUP)
+        if s_ != 200:
+            errs.append(s_)
+    except Exception as e:
+        errs.append(str(e))
+ths = [threading.Thread(target=up, args=(z,)) for z in (zA, zB)]
+[t.start() for t in ths]; [t.join() for t in ths]
+rows = q("SELECT sid, rev FROM cloud_sessions WHERE uid=? AND sid=?", (uid_row, sid))
+ck("并发上传库中单行 rev 单调", len(rows) == 1 and rows[0]["rev"] >= 2 and not errs, (len(rows), rows[0]["rev"] if rows else None, errs))
+
+# ── 清理 ──
+c = sqlite3.connect(SITE)
+c.execute("DELETE FROM cloud_sessions WHERE uid=?", (uid_row,))
+c.execute("DELETE FROM cloud_backups WHERE uid=?", (uid_row,))
+c.execute("DELETE FROM users WHERE username=?", (U,))
+c.commit(); c.close()
+import shutil
+shutil.rmtree("/tmp/chatsite-test/snapshots/%s" % uid_row, ignore_errors=True)
+print("清理完成: %s" % U)
+
+fails = [n for n, ok in results if not ok]
+print("\n════ P1-15 云同步冲突: ✅%d ❌%d ════" % (len(results) - len(fails), len(fails)))
+sys.exit(1 if fails else 0)
