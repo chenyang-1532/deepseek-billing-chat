@@ -196,8 +196,10 @@ echo ""
 echo "════════════════════════════"
 echo "回归测试完成: ✅通过 $PASS  ❌失败 $FAIL"
 # 门禁完整性：有失败必须退出非零，否则 run_all 只看退出码会放行带病回归
-if [ "$FAIL" -gt 0 ]; then exit 1; fi
-exit 0
+# R10（审查 P1）：退出码必须放到清理之后再执行——原写法 exit 0 把下面的清理块
+# 变成死代码，测试账号永不清理（实测 FAIL=50 时 exit=1、grep DELETE=0、账号残留）。
+_rt_rc=0
+if [ "$FAIL" -gt 0 ]; then _rt_rc=1; fi
 
 # 清理 rttest_ 测试账号（仅限测试环境，绝不触碰账号"1"等其他用户）
 (cd "$SITE_DIR" && python3 -c "
@@ -209,3 +211,5 @@ c.execute(\"DELETE FROM users WHERE username LIKE '$RLIKE'\")
 c.commit()
 print('测试账号已清理; 现存用户:', c.execute('SELECT username FROM users').fetchall())
 ")
+
+exit $_rt_rc
