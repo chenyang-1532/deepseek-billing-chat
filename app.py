@@ -360,7 +360,7 @@ LOGIN_PAGE_HEAD = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-
 </head><body><div class="card">
 <h1>Miandning AI</h1>
 <div class="notice" id="notice" style="display:none"></div>
-<div class="sub">注册后需管理员审核通过方可使用。<br>模型调用使用你自己的 DeepSeek API Key，费用自理。聊天记录自动云端同步，换设备登录即恢复。</div>"""
+<div class="sub">注册后需管理员审核通过方可使用。<br>按钱包余额计费（充值后即可使用）。聊天记录自动云端同步，换设备登录即恢复。</div>"""
 
 LOGIN_PAGE_TAIL = """
 <div id="msg" class="msg"></div>
@@ -558,6 +558,48 @@ STATUS_TEXT = {
 }
 
 app = FastAPI(title="Paid Chat Gate")
+
+
+# ── 审查 R8/R9：请求体上限「读之前拦」而非「读完再判」 ──
+# 原先 5 处都是 body = await request.body() 之后才 len(body) > LIMIT，上限只约束
+# 合法用户，约束不了故意发超大 body（单请求即可顶满内存）。这里在中间件层按
+# Content-Length 预检；chunked（无 CL）由反代 client_max_body_size 兜底 + 路由层判断。
+BODY_LIMIT_DEFAULT = 2 * 1024 * 1024
+_BODY_LIMIT_RULES = (
+    ("/api/upload", "UPLOAD_MAX_BYTES"),
+    ("/api/backup", "BACKUP_MAX_BYTES"),
+    ("/anthropic/", "GW_BODY_MAX_BYTES"),
+)
+
+
+@app.middleware("http")
+async def _body_limit_middleware(request, call_next):
+    if request.method in ("POST", "PUT", "PATCH"):
+        cl = request.headers.get("content-length")
+        if cl and cl.isdigit():
+            limit = BODY_LIMIT_DEFAULT
+            path = request.url.path
+            for _pref, _name in _BODY_LIMIT_RULES:
+                if path.startswith(_pref):
+                    limit = globals().get(_name) or BODY_LIMIT_DEFAULT   # 常量在下方定义，延迟取值
+                    break
+            if int(cl) > limit:
+                return JSONResponse(
+                    {"ok": False, "msg": "请求体过大（上限 %d MB）" % (limit >> 20)},
+                    status_code=413,
+                )
+    return await call_next(request)
+
+
+# ── 审查 R8/R9：导出/恢复是「全量会话+图片在内存拼 zip」，单账号上限 200MB，
+# 线程池下并发导出峰值可达数 GB。用小信号量把并发压到 2，超限快速失败。
+_EXPORT_SEM = threading.BoundedSemaphore(2)
+
+
+def _export_busy() -> JSONResponse:
+    return JSONResponse({"ok": False, "msg": "导出任务较多，请稍后重试"}, status_code=503)
+
+
 init_db()
 
 @app.get("/login", response_class=HTMLResponse)
@@ -841,6 +883,15 @@ def api_backup_get(request: Request):
     user = get_user(request)
     if user is None or not valid_paid_user(user):
         return Response(status_code=403)
+    if not _EXPORT_SEM.acquire(blocking=False):
+        return _export_busy()
+    try:
+        return _backup_get_locked(user)
+    finally:
+        _EXPORT_SEM.release()
+
+
+def _backup_get_locked(user) -> Response:
     with db() as c:
         _ensure_cloud_sessions(c)
         _migrate_legacy(c, user["id"])
@@ -1085,10 +1136,15 @@ def api_restore_get(request: Request):
     user = get_user(request)
     if user is None or not valid_paid_user(user):
         return Response(status_code=403)
-    with db() as c:
-        _ensure_cloud_sessions(c)
-        _migrate_legacy(c, user["id"])
-        data = _build_archive(c, user["id"])
+    if not _EXPORT_SEM.acquire(blocking=False):
+        return _export_busy()
+    try:
+        with db() as c:
+            _ensure_cloud_sessions(c)
+            _migrate_legacy(c, user["id"])
+            data = _build_archive(c, user["id"])
+    finally:
+        _EXPORT_SEM.release()
     return Response(
         content=data,
         media_type="application/zip",
@@ -1552,7 +1608,7 @@ def admin_page(request: Request):
             ratios_sec = (
                 '<section class="sec" id="sec-ratios"><div class="sec-h"><h2>定价（官方价 × 倍数）</h2>'
                 f'<span class="hint">官方价每 10 分钟自动抓取；当前时段：{"峰时" if tier_peak else "谷时"} · 数据时间 {official_ts}'
-                f'（峰时=UTC 周一至周五 01:00-04:00 与 06:00-10:00；法定节假日保守按峰时计费，周末/其余时段按谷时）'
+                f'（峰时=UTC 周一至周五 01:00-04:00 与 06:00-10:00；中国法定节假日全天按谷时计，周末/其余时段按谷时）'
                 ' · 倍数=在你的售价上相对官方价的倍率</span></div>'
                 + ratio_flash
                 + price_alert_html
@@ -1914,7 +1970,7 @@ GW_TIME_MULT_KEY = "time_multipliers"   # 时段倍率：{"default": x, "rules":
 GW_OFFICIAL_KEY = "official_prices"
 GW_RATIO_REFRESH_INTERVAL = 600  # 官方价抓取周期（秒）；时段/峰谷切换每分钟自检并即时重算
 # 峰时定义（官方）：UTC 周一至周五 01:00-04:00 与 06:00-10:00，中国法定节假日除外；
-# 节假日日历不引入（保守按峰时计），周末/其余时段按谷时
+# 中国法定节假日全天按谷时（见下方 CN_HOLIDAYS），周末/其余时段按谷时
 _PEAK_WINDOWS_UTC = [(1, 4), (6, 10)]
 
 # 兑换尝试限流表：{uid: [窗口起始时间, 次数]}（进程内即可，多worker部署时换共享存储）
@@ -2321,7 +2377,10 @@ def _ratio_refresher():
                 recompute_ratios(data)
                 if ok or last_fetch == 0.0:
                     last_fetch = now
-                last_key = key
+                    # 审查 R8/R9：只有成功（或首次）才推进 key。失败时若也更新，
+                    # 下一轮 key==last_key 且未到 INTERVAL → 不再重试，峰谷切换失败
+                    # 会以旧时段倍率计费最多 GW_RATIO_REFRESH_INTERVAL(600s)。
+                    last_key = key
         except Exception as e:  # noqa: BLE001
             print("[official-price] 后台刷新异常:", e)
         time.sleep(60)

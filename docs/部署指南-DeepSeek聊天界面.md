@@ -75,11 +75,14 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_read_timeout 360s;                       # 网关流式响应最长 300s
+        client_max_body_size 256m;                     # 必须：默认 1m 会让云备份(≤200MB)/文件上传(≤64MB)全部 413
     }
 }
 ```
 
 `_req_secure()` 的 HTTPS 探测顺序：`X-Forwarded-Proto` 头 → `url.scheme`。只走反代时必须配置该头，否则登录 Cookie 不带 Secure。
+
+`client_max_body_size` 必须 ≥ 200MB：站点侧 `/api/backup` 上限 200MB、`/api/upload` 64MB，Nginx 默认 1MB 会先返回 413（页面表现为「同步失败 / 上传失败」，服务端日志一条都没有）。反向代理同时是 chunked（无 Content-Length）请求体的唯一兜底——应用层中间件只能按 CL 预检。
 
 ## 五、日常运维
 
@@ -117,10 +120,10 @@ echo "$NEWPW"   # 仅本次显示，立即转存密码管理器并清终端历�
 export RT_TAG=<唯一标签> ADMIN_PW=<管理密码>
 export RT_ALLOWED_DB_DIRS=/opt/newapi   # 显式声明测试实例目录（防误跑生产机）
 export RT_ALLOW_RESTART=1               # 仅测试环境允许 new-api 重启类用例
-bash tests/run_all.sh                   # 统一门禁：12 套件串行，任一失败总退出码 1
+bash tests/run_all.sh                   # 统一门禁：1 个 bash 回归 + 16 个 Python 套件串行，任一失败总退出码 1
 ```
 
-**禁止在生产机执行**：所有 `tests/` 脚本会写数据库、删除测试用户、（在显式允许时）重启 new-api 进程。`_guard()` 会在数据库路径不在 `/tmp/` 且未声明 `RT_ALLOWED_DB_DIRS` 时以退出码 2 拒绝执行。
+**禁止在生产机执行**：所有 `tests/` 脚本会写数据库、删除测试用户、（在显式允许时）重启 new-api 进程。`_guard()` 会在数据库路径不在 `/tmp/` 且未声明 `RT_ALLOWED_DB_DIRS` 时以退出码 2 拒绝执行；`regression_3000.sh` 另有一道实例校验——3000 端口上 uvicorn 的工作目录必须等于 `/tmp/chatsite-test`，否则同样以退出码 2 拒绝（生产部署也用 3000，这道检查防的是「知道管理密码就直接跑回归」）。
 
 ## 八、已知边界
 

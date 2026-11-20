@@ -3,11 +3,33 @@
 # 基于 /workspace/regression.sh 适配：HTTP、本机直查库
 BASE="http://127.0.0.1:3000"
 RT_TAG="${RT_TAG:-}"
-RREG="rttest${RT_TAG}_regress"
+# 用户名上限 24 位（app.py 注册校验 [\w]{2,24}）：自动标签 runnerHHMMSS(12) 时
+# rttest(6)+tag(12)+_regress(8)=26 会超限被拒 → 级联 31 失败。收短后缀，最长 6+12+4=22。
+RREG="rttest${RT_TAG}_reg"
 RLIKE="rttest${RT_TAG}_%"
 
 SITE_DIR="/tmp/chatsite-test"
 ADMIN_PW="${ADMIN_PW:?请先 export ADMIN_PW}"
+
+# ── R9（审查 P1）：实例校验，必须在发出第一个请求之前 ──
+# 生产部署命令就是 --port 3000（见部署指南 §四），而本脚本 BASE 也打 3000：
+# 在跑着生产站点的机器上执行一次，注册/审批/续期/禁用会全部落到生产库。
+# _guard.py 只覆盖 Python 套件，bash 脚本此前只靠 ADMIN_PW 兜底 → 知道密码就能误伤。
+_site_ok() {
+  [ -f "$SITE_DIR/data.db" ] || return 1
+  local pid cwd real_site
+  real_site=$(readlink -f "$SITE_DIR") || return 1
+  for pid in $(pgrep -f "uvicorn app:app" 2>/dev/null); do
+    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+    [ "$cwd" = "$real_site" ] && return 0
+  done
+  return 1
+}
+if ! _site_ok; then
+  echo "🛑 [TEST-GUARD] 3000 端口上找不到以 $SITE_DIR 为工作目录的实例，拒绝执行（防止误打生产站点）" >&2
+  exit 2
+fi
+
 PASS=0; FAIL=0
 A_JAR=/tmp/rt_admin.jar; U_JAR=/tmp/rt_user.jar
 rm -f $A_JAR $U_JAR
@@ -173,6 +195,9 @@ ck "非ZIP文件上传被拒(400)" 400 "$CODE"
 echo ""
 echo "════════════════════════════"
 echo "回归测试完成: ✅通过 $PASS  ❌失败 $FAIL"
+# 门禁完整性：有失败必须退出非零，否则 run_all 只看退出码会放行带病回归
+if [ "$FAIL" -gt 0 ]; then exit 1; fi
+exit 0
 
 # 清理 rttest_ 测试账号（仅限测试环境，绝不触碰账号"1"等其他用户）
 (cd "$SITE_DIR" && python3 -c "
