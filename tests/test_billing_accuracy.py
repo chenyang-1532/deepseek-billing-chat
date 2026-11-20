@@ -195,6 +195,25 @@ for row, (name, model, text, system) in zip(log_rows, CASES):
     ck("%s: token计量与独立预期一致" % name, ok_tok,
        "in %s/%s out %s/%s" % (row["prompt_tokens"], exp_in, row["completion_tokens"], OUT_TOK))
     ck("%s: 扣款quota与独立公式一致(|误差|≤2)" % name, abs(diff) <= 2, diff)
+    # ── 审查 R11（P0）独立对账：不读 new-api 的 MR/CR（那是循环论证——实现错了期望值
+    # 跟着错），直接用「官方价 × 站点加价倍数」算应收美元，与真实扣款比对，误差 <2%。
+    # 公式：should = in/M×in_miss + out/M×out（M=1e6）；actual = quota/500000；
+    # 定价引擎正确时 actual ≈ should × n（n=加价倍数×时乘），相对误差 <2%。
+    if "/tmp/chatsite-test" not in sys.path:
+        sys.path.insert(0, "/tmp/chatsite-test")
+    import app as _A  # noqa: E402  （guard 已前置，导入副作用仅限测试库）
+    _tier = 1 if _A._is_peak_now() else 0
+    _tmult, _ = _A._active_time_mult()
+    _n = float(_A.get_multipliers().get(billed_model, 1.0)) * _tmult
+    _base = (_A._load_official_prices().get("models") or {}).get(
+        _A.OFFICIAL_PRICE_MAP.get(billed_model, "deepseek-flash")) or \
+        _A.OFFICIAL_PRICES_DEFAULT[_A.OFFICIAL_PRICE_MAP.get(billed_model, "deepseek-flash")]
+    _should_usd = (row["prompt_tokens"] / 1e6 * _base["in_miss"][_tier]
+                   + row["completion_tokens"] / 1e6 * _base["out"][_tier])
+    _actual_usd = row["quota"] / QUSD
+    _rel_err = abs(_actual_usd - _should_usd * _n) / _should_usd if _should_usd > 0 else 0
+    ck("%s: 官方价独立对账(误差<2%%, n=%.2f)" % (name, _n), _rel_err < 0.02,
+       "should=%.6f$ actual=%.6f$ rel=%.4f" % (_should_usd * _n, _actual_usd, _rel_err))
 
 after_used = q("SELECT used_quota FROM users WHERE id=?", (nid,), NAPI)[0]["used_quota"]
 after_quota = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"]

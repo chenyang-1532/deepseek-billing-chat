@@ -24,11 +24,14 @@ import uuid
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, "/tmp/chatsite-test")
-import app as A  # noqa: E402
 from _guard import guard  # noqa: E402
 
-guard(A.DB_PATH, "/opt/newapi/one-api.db")
+# 审查 R11（P1）：guard 必须在 import app 之前（原因同 test_p0_r3.py：
+# 导入即 init_db + 启动定价刷新线程写 new-api 生产 options）。
+guard("/tmp/chatsite-test/data.db", "/opt/newapi/one-api.db")
+
+sys.path.insert(0, "/tmp/chatsite-test")
+import app as A  # noqa: E402
 
 APP = os.path.join("/tmp/chatsite-test", "app.py")
 PASS = FAIL = 0

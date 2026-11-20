@@ -207,10 +207,14 @@ finally:
     try:
         site = sqlite3.connect(SITE_DB, timeout=30)
         napi = sqlite3.connect(NAPI, timeout=30)
-        uids = [r[0] for r in site.execute("SELECT id FROM users WHERE username LIKE 'rttest%s_perf_'" % TAG).fetchall()]
+        # 审查 R11（P2）：原来是 "LIKE 'rttest%s_perf_'" % TAG 的格式化 SQL——RT_TAG
+        # 含单引号即可改写 WHERE（生产库上的 DELETE），且 TAG 里的 _ 会被 LIKE 当通配符。
+        _pat = "rttest" + TAG + r"\_perf\_"
+        uids = [r[0] for r in site.execute(
+            "SELECT id FROM users WHERE username LIKE ? ESCAPE '\\'", (_pat,)).fetchall()]
         nids = [r[0] for r in site.execute("SELECT napi_uid FROM gateway_map WHERE uid IN (%s)" % ",".join(map(str, uids))).fetchall()] if uids else []
         site.execute("DELETE FROM gateway_map WHERE uid IN (%s)" % ",".join(map(str, uids or [0])))
-        site.execute("DELETE FROM users WHERE username LIKE 'rttest%s_perf_'" % TAG)
+        site.execute("DELETE FROM users WHERE username LIKE ? ESCAPE '\\'", (_pat,))
         site.commit()
         for nid in nids:
             napi.execute("DELETE FROM logs WHERE user_id=?", (nid,))

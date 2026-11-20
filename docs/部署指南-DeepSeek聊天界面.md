@@ -56,13 +56,20 @@ pip3 install fastapi uvicorn requests
 
 # 3. 主站点
 cd /opt/chatsite
-ADMIN_PASSWORD='<强密码>' setsid python3.11 -m uvicorn app:app --host 0.0.0.0 --port 3000
-touch /opt/chatsite/gateway.on    # 启用网关计费
+touch gateway.on                  # 审查 R11：必须先开开关再启动——GATEWAY_ENABLED 是模块级
+                                  # 常量，只在 import 时求值一次；先启动后 touch 会导致网关
+                                  # 关闭（/anthropic 全部 503），改开关后必须重启进程
+ADMIN_PASSWORD='<强密码>' setsid python3.11 -m uvicorn app:app --host 0.0.0.0 --port 3000 \
+  --proxy-headers --forwarded-allow-ips=127.0.0.1
+  # 审查 R11：--proxy-headers + forwarded-allow-ips 让应用从 X-Forwarded-For 取真实 IP；
+  # 否则所有按 IP 的限流（登录 20/min、注册 10/min、管理锁定）都退化成全站单桶——
+  # 21 个用户同分钟登录即全站 429，且管理后台可被外部 5 次错误密码锁死。
+  # 若 uvicorn 不再只监听 127.0.0.1，必须同步收紧 forwarded-allow-ips。
 
 # 4. Nginx 反代（必须，见下）
 ```
 
-### Nginx 反代（含 X-Forwarded-Proto，Cookie Secure 依赖它）
+### Nginx 反代（含 X-Forwarded-Proto / X-Forwarded-For）
 
 ```nginx
 server {
@@ -72,6 +79,8 @@ server {
         proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;   # 必须：站点据此发 Secure Cookie
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;   # 必须：按真实 IP 限流/锁定
+        proxy_set_header X-Real-IP $remote_addr;      # 建议：日志/审计工具使用
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_read_timeout 360s;                       # 网关流式响应最长 300s

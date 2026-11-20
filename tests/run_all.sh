@@ -29,6 +29,13 @@ run() {
   echo "════ $name ════"
   "$@" > "/tmp/rt_${name}.log" 2>&1
   local rc=$?
+  # 审查 R11/D3：exit 0 ≠ PASS——test_performance 在 RT_SITE_DB 为空时 sys.exit(0)
+  # 是 SKIP 不是 PASS，汇总里必须写明，否则「17/17」名不副实。
+  if [ $rc -eq 0 ] && grep -q "^\[SKIP\]" "/tmp/rt_${name}.log" 2>/dev/null; then
+    RESULTS+=("$name SKIP(exit=0)")
+    echo "  ⏭️ $name SKIP（依赖未设置，未实际执行）"
+    return
+  fi
   RESULTS+=("$name exit=$rc")
   tail -3 "/tmp/rt_${name}.log"
   if [ $rc -eq 2 ]; then
@@ -80,7 +87,44 @@ echo "════════ 退出码汇总 ════════"
 printf '%s\n' "${RESULTS[@]}"
 if [ $FAIL -ne 0 ]; then
   echo "════ 总结果: ❌ 存在失败套件（exit 1） ════"
-  exit 1
+  _final_rc=1
+else
+  echo "════ 总结果: ✅ 全部套件退出码为 0 ════"
+  _final_rc=0
 fi
-echo "════ 总结果: ✅ 全部套件退出码为 0 ════"
-exit 0
+
+# 审查 R11/E：测试账号清理收口——只靠 regression 末尾清理会漏掉 performance 等
+# 后跑套件注册的账号（实测每轮 gate 残留 100+），手动清一定会漏，漏了下次 gate
+# 的账号基数就变、test_performance 结论不可复现。统一在两库按 RT_TAG 前缀批量删。
+if [ -n "$RT_SITE_DB" ] && [ -f "$RT_SITE_DB" ]; then
+  RT_TAG="$RT_TAG" python3 - "$RT_SITE_DB" "${RT_NAPI_DB:-}" <<'PYEOF'
+import os, sqlite3, sys
+tag = os.environ["RT_TAG"]
+site, napi = sys.argv[1], sys.argv[2] or None
+# 匹配 rttest…TAG…任意位置（覆盖 regression 的 rttest<TAG>_、p0_r3 的 rttest_r3<TAG>、
+# performance 在 new-api 的 site<uid>_rttest<TAG>_ 前缀命名）；TAG 不参与 SQL 拼接
+pat = "%%rttest%%%s%%" % tag
+c = sqlite3.connect(site, timeout=15)
+c.execute("PRAGMA busy_timeout=15000")
+uids = [r[0] for r in c.execute("SELECT id FROM users WHERE username LIKE ?", (pat,)).fetchall()]
+n1 = c.execute("DELETE FROM cloud_sessions WHERE uid IN (SELECT id FROM users WHERE username LIKE ?)", (pat,)).rowcount
+c.execute("DELETE FROM cloud_backups WHERE uid IN (SELECT id FROM users WHERE username LIKE ?)", (pat,))
+c.execute("DELETE FROM gateway_map WHERE uid IN (SELECT id FROM users WHERE username LIKE ?)", (pat,))
+n2 = c.execute("DELETE FROM users WHERE username LIKE ?", (pat,)).rowcount
+c.commit()
+napi_deleted = 0
+if napi:
+    nc = sqlite3.connect(napi, timeout=15)
+    nc.execute("PRAGMA busy_timeout=15000")
+    for nid in [r[0] for r in nc.execute("SELECT id FROM users WHERE username LIKE ?", (pat,)).fetchall()]:
+        nc.execute("DELETE FROM logs WHERE user_id=?", (nid,))
+        nc.execute("DELETE FROM tokens WHERE user_id=?", (nid,))
+    napi_deleted = nc.execute("DELETE FROM users WHERE username LIKE ?", (pat,)).rowcount
+    nc.execute("DELETE FROM tokens WHERE user_id NOT IN (SELECT id FROM users)")
+    nc.commit(); nc.close()
+c.close()
+print("[run_all] 测试账号收口清理: 站点 %d 用户/%d 会话, new-api %d 用户" % (n2, n1, napi_deleted))
+PYEOF
+fi
+
+exit $_final_rc

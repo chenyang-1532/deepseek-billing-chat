@@ -151,13 +151,16 @@ ck("消费记录接口不返回token_key", tk not in r)
 
 print("\n═══ 6. 封禁/过期后的行为 ═══")
 c = sqlite3.connect(SITE, timeout=15)
-c.execute("UPDATE users SET status='banned' WHERE username='rttest%s_iso_A'" % TAG)
+# 审查 R11（P2）：格式化 UPDATE（TAG 含引号即可改写生产库）；且 'banned' 不是站点
+# 合法状态（应用只有 pending/approved/rejected/disabled），此处应测真实禁用态。
+c.execute("UPDATE users SET status='disabled' WHERE username=?", ("rttest%s_iso_A" % TAG,))
 c.commit()
 c.close()
 s, r, _ = api("POST", "/anthropic/v1/messages", BODY, cookie=cookies["A"])
 ck("封禁用户调用计费代理被拒", s in (402, 403), s)
 c = sqlite3.connect(SITE, timeout=15)
-c.execute("UPDATE users SET status='approved', expiry=date('now','localtime','-1 day') WHERE username='rttest%s_iso_B'" % TAG)
+c.execute("UPDATE users SET status='approved', expiry=date('now','localtime','-1 day') WHERE username=?",
+          ("rttest%s_iso_B" % TAG,))
 c.commit()
 c.close()
 s, r, _ = api("POST", "/anthropic/v1/messages", BODY, cookie=cookies["B"])

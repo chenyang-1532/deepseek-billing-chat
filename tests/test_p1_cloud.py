@@ -141,6 +141,79 @@ ths = [threading.Thread(target=up, args=(z,)) for z in (zA, zB)]
 rows = q("SELECT sid, rev FROM cloud_sessions WHERE uid=? AND sid=?", (uid_row, sid))
 ck("并发上传库中单行 rev 单调", len(rows) == 1 and rows[0]["rev"] >= 2 and not errs, (len(rows), rows[0]["rev"] if rows else None, errs))
 
+# 9. 图片保留语义（审查 R11/P1-a）：带图上传 → 无图上传 → restore 仍有图
+def mkzip_img(sessions, with_img):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("manifest.json", json.dumps({"export_format_version": 3}))
+        for s_, sess in sessions.items():
+            z.writestr("chat_sessions/%s.json" % s_,
+                       json.dumps({"id": s_, "title": "t", "updated_at": sess["updated_at"],
+                                   "messages": sess["messages"]}))
+            if with_img:
+                z.writestr("chat_sessions/%s_files/pic1.png" % s_, b"\x89PNG\r\n\x1a\nfake-image-bytes-r11")
+    return buf.getvalue()
+
+sid_img = str(uuid.uuid4())
+def img_zip_has(blob):
+    # 云端 images 是 _imgs_zip() 的 ZIP_DEFLATED 包（审查 R11 断言适配：解压后检查）
+    if not blob:
+        return False
+    try:
+        iz = zipfile.ZipFile(io.BytesIO(blob))
+        names = iz.namelist()
+        return any("pic1.png" in n for n in names) and any(
+            b"fake-image-bytes-r11" in iz.read(n) for n in names)
+    except Exception:
+        return b"fake-image-bytes-r11" in blob
+zi1 = mkzip_img({sid_img: {"updated_at": "2026-02-01T00:00:00Z", "messages": [{"role": "user", "content": "with-img"}]}}, True)
+s9, r9, _ = api("POST", "/api/backup?deleted=%5B%5D", zi1, BUP)
+j9 = json.loads(r9)
+ck("带图上传成功", s9 == 200 and j9.get("ok"), (s9, r9[:120]))
+img_row = q("SELECT images FROM cloud_sessions WHERE uid=? AND sid=?", (uid_row, sid_img))
+ck("云端 images 已存图片", img_row and img_zip_has(img_row[0]["images"]),
+   len(img_row[0]["images"]) if img_row and img_row[0]["images"] else None)
+zi2 = mkzip_img({sid_img: {"updated_at": "2026-02-02T00:00:00Z", "messages": [{"role": "user", "content": "no-img-update"}]}}, False)
+s10, r10, _ = api("POST", "/api/backup?deleted=%5B%5D&base_revs=" + urllib.parse.quote(json.dumps({sid_img: 1})), zi2, BUP)
+j10 = json.loads(r10)
+ck("无图更新推送成功", s10 == 200 and j10.get("ok") and sid_img not in (j10.get("conflicts") or []), r10[:150])
+img_row2 = q("SELECT images FROM cloud_sessions WHERE uid=? AND sid=?", (uid_row, sid_img))
+ck("无图上传不清空云端图片", img_row2 and img_zip_has(img_row2[0]["images"]),
+   len(img_row2[0]["images"]) if img_row2 and img_row2[0]["images"] else None)
+s11, r11, _ = api("GET", "/api/restore", hdrs={"Cookie": CK})
+img_survives = False
+if s11 == 200 and r11[:2] == b"PK":
+    zf11 = zipfile.ZipFile(io.BytesIO(r11))
+    img_survives = "chat_sessions/%s_files/pic1.png" % sid_img in zf11.namelist()
+ck("restore 后图片仍幸存", img_survives, s11)
+
+# 10. base_revs CAS 并发（审查 R11/P1-b）：两设备同 base_rev 并发推送 → 恰好一个 conflicts 非空
+sid_race = str(uuid.uuid4())
+zr1 = mkzip({sid_race: {"updated_at": "2026-03-01T00:00:00Z", "messages": [{"role": "user", "content": "race-base"}]}})
+s12, r12, _ = api("POST", "/api/backup?deleted=%5B%5D", zr1, BUP)
+j12 = json.loads(r12)
+base_rev = (j12.get("revs") or {}).get(sid_race)
+ck("CAS 准备: 初始 rev 就绪", s12 == 200 and base_rev == 1, (s12, j12.get("revs")))
+zrA = mkzip({sid_race: {"updated_at": "2026-03-02T00:00:00Z", "messages": [{"role": "user", "content": "race-A"}]}})
+zrB = mkzip({sid_race: {"updated_at": "2026-03-02T00:00:00Z", "messages": [{"role": "user", "content": "race-B"}]}})
+race_conflicts, race_errs = [], []
+barrier = threading.Barrier(2)
+def push_race(zx):
+    try:
+        barrier.wait()
+        s_, r_, _ = api("POST", "/api/backup?deleted=%5B%5D&base_revs=" + urllib.parse.quote(json.dumps({sid_race: base_rev})), zx, BUP)
+        j_ = json.loads(r_)
+        race_conflicts.append(sid_race in (j_.get("conflicts") or []))
+    except Exception as e:
+        race_errs.append(str(e))
+ths2 = [threading.Thread(target=push_race, args=(z,)) for z in (zrA, zrB)]
+[t.start() for t in ths2]; [t.join() for t in ths2]
+ck("同 base_rev 并发推送恰好一个冲突", len(race_errs) == 0 and sum(race_conflicts) == 1,
+   "conflicts=%s errs=%s" % (race_conflicts, race_errs))
+race_row = q("SELECT rev, session_json FROM cloud_sessions WHERE uid=? AND sid=?", (uid_row, sid_race))
+ck("CAS 后云端单行且 rev 只前进一次", len(race_row) == 1 and race_row[0]["rev"] == base_rev + 1,
+   (len(race_row), race_row[0]["rev"] if race_row else None))
+
 # ── 清理 ──
 c = sqlite3.connect(SITE)
 c.execute("DELETE FROM cloud_sessions WHERE uid=?", (uid_row,))

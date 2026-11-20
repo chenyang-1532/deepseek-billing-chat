@@ -139,6 +139,17 @@ def db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+def _add_column(c, table: str, col: str, decl: str) -> None:
+    """容错加列（审查 R11/P1）：多 worker 同时启动时两个进程可能同时通过 PRAGMA 检查，
+    后到者 ALTER 撞 duplicate column 直接抛异常 → 该 worker 启动失败（实测 6 并发 1 崩）。
+    表名/列名为本文件内硬编码常量，不接受外部输入。"""
+    try:
+        c.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, decl))
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+
+
 def init_db():
     with db() as c:
         c.execute(
@@ -187,7 +198,7 @@ def init_db():
         # 迁移：老库补 status 列并回填（兑换 saga，审查 R2：unused→processing→used 持久状态机）
         _rc_cols = [r[1] for r in c.execute("PRAGMA table_info(redeem_codes)").fetchall()]
         if "status" not in _rc_cols:
-            c.execute("ALTER TABLE redeem_codes ADD COLUMN status TEXT")
+            _add_column(c, "redeem_codes", "status", "TEXT")
         c.execute(
             "UPDATE redeem_codes SET status=CASE WHEN used_by IS NOT NULL THEN 'used' ELSE 'unused' END "
             "WHERE status IS NULL"
@@ -224,14 +235,14 @@ def init_db():
         # wallet_tx.ref：业务操作号唯一凭据（adjust:<op_id> / pay:<oid>），禁止再用备注 LIKE 对账
         cols = {r["name"] for r in c.execute("PRAGMA table_info(wallet_tx)")}
         if "ref" not in cols:
-            c.execute("ALTER TABLE wallet_tx ADD COLUMN ref TEXT")
+            _add_column(c, "wallet_tx", "ref", "TEXT")
         c.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_tx_ref ON wallet_tx(ref) "
             "WHERE ref IS NOT NULL"
         )
         cols2 = {r["name"] for r in c.execute("PRAGMA table_info(pay_orders)")}
         if "client_request_id" not in cols2:
-            c.execute("ALTER TABLE pay_orders ADD COLUMN client_request_id TEXT")
+            _add_column(c, "pay_orders", "client_request_id", "TEXT")
         c.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pay_orders_crid ON pay_orders(uid, client_request_id) "
             "WHERE client_request_id IS NOT NULL"
@@ -619,8 +630,26 @@ def api_announcement():
 _AUTH_ATTEMPTS = {}
 
 
+def _prune_attempts(table: dict, ttl: int = 60, cap: int = 4096, ts_idx: int = 0) -> None:
+    """审查 R11（P2）：限流表只增不减——IPv6 一个 /64 段就能造出天文数字的键，
+    长期运行内存无上限增长。超过 cap 时按时间戳清掉过窗条目（摊还成本 O(n)/cap 次）。
+    只影响限流精度（过窗记录本就该失效），不影响安全判定。"""
+    if len(table) <= cap:
+        return
+    cutoff = time.time() - ttl
+    for k in [k for k, v in table.items() if not v or (v[ts_idx] or 0) < cutoff]:
+        table.pop(k, None)
+    # 过窗清理压不回上限（60 秒内被灌满，所有条目都还"新鲜"）→ 按插入序丢最老的。
+    # 安全代价可忽略：限流本就按 IP/uid 独立计数，丢掉最老条目最多让其多试一个窗口；
+    # 要利用它先得制造 4096 个不同源地址，那时换地址本身就能绕过限流。
+    if len(table) > cap:
+        for k in list(table)[:len(table) - cap]:
+            table.pop(k, None)
+
+
 def _auth_rate_limited(ip: str, limit: int) -> bool:
     now = time.time()
+    _prune_attempts(_AUTH_ATTEMPTS, ttl=60, cap=4096, ts_idx=0)
     win = _AUTH_ATTEMPTS.get(ip)
     if win is None or now - win[0] >= 60:
         _AUTH_ATTEMPTS[ip] = [now, 1]
@@ -633,7 +662,14 @@ def _auth_rate_limited(ip: str, limit: int) -> bool:
 async def api_register(request: Request):
     if _auth_rate_limited(request.client.host if request.client else "?", 10):
         return JSONResponse({"ok": False, "msg": "注册尝试过于频繁，请一分钟后再试"}, status_code=429)
-    d = await request.json()
+    # 审查 R11（P2）：非法 JSON / 非对象 body 会让 d.get 抛异常 → 500（实测 6/6 全 500）。
+    # 客户端错误统一 400，且不写入任何状态。
+    try:
+        d = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
+    if not isinstance(d, dict):
+        return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
     u = str(d.get("u", "")).strip()
     p = str(d.get("p", ""))
     if not re.fullmatch(r"[\w\u4e00-\u9fa5]{2,24}", u):
@@ -654,7 +690,12 @@ async def api_register(request: Request):
 async def api_login(request: Request):
     if _auth_rate_limited(request.client.host if request.client else "?", 20):
         return JSONResponse({"ok": False, "msg": "登录尝试过于频繁，请一分钟后再试"}, status_code=429)
-    d = await request.json()
+    try:
+        d = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
+    if not isinstance(d, dict):
+        return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
     u = str(d.get("u", "")).strip()
     p = str(d.get("p", ""))
     with db() as c:
@@ -758,7 +799,7 @@ def _ensure_cloud_sessions(c):
     # P1-15（审查 R2）：服务端单调递增 rev 作为版本权威，客户端 updated_at 仅作展示
     _cs_cols = [r[1] for r in c.execute("PRAGMA table_info(cloud_sessions)").fetchall()]
     if "rev" not in _cs_cols:
-        c.execute("ALTER TABLE cloud_sessions ADD COLUMN rev INTEGER DEFAULT 0")
+        _add_column(c, "cloud_sessions", "rev", "INTEGER DEFAULT 0")
 
 
 def _split_archive(data: bytes):
@@ -863,8 +904,10 @@ def _build_archive(c, uid) -> bytes:
 @app.get("/api/backup/meta")
 def api_backup_meta(request: Request):
     user = get_user(request)
-    if user is None:
-        return JSONResponse({"ok": False})
+    # 审查 R11（P2）：与 /api/backup、/api/restore 的权限保持一致——过期/未审核账号
+    # 不该看到云端备份的更新时间（原实现只判 user is not None）。
+    if user is None or not valid_paid_user(user):
+        return JSONResponse({"ok": False}, status_code=403)
     with db() as c:
         _ensure_cloud_sessions(c)
         _migrate_legacy(c, user["id"])
@@ -975,6 +1018,14 @@ async def api_backup_post(request: Request):
         base_revs = {str(k): int(v) for k, v in json.loads(_br_raw).items()} if _br_raw else {}
     except Exception:
         base_revs = {}
+    # 审查 R11（P1）：解压 + 合并 + 写库 + 落盘全是同步阻塞 IO，原实现在事件循环里执行；
+    # 实测 60MB 备份上传期间并发请求延迟 1766ms（正常 3ms），单 worker 下等于全站卡死，
+    # 200MB 上传可达 6s+。整段搬进线程池（FastAPI 默认 40 线程），不再占用事件循环。
+    return await run_in_threadpool(_backup_merge, user, data, del_ids, base_revs, now_ms)
+
+
+def _backup_merge(user, data, del_ids, base_revs, now_ms) -> JSONResponse:
+    """同步执行备份合并 + 快照落盘（只在线程池中调用，禁止在事件循环直接调用）。"""
     try:
         with db() as c:
             _ensure_cloud_sessions(c)
@@ -1049,7 +1100,7 @@ async def api_backup_post(request: Request):
             conflicts = []
             for sid, item in incoming.items():
                 row = c.execute(
-                    "SELECT updated_at, deleted, rev, session_json FROM cloud_sessions WHERE uid=? AND sid=?",
+                    "SELECT updated_at, deleted, rev, session_json, images FROM cloud_sessions WHERE uid=? AND sid=?",
                     (user["id"], sid),
                 ).fetchone()
                 if row is not None and row["deleted"]:
@@ -1061,11 +1112,17 @@ async def api_backup_post(request: Request):
                 if same:
                     continue  # 内容未变：不动 rev，避免每次上传都虚增版本
                 if row is None:
-                    c.execute(
+                    # 审查 R11（P1-b）：新建分支防并发——两个设备同时首次推送同一 sid，
+                    # 普通 INSERT 会互相覆盖（后到者把先到者的内容抹掉）。
+                    # ON CONFLICT DO NOTHING + rowcount 判定，撞上即按冲突处理。
+                    ins = c.execute(
                         "INSERT INTO cloud_sessions(uid,sid,session_json,images,updated_at,deleted,rev) "
-                        "VALUES(?,?,?,?,?,0,1)",
+                        "VALUES(?,?,?,?,?,0,1) ON CONFLICT(uid,sid) DO NOTHING",
                         (user["id"], sid, item["json"], _imgs_zip(item["imgs"]), item["upd"]),
                     )
+                    if ins.rowcount != 1:
+                        conflicts.append(sid)
+                        changed = True
                 elif sid in base_revs:
                     # 新版客户端：rev 权威判定。base_rev 落后于云端 = 双设备并发编辑 → 冲突，
                     # 保留云端版本，回传 conflicts 让客户端拉取合并（绝不以客户端时间戳新者胜）
@@ -1073,19 +1130,34 @@ async def api_backup_post(request: Request):
                         conflicts.append(sid)
                         changed = True
                         continue
-                    c.execute(
+                    # 审查 R11（P1-a）：本次没带图片条目 ≠ 用户要删图片（新设备首推、图片
+                    # 缓存被清、blob 读取失败都会 imgs=[]），无条件写 None 会把云端已存
+                    # 图片永久抹掉。此处保留云端现值；真正删图需要显式协议，不用"没上传"当删除语义。
+                    _imgs_blob = _imgs_zip(item["imgs"])
+                    if _imgs_blob is None:
+                        _imgs_blob = row["images"] if row is not None else None
+                    # 审查 R11（P1-b）：读 rev 与写 rev 之间无原子性，两设备并发都能通过
+                    # base_revs 校验 → 后写静默覆盖且双方 conflicts=[]（对话丢失）。
+                    # 改原子 CAS：WHERE 带上 rev=cur_rev，rowcount≠1 即判定冲突。
+                    upd = c.execute(
                         "UPDATE cloud_sessions SET session_json=?, images=?, updated_at=?, rev=? "
-                        "WHERE uid=? AND sid=?",
-                        (item["json"], _imgs_zip(item["imgs"]), item["upd"], cur_rev + 1, user["id"], sid),
+                        "WHERE uid=? AND sid=? AND deleted=0 AND rev=?",
+                        (item["json"], _imgs_blob, item["upd"], cur_rev + 1, user["id"], sid, cur_rev),
                     )
+                    if upd.rowcount != 1:
+                        conflicts.append(sid)
+                        changed = True
                 elif _cloud_newer(row["updated_at"] or "", item["upd"]):
                     changed = True  # 云端这条更新，客户端待会儿拉取
                 else:
                     # 旧客户端（无 base_rev）：保留 updated_at 兼容路径，服务端 rev 单调递增
+                    _imgs_blob = _imgs_zip(item["imgs"])
+                    if _imgs_blob is None:
+                        _imgs_blob = row["images"] if row is not None else None
                     c.execute(
                         "UPDATE cloud_sessions SET session_json=?, images=?, updated_at=?, rev=? "
                         "WHERE uid=? AND sid=?",
-                        (item["json"], _imgs_zip(item["imgs"]), item["upd"], cur_rev + 1, user["id"], sid),
+                        (item["json"], _imgs_blob, item["upd"], cur_rev + 1, user["id"], sid),
                     )
             # 云端存在但本次上传没有的会话 → 客户端缺数据，需要拉取
             extra = c.execute(
@@ -1317,7 +1389,10 @@ def admin_page(request: Request):
     if gw_enabled():
         try:
             with napi_connect() as nc:
-                today_start = int(datetime.combine(site_now().date(), datetime.min.time()).timestamp())
+                # 审查 R11（P2）：site_now() 返回不带 tzinfo 的北京时间，.timestamp() 会按
+                # 宿主时区解释——Docker（UTC）主机上「今日消费」起点偏到北京 08:00，当天
+                # 0-8 点的消费漏算。显式挂 SITE_TZ 再取时间戳。
+                today_start = int(datetime.combine(site_now().date(), datetime.min.time(), tzinfo=SITE_TZ).timestamp())
                 # 每个站点用户的余额与用量
                 wallet_rows = {}
                 with db() as c:
@@ -1770,7 +1845,19 @@ def _admin_login_check(ip: str) -> str:
 
 
 def _admin_login_fail(ip: str):
+    # 审查 R11（P2）：锁定表同样无上限——失败 1 次就建键，IPv6 一段地址即可撑爆内存。
+    # 超限时按插入序丢最老的，保留最近 4096 条（dict 自 3.7 保序）。
+    # 代价：被丢弃的 IP 失败计数归零（最多多试 _ADMIN_LOCK_AFTER 次），
+    # 但拿到这个收益需要先失败、再制造 4096 个不同源地址，成本远高于收益。
+    if len(_ADMIN_LOGIN_FAILS) > 8192:
+        for _k in list(_ADMIN_LOGIN_FAILS)[:len(_ADMIN_LOGIN_FAILS) - 4096]:
+            _ADMIN_LOGIN_FAILS.pop(_k, None)
     ent = _ADMIN_LOGIN_FAILS.setdefault(ip, [0, 0.0])
+    # 审查 R11（P1）：锁定期内继续失败不再累加、不续期——否则攻击者每 5 分钟打 5 次
+    # 错误密码就能把锁定时间无限延长，真正的管理员永远进不了后台（纯 DoS，无需密码）。
+    # 一次锁定最多 _ADMIN_LOCK_SECONDS，到期后重新计数。
+    if ent[1] > time.time():
+        return
     ent[0] += 1
     if ent[0] >= _ADMIN_LOCK_AFTER:
         ent[1] = time.time() + _ADMIN_LOCK_SECONDS
@@ -1783,7 +1870,9 @@ async def admin_login(request: Request, pw: str = Form("")):
     if _admin_login_check(ip) == "locked":
         print("[安全] 管理登录拒绝(锁定中) ip=%s" % ip)
         return RedirectResponse("/admin?login_err=locked", status_code=303)
-    if not hmac.compare_digest(pw, ADMIN_PASSWORD):
+    # 审查 R11（P1）：hmac.compare_digest 对 str 要求 ASCII-only，管理员设置中文密码
+    # 或攻击者提交中文密码都会抛 TypeError → 500（实测确认）。统一按 UTF-8 字节比较。
+    if not hmac.compare_digest(pw.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
         _admin_login_fail(ip)
         print("[安全] 管理登录失败 ip=%s" % ip)
         return RedirectResponse("/admin", status_code=303)
@@ -1834,7 +1923,17 @@ async def admin_action(request: Request, uid: int = Form(...), action: str = For
         elif action == "disable":
             c.execute("UPDATE users SET status='disabled' WHERE id=?", (uid,))
         elif action == "enable":
-            c.execute("UPDATE users SET status='approved' WHERE id=?", (uid,))
+            # 审查 R11（P2）：原实现只改 status，过期账号启用后仍是 approved+过去日期 →
+            # 依旧登录不了（表现为"点了启用没反应"）。未过期则原样恢复，已过期则补足有效期。
+            if row["expiry"] and not is_expired(row):
+                c.execute("UPDATE users SET status='approved' WHERE id=?", (uid,))
+            else:
+                _base = max(today(), row["expiry"]) if row["expiry"] else today()
+                _new = (date.fromisoformat(_base) + timedelta(days=days)).isoformat()
+                c.execute(
+                    "UPDATE users SET status='approved', expiry=?, renewal_requested=0 WHERE id=?",
+                    (_new, uid),
+                )
     return RedirectResponse("/admin", status_code=303)
 
 # ---------- 文件上传中转 ----------
@@ -2302,7 +2401,11 @@ def recompute_ratios(official: dict | None = None) -> str:
         base = models.get(OFFICIAL_PRICE_MAP.get(m, "deepseek-flash")) or OFFICIAL_PRICES_DEFAULT[OFFICIAL_PRICE_MAP.get(m, "deepseek-flash")]
         n = float(mults.get(m, 1.0)) * tmult
         mr_map[m] = _ratio_from_price(base["in_miss"][tier], n)
-        cr_map[m] = _ratio_from_price(base["out"][tier], n)
+        # 审查 R11（P0）：CompletionRatio 是「输出相对输入」的倍数（new-api:
+        # completionQuota = out_tokens × CR × MR），与加价倍数 n 无关（n 已含在
+        # ModelRatio 里）。原实现把 out 绝对价当倍数写入 → 输出部分只收 7.5%~33%，
+        # 纯输出请求安静少收 3~13 倍（flash 实测 26.0%、pro 49.7%）。
+        cr_map[m] = round(base["out"][tier] / base["in_miss"][tier], 6)
         # P0-C：缓存命中计价比 = 官方缓存命中价 / 未命中价（与 ModelRatio 同源同时段）。
         # 两个模型比值不同（flash 0.02 / pro ≈0.0333），按 map 逐模型写入；
         # 比值取两个时段中的较小值——宁可少收（按更低的缓存价），绝不多收。
@@ -2420,6 +2523,7 @@ def _gw_inflight_release(uid: int):
 
 def _redeem_rate_limited(uid: int) -> bool:
     now = time.time()
+    _prune_attempts(_REDEEM_ATTEMPTS, ttl=60, cap=4096, ts_idx=0)
     win = _REDEEM_ATTEMPTS.get(uid)
     if win is None or now - win[0] >= 60:
         _REDEEM_ATTEMPTS[uid] = [now, 1]
@@ -2433,6 +2537,7 @@ _PAY_ATTEMPTS = {}
 
 def _pay_rate_limited(uid: int) -> bool:
     now = time.time()
+    _prune_attempts(_PAY_ATTEMPTS, ttl=60, cap=4096, ts_idx=0)
     win = _PAY_ATTEMPTS.get(uid)
     if win is None or now - win[0] >= 60:
         _PAY_ATTEMPTS[uid] = [now, 1]
@@ -2455,11 +2560,18 @@ def gw_enabled() -> bool:
 
 # 定价同步线程（官方价每 10 分钟刷新 + 峰谷时段自动重算倍率）
 if gw_enabled():
+    print("[gateway] 计费网关已启用 (new-api %s)" % NEWAPI_BASE)
     threading.Thread(target=_ratio_refresher, daemon=True).start()
     try:
         _check_holiday_freshness()   # R6（审查 P2）：启动即检查节假日表时效（过期红色告警 + 面板标记）
     except Exception:
         pass
+else:
+    # 审查 R11（P1）：GATEWAY_ENABLED 是模块级常量（import 时求值），启动后再 touch
+    # gateway.on 不会生效——照老文档部署会得到「能登录能看界面但聊天全 503」的站，
+    # 且启动日志里看不出网关是关的，排查方向会被引向 Key/渠道。第一屏打明状态。
+    print("[gateway] 计费网关未启用（gateway.on 不存在且未设 GATEWAY_ENABLED=1）"
+          "→ /anthropic 将返回 503；改开关后必须重启进程")
 
 
 def napi_connect():
@@ -2642,7 +2754,8 @@ def api_wallet(request: Request):
     _, nid = gw_provision(user)
     with napi_connect() as nc:
         u = nc.execute("SELECT quota, used_quota, request_count FROM users WHERE id=?", (nid,)).fetchone()
-        today_start = int(datetime.combine(site_now().date(), datetime.min.time()).timestamp())
+        # 审查 R11（P2）：同上——UTC 宿主上今日起点偏 8 小时，显式挂 SITE_TZ。
+        today_start = int(datetime.combine(site_now().date(), datetime.min.time(), tzinfo=SITE_TZ).timestamp())
         today = nc.execute(
             "SELECT COALESCE(SUM(quota),0) AS s FROM logs WHERE user_id=? AND type=2 AND created_at>=?",
             (nid, today_start),
@@ -3463,6 +3576,10 @@ async def admin_wallet_qr(request: Request, file: UploadFile = File(None)):
 def gate(full_path: str, request: Request):
     if full_path in ("favicon.ico", "robots.txt"):
         return Response(status_code=204)
+    # 审查 R11（P2）：未注册的 /api/* 原本落到这里返回 index.html（200 text/html），
+    # 前端 res.json() 直接抛异常、日志里也看不到 404。接口路径统一返回 JSON 404。
+    if full_path.startswith("api/") or full_path.startswith("admin/"):
+        return JSONResponse({"ok": False, "msg": "接口不存在"}, status_code=404)
     user = get_user(request)
     if user is None:
         return RedirectResponse("/login", status_code=303)
@@ -3476,9 +3593,14 @@ def gate(full_path: str, request: Request):
     resp = serve_static(full_path or "index.html")
     # 滑动续期：每次打开网站都把登录态再续 30 天。
     # 活跃用户只要 30 天内来过一次就永远不会被要求重新登录。
-    resp.set_cookie(
-        "session", sign({"uid": user["id"], "exp": time.time() + SESSION_DAYS * 86400}),
-        max_age=SESSION_DAYS * 86400, httponly=True, samesite="lax", path="/",
-        secure=_req_secure(request),
-    )
+    # 审查 R11（P2）：只对 HTML 导航续期。给 /static/js|css（Cache-Control: public,
+    # max-age=2592000, immutable）也塞 Set-Cookie，会让 CDN/浏览器放弃长缓存（实测每个
+    # 静态资源都带 172 字节 Set-Cookie）；若前置缓存配置了 proxy_ignore_headers Set-Cookie，
+    # 还会把 A 的会话发给 B。静态资源不需要续期，导航请求续期足够。
+    if (resp.headers.get("content-type") or "").startswith("text/html"):
+        resp.set_cookie(
+            "session", sign({"uid": user["id"], "exp": time.time() + SESSION_DAYS * 86400}),
+            max_age=SESSION_DAYS * 86400, httponly=True, samesite="lax", path="/",
+            secure=_req_secure(request),
+        )
     return resp

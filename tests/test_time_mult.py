@@ -126,7 +126,9 @@ ok("B4 v4-pro 按自身档位同步", abs(mr3["deepseek-v4-pro"] - expect_p) < 1
 # B5 CompletionRatio 同步
 with A.napi_connect() as nc:
     cr3 = json.loads(nc.execute("SELECT value FROM options WHERE key='CompletionRatio'").fetchone()[0])
-expect_cr = A._ratio_from_price(base["out"][tier], 2.0 * 1.5)
+# 审查 R11（P0）：CR 是「输出相对输入」的倍数 = out/in_miss，不随倍数 n 变化
+# （原写法用 _ratio_from_price(out, n) 循环论证，实现错了期望值跟着错）
+expect_cr = round(base["out"][tier] / base["in_miss"][tier], 6)
 ok("B5 CompletionRatio 同步", abs(cr3["deepseek-flash"] - expect_cr) < 1e-6, (cr3["deepseek-flash"], expect_cr))
 
 # B6 值无变化不重复写库（幂等）

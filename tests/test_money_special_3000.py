@@ -171,7 +171,7 @@ s, r, _ = api("GET", "/anthropic/v1/models", cookie=ckA)
 ck("登录后代理可用(models 200)", s == 200, s)
 s, r, _ = api("POST", "/anthropic/v1/messages", {"model": "deepseek-flash", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}, cookie=ckA)
 ck("正常对话经网关计费成功", s == 200, s)
-ck("响应含固定验证文案", "已打通" in r or "已计量" in r or len(r) > 0, r[:80])
+ck("响应含固定验证文案", "已打通" in r or "已计量" in r, r[:80])   # 审查 R11：or len(r)>0 恒真，删掉
 # 路径穿越
 s, r, _ = api("GET", "/anthropic/v1/../admin/panel", cookie=ckA)
 ck("代理路径穿越→400", s == 400, s)
@@ -216,8 +216,14 @@ print("═══ 清理 ═══")
 c = sqlite3.connect(SITE + "/data.db")
 c.execute("DELETE FROM wallet_tx WHERE uid IN (SELECT id FROM users WHERE username IN ('rttest%s_sec_a','rttest%s_sec_b'))" % (TAG, TAG))
 c.execute("DELETE FROM gateway_map WHERE uid IN (SELECT id FROM users WHERE username IN ('rttest%s_sec_a','rttest%s_sec_b'))" % (TAG, TAG))
-c.execute("DELETE FROM redeem_codes WHERE code LIKE 'GW-TEST-%' OR code LIKE 'GW-NEG-%' OR code LIKE 'GW-NUL-%'")
-c.execute("DELETE FROM users WHERE username IN ('rttest%s_sec_a','rttest%s_sec_b')" % (TAG, TAG))
+# 审查 R11（P2）：原来是 LIKE 'GW-TEST-%' 的宽范围删除，会清掉库里所有同前缀的码。
+# 改成只删本套件确实创建的三张。
+c.execute("DELETE FROM redeem_codes WHERE code IN (?,?,?)",
+          (test_code, "GW-NEG-TEST1", "GW-NUL-TEST1"))
+# 审查 R11（P2）：原为 "... IN ('rttest%s_sec_a','rttest%s_sec_b')" % (TAG, TAG) 的
+# 格式化 DELETE——RT_TAG 含单引号即可改写 WHERE（生产库上的删除）。改参数化。
+c.execute("DELETE FROM users WHERE username IN (?,?)",
+          ("rttest%s_sec_a" % TAG, "rttest%s_sec_b" % TAG))
 c.commit()
 c.close()
 db = sqlite3.connect(NAPI_DB, timeout=15)

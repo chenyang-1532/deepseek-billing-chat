@@ -2,10 +2,16 @@
 """审查 P0 修复故障注入专项：P0-1 审批 saga / P0-3 调账幂等 / P0-4 支付幂等"""
 import json, sys, time, sqlite3, hashlib, secrets, urllib.request, urllib.error, uuid, threading
 
+from _guard import guard, assert_restart_allowed  # noqa: E402
+
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
 BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test/data.db"
 NAPI = "/opt/newapi/one-api.db"
+# 审查 R11（P1）：原实现把 guard 放在第 62 行，而第 52-58 行已经注册用户、直接
+# UPDATE users 置 approved、登录拿 cookie——生产机上执行会先留下一个已开通账号，
+# 然后才被 guard 拒绝（防线在副作用之后 = 失效）。必须在任何请求/写库之前。
+guard(SITE, NAPI)
 TAG = os.environ.get("RT_TAG", "") if (os := sys.modules.get("os")) or True else ""
 import os
 TAG = os.environ.get("RT_TAG", "")
@@ -58,8 +64,6 @@ CK = [x for x in (h.get_all("Set-Cookie") or []) if "session" in x][0].split(";"
 uid = q("SELECT id FROM users WHERE username=?", (U,))[0]["id"]
 
 import http.cookiejar
-from _guard import guard, assert_restart_allowed
-guard(SITE, NAPI)
 jar = http.cookiejar.CookieJar()
 ADM = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), NR)
 try:

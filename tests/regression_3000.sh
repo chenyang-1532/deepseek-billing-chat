@@ -188,7 +188,13 @@ echo "═══ 十一、静态兜底与安全 ═══"
 TITLE=$(curl -s -b $U_JAR -m 10 $BASE/不存在的路径xyz | grep -o "<title>[^<]*</title>")
 ck "未知路径SPA兜底返回首页" "<title>Miandning AI</title>" "$TITLE"
 R=$(curl -s -m 10 --path-as-is "$BASE/api/../etc/passwd" -b $U_JAR -o /dev/null -w "%{http_code}")
-ck "路径穿越攻击被兜底(非泄漏)" "200" "$R"
+# 审查 R11（P2-2）：未注册的 /api/* 路径从 SPA HTML 兜底(200)改为 JSON 404——
+# 两者都不泄漏 /etc/passwd 内容，语义同为「兜住且非泄漏」
+if [ "$R" = "200" ] || [ "$R" = "404" ]; then
+  ck "路径穿越攻击被兜底(非泄漏,200或404)" "$R" "$R"
+else
+  ck "路径穿越攻击被兜底(非泄漏,200或404)" "200或404" "$R"
+fi
 CODE=$(curl -s -m 10 -X POST $BASE/api/backup -F "file=@/etc/hostname" -b $U_JAR -o /dev/null -w "%{http_code}")
 ck "非ZIP文件上传被拒(400)" 400 "$CODE"
 

@@ -17,14 +17,18 @@ import time
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _guard import guard  # noqa: E402
+
+# 审查 R11（P1）：guard 必须在 import app 之前——app.py 模块级会 init_db() 并在
+# gw_enabled() 时启动 _ratio_refresher 守护线程，导入即写 new-api 生产 options 表
+# （官方价重算），guard 再拦已经晚了。这里用字面量路径，避免先 import 才能取 A.DB_PATH。
+guard("/tmp/chatsite-test/data.db", "/opt/newapi/one-api.db")
+
 sys.path.insert(0, "/tmp/chatsite-test")
 import app as A  # noqa: E402
-from _guard import guard  # noqa: E402
 import json  # noqa: E402
 import sqlite3  # noqa: E402
 import urllib.request  # noqa: E402
-
-guard(A.DB_PATH, "/opt/newapi/one-api.db")
 
 PASS = FAIL = 0
 

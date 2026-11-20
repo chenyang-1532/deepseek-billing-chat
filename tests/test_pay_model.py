@@ -101,7 +101,7 @@ bal0 = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"]
 time.sleep(62)  # 避开上一轮遗留的限流窗口
 print("\n═══ A. 扫码充值：参数校验 ═══")
 s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 4.99, "client_request_id": "crida0499low"}, cookie=cku)
-ck("¥4.99 < 起充¥5 → 拒绝", s == 400 and "低于" in r or "5" in r, (s, r[:80]))
+ck("¥4.99 < 起充¥5 → 拒绝", s == 400, (s, r[:80]))   # 审查 R11：原写法 ... or "5" in r 恒真
 s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": 0}, cookie=cku)
 ck("¥0 → 拒绝", s == 400, (s, r[:80]))
 s, r, _ = api("POST", "/api/wallet/pay-request", {"cny": -3}, cookie=cku)
@@ -278,8 +278,10 @@ ispk = now.weekday() < 5 and any(lo <= now.hour + now.minute / 60.0 < hi for lo,
 base_in, base_out = (0.3, 1.2) if ispk else (0.15, 0.6)
 ck("flash 输入倍率 = 官方%s价$%g×1.5" % ("峰" if ispk else "谷", base_in),
    abs(mr["deepseek-flash"] - round(base_in / 1e6 * QUSD * 1.5, 6)) < 1e-9, mr["deepseek-flash"])
-ck("flash 输出倍率 = 官方%s价$%g×1.5" % ("峰" if ispk else "谷", base_out),
-   abs(cr["deepseek-flash"] - round(base_out / 1e6 * QUSD * 1.5, 6)) < 1e-9, cr["deepseek-flash"])
+# 审查 R11（P0）：CR 是「输出相对输入」的倍数 = out/in_miss，不随倍数 1.5 变化
+# （原断言把 out 绝对价×1.5 当 CR，是循环论证；修复后 CR=4.0 恒定）
+ck("flash 输出倍率 = out/in_miss（%s价 $%g/$%g）" % ("峰" if ispk else "谷", base_out, base_in),
+   abs(cr["deepseek-flash"] - round(base_out / base_in, 6)) < 1e-9, cr["deepseek-flash"])
 # 非法倍数
 for name, mv in [("nan", "nan"), ("inf", "inf"), ("-1", "-1"), ("0", "0"), ("500", "500"), ("abc", "abc")]:
     s, _, hh = api("POST", "/admin/wallet/ratios", {"model": "deepseek-flash", "mult": mv}, cookie=ckadm, form=True)
