@@ -198,6 +198,12 @@ fi
 CODE=$(curl -s -m 10 -X POST $BASE/api/backup -F "file=@/etc/hostname" -b $U_JAR -o /dev/null -w "%{http_code}")
 ck "非ZIP文件上传被拒(400)" 400 "$CODE"
 
+echo "═══ 十二、XFF 分桶（审查 R12：反代必须传 X-Forwarded-For，否则全站单桶） ═══"
+_X1=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -H "X-Forwarded-For: 198.51.100.11" -X POST $BASE/api/login -H "Content-Type: application/json" -d '{"u":"xffprobe_a","p":"wrongpw"}')
+_X2=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -H "X-Forwarded-For: 198.51.100.12" -X POST $BASE/api/login -H "Content-Type: application/json" -d '{"u":"xffprobe_b","p":"wrongpw"}')
+_X3=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -H "X-Forwarded-For: 198.51.100.13" -X POST $BASE/api/login -H "Content-Type: application/json" -d '{"u":"xffprobe_c","p":"wrongpw"}')
+ck "3 个不同 XFF 各登录 1 次均不被 429（分桶生效）" "200 200 200" "$_X1 $_X2 $_X3"
+
 echo ""
 echo "════════════════════════════"
 echo "回归测试完成: ✅通过 $PASS  ❌失败 $FAIL"

@@ -214,6 +214,20 @@ race_row = q("SELECT rev, session_json FROM cloud_sessions WHERE uid=? AND sid=?
 ck("CAS 后云端单行且 rev 只前进一次", len(race_row) == 1 and race_row[0]["rev"] == base_rev + 1,
    (len(race_row), race_row[0]["rev"] if race_row else None))
 
+# 11. 墓碑清 blob（审查 R12/P1-c）：上传→删除→blob 必须释放，否则磁盘无限占用
+sid_tomb = str(uuid.uuid4())
+zt = mkzip({sid_tomb: {"updated_at": "2026-04-01T00:00:00Z",
+                       "messages": [{"role": "user", "content": "tomb-" + "x" * 500000}]}})
+s13, r13, _ = api("POST", "/api/backup?deleted=%5B%5D", zt, BUP)
+j13 = json.loads(r13)
+ck("墓碑用例: 上传成功", s13 == 200 and j13.get("ok"), (s13, r13[:120]))
+sz_before = q("SELECT LENGTH(session_json) AS n FROM cloud_sessions WHERE uid=? AND sid=?", (uid_row, sid_tomb))
+s14, r14, _ = api("POST", "/api/backup?deleted=" + urllib.parse.quote(json.dumps([sid_tomb])), zt, BUP)
+ck("墓碑用例: 删除请求成功", s14 == 200 and json.loads(r14).get("ok"), (s14, r14[:120]))
+sz_after = q("SELECT deleted, LENGTH(session_json) AS n, LENGTH(images) AS ni FROM cloud_sessions WHERE uid=? AND sid=?", (uid_row, sid_tomb))
+ck("删除后墓碑 blob 已清空", sz_after and sz_after[0]["deleted"] == 1
+   and (sz_after[0]["n"] is None or sz_after[0]["n"] == 0), dict(sz_after[0]) if sz_after else None)
+
 # ── 清理 ──
 c = sqlite3.connect(SITE)
 c.execute("DELETE FROM cloud_sessions WHERE uid=?", (uid_row,))

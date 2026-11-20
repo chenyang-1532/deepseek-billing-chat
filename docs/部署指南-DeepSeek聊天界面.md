@@ -85,6 +85,9 @@ server {
         proxy_set_header Connection "";
         proxy_read_timeout 360s;                       # 网关流式响应最长 300s
         client_max_body_size 256m;                     # 必须：默认 1m 会让云备份(≤200MB)/文件上传(≤64MB)全部 413
+        proxy_buffer_size 32k;                         # 必须：X-Cloud-Revs 响应头随会话数增长（500 会话≈8KB），
+                                                       # 默认 4k|8k 会 upstream sent too big header → 502
+        large_client_header_buffers 4 32k;             # 同上配套；会话数上万需再调大
     }
 }
 ```

@@ -304,6 +304,25 @@ s, _, hh = api("POST", "/admin/wallet/refresh-official", {}, cookie=ckadm, form=
 loc = hh.get("Location", "") or (hh.get_all("Location") or [""])[0]
 ck("手动刷新官方价（在线应成功）", "official_ok=1" in loc, loc)
 
+print("\n═══ E2. 余额预检兜底（审查 R11/R12 P1-d：tools/图片可绕过 est_in） ═══")
+# 把测试账号余额扣到 ¥0.01（694 quota），发 8MB tools 请求，必须 402 而不是放行
+def _set_quota(v):
+    _c = sqlite3.connect(NAPI, timeout=15)
+    _c.execute("UPDATE users SET quota=? WHERE id=?", (v, nid))
+    _c.commit(); _c.close()
+_set_quota(694)
+_big_tools = {"model": "deepseek-flash", "max_tokens": 100,
+              "messages": [{"role": "user", "content": "hi"}],
+              "tools": [{"name": "pad", "description": "x" * (4 * 1024 * 1024)}]}
+s, r, _ = api("POST", "/anthropic/v1/messages", _big_tools, cookie=cku, timeout=60)
+ck("8MB tools + 余额¥0.01 → 402 拒绝", s == 402, (s, r[:120] if isinstance(r, str) else r))
+s, r, _ = api("POST", "/anthropic/v1/messages",
+              {"model": "deepseek-flash", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]},
+              cookie=cku, timeout=60)
+ck("同一账号正常短消息不受影响(非402预检误拦)", s != 402, s)
+# 恢复余额供清理
+_set_quota(1000000)
+
 print("\n═══ F. 清理 ═══")
 c = sqlite3.connect(SITE_DB)
 c.execute("DELETE FROM wallet_tx WHERE uid=?", (uid,))

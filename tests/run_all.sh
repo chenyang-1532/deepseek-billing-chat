@@ -23,16 +23,18 @@ export RT_SITE_DB="${RT_SITE_DB:-}"                   # 默认空 → test_perfo
 export RT_NAPI_DB="${RT_NAPI_DB:-}"
 FAIL=0
 RESULTS=()
+SKIPN=0
 
 run() {
   local name="$1"; shift
   echo "════ $name ════"
   "$@" > "/tmp/rt_${name}.log" 2>&1
   local rc=$?
-  # 审查 R11/D3：exit 0 ≠ PASS——test_performance 在 RT_SITE_DB 为空时 sys.exit(0)
-  # 是 SKIP 不是 PASS，汇总里必须写明，否则「17/17」名不副实。
-  if [ $rc -eq 0 ] && grep -q "^\[SKIP\]" "/tmp/rt_${name}.log" 2>/dev/null; then
-    RESULTS+=("$name SKIP(exit=0)")
+  # 审查 R11/R12：SKIP 用专用退出码 3 单列——test_performance 在 RT_SITE_DB 为空时
+  # 跳过是 SKIP 不是 PASS，汇总里必须写明（如 16 PASS / 1 SKIP），否则「17/17」名不副实。
+  if [ $rc -eq 3 ] || { [ $rc -eq 0 ] && grep -q "^\[SKIP\]" "/tmp/rt_${name}.log" 2>/dev/null; }; then
+    SKIPN=$((SKIPN+1))
+    RESULTS+=("$name SKIP")
     echo "  ⏭️ $name SKIP（依赖未设置，未实际执行）"
     return
   fi
@@ -88,6 +90,9 @@ printf '%s\n' "${RESULTS[@]}"
 if [ $FAIL -ne 0 ]; then
   echo "════ 总结果: ❌ 存在失败套件（exit 1） ════"
   _final_rc=1
+elif [ $SKIPN -gt 0 ]; then
+  echo "════ 总结果: ✅ $(( ${#RESULTS[@]} - SKIPN )) PASS / $SKIPN SKIP（SKIP 套件未实际执行） ════"
+  _final_rc=0
 else
   echo "════ 总结果: ✅ 全部套件退出码为 0 ════"
   _final_rc=0

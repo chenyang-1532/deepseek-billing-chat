@@ -228,8 +228,3 @@ async def main():
 
 
 sys.exit(asyncio.run(main()))
-
-
-# P1-13：失败必须非零退出
-_fails = [n for n, ok in results if not ok]
-sys.exit(1 if _fails else 0)

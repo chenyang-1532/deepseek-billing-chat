@@ -30,7 +30,7 @@ SITE_DB = os.environ.get("RT_SITE_DB", "")
 NAPI = os.environ.get("RT_NAPI_DB", "")
 if not (SITE_DB and NAPI):
     print("[SKIP] RT_SITE_DB / RT_NAPI_DB 未设置，跳过性能测试（防止误写生产库）")
-    sys.exit(0)
+    sys.exit(3)   # 审查 R11/R12：SKIP 用专用退出码，run_all 单列 SKIP，防止「17/17」名不副实
 guard(SITE_DB, NAPI)          # 必须在任何 connect 之前
 SITE = SITE or os.path.dirname(SITE_DB)
 SECRET = open(os.path.join(SITE, "secret.key"), "rb").read()
@@ -228,6 +228,54 @@ finally:
         print("⚠️ 清理段异常（可能残留 rttest%s_perf_* 直插账号，需手工核查！）: %r" % (TAG, _ce))
 print("══════════════")
 print("性能测试: ✅通过 %d  ❌失败 %d" % (PASS, FAIL))
+
+# ── 并发上传内存闸（审查 R12/P2：_UPLOAD_SEM=2，超限 503 快速失败）──
+print("\n═══ 并发上传内存闸 ═══")
+try:
+    import threading as _th, io as _io, zipfile as _zf, json as _js, sqlite3 as _sq3
+    _db = _sq3.connect(SITE_DB, timeout=15)
+    _row = _db.execute("SELECT id FROM users WHERE status='approved' LIMIT 1").fetchone()
+    _db.close()
+    if not _row:
+        print("  ⏭️ 无已审核用户，跳过并发上传闸测试")
+    else:
+        _ck = make_cookie(_row[0])
+        _buf = _io.BytesIO()
+        with _zf.ZipFile(_buf, "w", _zf.ZIP_STORED) as _z:
+            _z.writestr("manifest.json", _js.dumps({"export_format_version": 3}))
+            for _i in range(4):
+                _z.writestr("chat_sessions/%s.json" % ("sem%02d" % _i),
+                            _js.dumps({"id": "sem%02d" % _i, "title": "t", "updated_at": "2026-05-01T00:00:00Z",
+                                       "messages": [{"role": "user", "content": "y" * 8_000_000}]}))
+        _payload = _buf.getvalue()
+        _codes, _lock, _bar = [], _th.Lock(), _th.Barrier(4)
+        def _up4():
+            try:
+                _bar.wait()
+                _req = urllib.request.Request(
+                    BASE + "/api/backup?deleted=%5B%5D", data=_payload, method="POST",
+                    headers={"Content-Type": "application/octet-stream", "Cookie": _ck})
+                _sc = urllib.request.urlopen(_req, timeout=120).status
+                with _lock: _codes.append(_sc)
+            except urllib.error.HTTPError as _he:
+                with _lock: _codes.append(_he.code)
+            except Exception as _e2:
+                with _lock: _codes.append(str(_e2)[:40])
+        _ts2 = [_th.Thread(target=_up4) for _ in range(4)]
+        [_t.start() for _t in _ts2]; [_t.join() for _t in _ts2]
+        _n200, _n503 = _codes.count(200), _codes.count(503)
+        ck("并发 4 次上传 → 2×200 + 2×503（内存闸生效）", _n200 == 2 and _n503 == 2,
+           "codes=%s" % _codes)
+        # 清理本次上传产生的会话
+        _db = _sq3.connect(SITE_DB, timeout=15)
+        _uid2 = _row[0]
+        _db.execute("DELETE FROM cloud_sessions WHERE uid=?", (_uid2,))
+        _db.execute("DELETE FROM cloud_backups WHERE uid=?", (_uid2,))
+        _db.commit(); _db.close()
+        import shutil as _sh
+        _sh.rmtree("/tmp/chatsite-test/snapshots/%s" % _uid2, ignore_errors=True)
+except Exception as _sem_e:
+    ck("并发上传内存闸（异常: %s）" % str(_sem_e)[:60], False)
 
 os.makedirs("/root/.codebuddy/artifact/delivery/test_results", exist_ok=True)
 try:

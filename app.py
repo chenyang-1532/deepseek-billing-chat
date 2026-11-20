@@ -135,7 +135,9 @@ def _load_secret() -> bytes:
 SECRET = _load_secret()
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # timeout=15：默认 5s 在「备份上传 + 云同步 + 计费」并发写时不够，实测出现过
+    # database is locked 直接 500；SQLite 侧 busy_timeout 与此参数一致。
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -152,6 +154,13 @@ def _add_column(c, table: str, col: str, decl: str) -> None:
 
 def init_db():
     with db() as c:
+        # WAL：读写不互斥，避免长事务（备份/导出）阻塞登录等读请求；
+        # NORMAL：WAL 下仍保证崩溃一致性，写放大明显低于 FULL。
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.DatabaseError:
+            pass
         c.execute(
             """CREATE TABLE IF NOT EXISTS users(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -583,6 +592,23 @@ _BODY_LIMIT_RULES = (
 )
 
 
+# 提前返回 413/503 前必须先消费掉请求体：客户端还在写 body 时直接关连接，
+# 内核回 RST，客户端拿不到响应——实测 6MB 上传只看到 Connection reset（3MB 能正常读到 413）。
+# 分块丢弃，内存有界；超过上限就不再读（剩下的只能靠 RST 断掉，属于病态客户端）。
+_BODY_DRAIN_MAX = 64 << 20
+
+
+async def _discard_body(request, cap: int = _BODY_DRAIN_MAX) -> None:
+    try:
+        n = 0
+        async for chunk in request.stream():
+            n += len(chunk)
+            if n > cap:
+                break
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @app.middleware("http")
 async def _body_limit_middleware(request, call_next):
     if request.method in ("POST", "PUT", "PATCH"):
@@ -595,16 +621,34 @@ async def _body_limit_middleware(request, call_next):
                     limit = globals().get(_name) or BODY_LIMIT_DEFAULT   # 常量在下方定义，延迟取值
                     break
             if int(cl) > limit:
+                await _discard_body(request)
                 return JSONResponse(
                     {"ok": False, "msg": "请求体过大（上限 %d MB）" % (limit >> 20)},
                     status_code=413,
                 )
+    _path = request.url.path
+    if _path in _UPLOAD_PATHS or (_path == "/api/backup" and request.method == "POST"):
+        if not _UPLOAD_SEM.acquire(blocking=False):
+            # 同上：先丢弃请求体，客户端才能读到 503 文案而不是 Connection reset。
+            await _discard_body(request)
+            return JSONResponse(
+                {"ok": False, "msg": "当前上传任务较多，请稍后重试"}, status_code=503)
+        try:
+            return await call_next(request)
+        finally:
+            _UPLOAD_SEM.release()
     return await call_next(request)
 
 
 # ── 审查 R8/R9：导出/恢复是「全量会话+图片在内存拼 zip」，单账号上限 200MB，
 # 线程池下并发导出峰值可达数 GB。用小信号量把并发压到 2，超限快速失败。
 _EXPORT_SEM = threading.BoundedSemaphore(2)
+
+# 审查 R12/P2：写路径同样要限并发。request.body() + b"".join(parts) 会让单请求驻留
+# 3~4 份 body（实测 6×32MB 并发把 RSS 从 61MB 打到 765MB），200MB 备份 3 并发就 2GB+。
+# 导出已有 _EXPORT_SEM，写路径限 2；在中间件里包住整个请求，避免每个路由各自 try/finally。
+_UPLOAD_SEM = threading.BoundedSemaphore(2)
+_UPLOAD_PATHS = ("/api/upload",)
 
 
 def _export_busy() -> JSONResponse:
@@ -676,11 +720,12 @@ async def api_register(request: Request):
         return JSONResponse({"ok": False, "msg": "用户名需2-24位，仅限字母/数字/下划线/中文"})
     if len(p) < 6:
         return JSONResponse({"ok": False, "msg": "密码至少6位"})
+    _pw_hash = await run_in_threadpool(hash_pw, p)   # 审查 R12/P2：同上，勿阻塞事件循环
     with db() as c:
         try:
             c.execute(
                 "INSERT INTO users(username,pw_hash,created_at) VALUES(?,?,?)",
-                (u, hash_pw(p), site_now().isoformat(timespec="seconds")),
+                (u, _pw_hash, site_now().isoformat(timespec="seconds")),
             )
         except sqlite3.IntegrityError:
             return JSONResponse({"ok": False, "msg": "用户名已存在"})
@@ -700,7 +745,9 @@ async def api_login(request: Request):
     p = str(d.get("p", ""))
     with db() as c:
         row = c.execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
-    if row is None or not check_pw(p, row["pw_hash"]):
+    # 审查 R12/P2：PBKDF2(100k) 单次约 21ms，在事件循环里同步执行会把并发登录串行化
+    # （实测 10 并发总耗时 223ms，同时段探针 p95 2ms→max 201ms）。C 实现释放 GIL，可并行。
+    if row is None or not await run_in_threadpool(check_pw, p, row["pw_hash"]):
         return JSONResponse({"ok": False, "msg": "用户名或密码错误"})
     if row["status"] == "pending":
         return JSONResponse({"ok": False, "msg": "账号正在等待管理员审核，请稍后再试"})
@@ -1080,7 +1127,7 @@ def _backup_merge(user, data, del_ids, base_revs, now_ms) -> JSONResponse:
                 v = _valid_img_entry(name)
                 if v and v[0] in incoming:
                     incoming[v[0]]["imgs"].append((name, zf.read(name)))
-            # 墓碑：客户端明确删除的会话，云端标记删除（保留 blob 以防万一）。
+            # 墓碑：客户端明确删除的会话，云端标记删除并清空 blob（见下方 R12/P1）。
             # 只对云端真实存在且未删除的会话生效——从未上传过的 sid 一律忽略，
             # 防止客户端误判（如导入替换期间的误报）在云端制造垃圾墓碑并回传扩散。
             for sid in del_ids:
@@ -1091,8 +1138,11 @@ def _backup_merge(user, data, del_ids, base_revs, now_ms) -> JSONResponse:
                     (user["id"], sid),
                 ).fetchone()
                 if live is not None:
+                    # 审查 R12/P1：墓碑只留 sid。原实现保留 session_json/images，
+                    # 而 200MB 限额只统计 deleted=0 →「上传→删除」循环可无限占磁盘（实测）。
                     c.execute(
-                        "UPDATE cloud_sessions SET deleted=1 WHERE uid=? AND sid=?",
+                        "UPDATE cloud_sessions SET deleted=1, session_json=NULL, images=NULL "
+                        "WHERE uid=? AND sid=? AND deleted=0",
                         (user["id"], sid),
                     )
             # 按会话合并（P1-15）：服务端 rev 为版本权威；冲突时保留云端并回传 conflicts
@@ -1156,7 +1206,7 @@ def _backup_merge(user, data, del_ids, base_revs, now_ms) -> JSONResponse:
                         _imgs_blob = row["images"] if row is not None else None
                     c.execute(
                         "UPDATE cloud_sessions SET session_json=?, images=?, updated_at=?, rev=? "
-                        "WHERE uid=? AND sid=?",
+                        "WHERE uid=? AND sid=? AND deleted=0",
                         (item["json"], _imgs_blob, item["upd"], cur_rev + 1, user["id"], sid),
                     )
             # 云端存在但本次上传没有的会话 → 客户端缺数据，需要拉取
@@ -1763,6 +1813,8 @@ def admin_page(request: Request):
             )
             wallet_html = head + codes_sec + ratios_sec + pay_sec + tx_sec
     npending = sum(1 for r in rows if r["status"] == "pending")
+    action_flash = ('<div class="flash err">只有「待审核」用户可以拒绝；已开通用户请用「禁用」。</div>'
+                    if request.query_params.get("action_err") == "1" else "")
     user_rows = []
     for r in rows:
         left = f"{days_left(r)}天" if r["status"] == "approved" and r["expiry"] and not is_expired(r) else "—"
@@ -1779,10 +1831,13 @@ def admin_page(request: Request):
                 f'<input type="hidden" name="action" value="renew"><input class="num" name="days" value="30" inputmode="numeric" aria-label="天数">'
                 f'<span class="unit">天</span><button class="btn sm ghost">续期</button></form>'
             )
-        ops.append(
-            f'<form method="post" action="/admin/action" class="inline"><input type="hidden" name="uid" value="{r["id"]}">'
-            f'<input type="hidden" name="action" value="reject"><button class="btn sm danger" data-confirm="拒绝该用户的注册申请？">拒绝</button></form>'
-        )
+        if r["status"] == "pending":
+            # 审查 R12/P2：只有待审核用户才显示「拒绝」。对已开通用户误点会把状态改成
+            # rejected，用户登录看到「注册申请未通过」，与「禁用」语义混淆（实测）。
+            ops.append(
+                f'<form method="post" action="/admin/action" class="inline"><input type="hidden" name="uid" value="{r["id"]}">'
+                f'<input type="hidden" name="action" value="reject"><button class="btn sm danger" data-confirm="拒绝该用户的注册申请？">拒绝</button></form>'
+            )
         if r["status"] == "disabled":
             ops.append(
                 f'<form method="post" action="/admin/action" class="inline"><input type="hidden" name="uid" value="{r["id"]}">'
@@ -1817,6 +1872,7 @@ def admin_page(request: Request):
     parts.append(
         '<section class="sec" id="sec-users"><div class="sec-h"><h2>用户管理</h2>'
         f'<span class="hint">{len(rows)} 个账号 · 待审核 {npending} · 待审核与续期申请自动置顶</span></div>'
+        + action_flash
         + backup_strip
         + '<div class="tscroll"><table><thead><tr>'
         '<th>用户</th><th>状态</th><th>到期</th><th>云端备份</th><th>操作</th></tr></thead><tbody>'
@@ -1853,6 +1909,9 @@ def _admin_login_fail(ip: str):
         for _k in list(_ADMIN_LOGIN_FAILS)[:len(_ADMIN_LOGIN_FAILS) - 4096]:
             _ADMIN_LOGIN_FAILS.pop(_k, None)
     ent = _ADMIN_LOGIN_FAILS.setdefault(ip, [0, 0.0])
+    if ent[1] > time.time():
+        # 审查 R12/P1：锁定期内继续失败不得续期，否则攻击者持续请求 = 永久锁死管理员
+        return
     # 审查 R11（P1）：锁定期内继续失败不再累加、不续期——否则攻击者每 5 分钟打 5 次
     # 错误密码就能把锁定时间无限延长，真正的管理员永远进不了后台（纯 DoS，无需密码）。
     # 一次锁定最多 _ADMIN_LOCK_SECONDS，到期后重新计数。
@@ -1919,6 +1978,10 @@ async def admin_action(request: Request, uid: int = Form(...), action: str = For
             new_exp = (date.fromisoformat(base) + timedelta(days=days)).isoformat()
             c.execute("UPDATE users SET expiry=?, renewal_requested=0 WHERE id=?", (new_exp, uid))
         elif action == "reject":
+            # 审查 R12/P2：拒绝只对「待审核」有意义。原实现对已开通用户也生效，
+            # 用户登录会被告知「注册申请未通过」（实测），且失去续期入口。
+            if row["status"] != "pending":
+                return RedirectResponse("/admin?action_err=1", status_code=303)
             c.execute("UPDATE users SET status='rejected', renewal_requested=0 WHERE id=?", (uid,))
         elif action == "disable":
             c.execute("UPDATE users SET status='disabled' WHERE id=?", (uid,))
@@ -1963,7 +2026,9 @@ async def api_upload(request: Request):
         upload_base = DEEPSEEK_BASE
         upload_path = "/anthropic/v1/files"
     name = (request.query_params.get("name") or "file").replace('"', "").replace("\r", "").replace("\n", "")
-    purpose = request.query_params.get("purpose") or None
+    # 审查 R12/P3：purpose 直接拼进 multipart 头，未白名单时 CRLF 可破坏自建结构
+    _purpose = (request.query_params.get("purpose") or "").strip()
+    purpose = _purpose if _purpose in ("assistants", "batch", "fine-tune", "vision", "user_data") else None
     body = await request.body()
     if not body:
         return JSONResponse({"error": {"message": "空文件"}}, status_code=400)
@@ -2126,6 +2191,10 @@ def _gw_estimate_quota(body: bytes, model: str) -> int:
         max_tokens = min(int(b.get("max_tokens") or 0) or GW_MAX_TOKENS_DEFAULT, GW_MAX_TOKENS_CAP)
     except Exception:  # noqa: BLE001
         pass
+    # 审查 R12/P1：原先只统计 messages[].content 与 system，tools / 图片 base64 /
+    # tool_result 全不计入——8MB tools 的请求被估成 4 quota（实测低估 7.5 万倍），
+    # 余额预检形同虚设。JSON 的 token 密度约 0.25~0.5 token/字符，用 //4 兜下界。
+    est_in = max(est_in, len(body) // 4)
     return int((est_in + max_tokens * cr) * mr * 1.2)
 
 
@@ -2397,6 +2466,21 @@ def recompute_ratios(official: dict | None = None) -> str:
     tmult, trule = _active_time_mult()
     mults = get_multipliers()
     mr_map, cr_map, cache_map = {}, {}, {}
+    # 脏快照防线（审查 R12）：任一模型输入价缺失/为 0 时直接放弃本轮刷新，保留上一轮倍率。
+    # 若照算下去 ModelRatio 会被写成 0 → 全站免费，比少收严重得多；除零还会让
+    # 刷新线程整个崩掉（CacheRatio 那行原来就是裸除法）。宁可这一轮不更新。
+    for m in SITE_MODELS:
+        _b = models.get(OFFICIAL_PRICE_MAP.get(m, "deepseek-flash")) or \
+            OFFICIAL_PRICES_DEFAULT[OFFICIAL_PRICE_MAP.get(m, "deepseek-flash")]
+        try:
+            _in_ok = float(_b["in_miss"][tier]) > 0 and float(_b["in_hit"][tier]) >= 0
+        except (KeyError, IndexError, TypeError, ValueError):
+            _in_ok = False
+        if not _in_ok:
+            print("[official-price] ⚠️ %s 的官方价快照异常(%r)，本轮跳过刷新，沿用上一轮倍率"
+                  % (m, _b.get("in_miss") if isinstance(_b, dict) else _b))
+            return RATIOS_FAILURE
+
     for m in SITE_MODELS:
         base = models.get(OFFICIAL_PRICE_MAP.get(m, "deepseek-flash")) or OFFICIAL_PRICES_DEFAULT[OFFICIAL_PRICE_MAP.get(m, "deepseek-flash")]
         n = float(mults.get(m, 1.0)) * tmult
@@ -2560,18 +2644,16 @@ def gw_enabled() -> bool:
 
 # 定价同步线程（官方价每 10 分钟刷新 + 峰谷时段自动重算倍率）
 if gw_enabled():
-    print("[gateway] 计费网关已启用 (new-api %s)" % NEWAPI_BASE)
     threading.Thread(target=_ratio_refresher, daemon=True).start()
+    # 审查 R12/P1：启动日志必须能一眼看出网关是否启用（否则 503 会被误判成 Key/渠道问题）
+    print("[gateway] 计费网关已启用: NEWAPI_DB=%s NEWAPI_BASE=%s" % (NEWAPI_DB, NEWAPI_BASE))
     try:
         _check_holiday_freshness()   # R6（审查 P2）：启动即检查节假日表时效（过期红色告警 + 面板标记）
     except Exception:
         pass
 else:
-    # 审查 R11（P1）：GATEWAY_ENABLED 是模块级常量（import 时求值），启动后再 touch
-    # gateway.on 不会生效——照老文档部署会得到「能登录能看界面但聊天全 503」的站，
-    # 且启动日志里看不出网关是关的，排查方向会被引向 Key/渠道。第一屏打明状态。
     print("[gateway] 计费网关未启用（gateway.on 不存在且未设 GATEWAY_ENABLED=1）"
-          "→ /anthropic 将返回 503；改开关后必须重启进程")
+          " → /anthropic 返回 503；改开关后必须重启进程")
 
 
 def napi_connect():
@@ -2846,6 +2928,9 @@ async def api_wallet_redeem(request: Request):
     try:
         body = json.loads(await request.body())
     except Exception:
+        return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
+    # 审查 R12/P2：json.loads 成功但 body 不是对象时 body.get 抛 AttributeError → 500
+    if not isinstance(body, dict):
         return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
     code = str(body.get("code") or "").strip().upper()
     if not code or len(code) > 32:
