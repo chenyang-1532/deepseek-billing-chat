@@ -273,7 +273,7 @@ try:
         _db.execute("DELETE FROM cloud_backups WHERE uid=?", (_uid2,))
         _db.commit(); _db.close()
         import shutil as _sh
-        _sh.rmtree("/tmp/chatsite-test/snapshots/%s" % _uid2, ignore_errors=True)
+        _sh.rmtree(os.path.join(SITE, "snapshots", str(_uid2)), ignore_errors=True)  # R13 P3-1：随 RT_SITE_DIR
 except Exception as _sem_e:
     ck("并发上传内存闸（异常: %s）" % str(_sem_e)[:60], False)
 

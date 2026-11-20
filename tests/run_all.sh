@@ -16,6 +16,11 @@
 set -u
 cd "$(dirname "$0")/.."
 export RT_TAG="${RT_TAG:-runner$(date +%H%M%S)}"
+# R13：TAG 规整——调用方误带 "rttest" 前缀时去掉（套件内用户名已自带 rttest 前缀，
+# 双前缀 + 长 TAG 会撞上 app.py 用户名 2-24 位校验，如 rttestrttest120039_gw_e2e=25 字符
+# 被拒 → gw_e2e 用户不存在 IndexError）；再截断到 10 字符兜底（最长后缀 _gw_e2e=7）。
+RT_TAG="${RT_TAG#rttest}"
+export RT_TAG="$(printf '%s' "$RT_TAG" | cut -c1-10)"
 export RT_ALLOWED_DB_DIRS="${RT_ALLOWED_DB_DIRS:-}"   # 默认拒绝：只有显式声明测试实例目录才放行
 export RT_ALLOW_RESTART="${RT_ALLOW_RESTART:-0}"      # 默认不重启线上 new-api
 export RT_SITE_DIR="${RT_SITE_DIR:-/tmp/chatsite-test}"
@@ -109,6 +114,10 @@ site, napi = sys.argv[1], sys.argv[2] or None
 # 匹配 rttest…TAG…任意位置（覆盖 regression 的 rttest<TAG>_、p0_r3 的 rttest_r3<TAG>、
 # performance 在 new-api 的 site<uid>_rttest<TAG>_ 前缀命名）；TAG 不参与 SQL 拼接
 pat = "%%rttest%%%s%%" % tag
+# R13 兜底：测试实例是专用库，任何含 rttest 的账号都是测试残留——TAG 模式覆盖不了的
+# 截断名（超 24/25 位被 DB 截断，TAG 尾部丢失，LIKE 匹配不到，实测 gate18 遗留 101 个
+# site<uid>_rttestrttest1200）也一并清掉
+pat_all = "%%rttest%%"
 c = sqlite3.connect(site, timeout=15)
 c.execute("PRAGMA busy_timeout=15000")
 uids = [r[0] for r in c.execute("SELECT id FROM users WHERE username LIKE ?", (pat,)).fetchall()]
@@ -116,15 +125,23 @@ n1 = c.execute("DELETE FROM cloud_sessions WHERE uid IN (SELECT id FROM users WH
 c.execute("DELETE FROM cloud_backups WHERE uid IN (SELECT id FROM users WHERE username LIKE ?)", (pat,))
 c.execute("DELETE FROM gateway_map WHERE uid IN (SELECT id FROM users WHERE username LIKE ?)", (pat,))
 n2 = c.execute("DELETE FROM users WHERE username LIKE ?", (pat,)).rowcount
+# R13 兜底第二遍：清 TAG 模式漏掉的截断名/异名残留
+n1 += c.execute("DELETE FROM cloud_sessions WHERE uid IN (SELECT id FROM users WHERE username LIKE ?)", (pat_all,)).rowcount
+c.execute("DELETE FROM cloud_backups WHERE uid IN (SELECT id FROM users WHERE username LIKE ?)", (pat_all,))
+c.execute("DELETE FROM gateway_map WHERE uid IN (SELECT id FROM users WHERE username LIKE ?)", (pat_all,))
+n2 += c.execute("DELETE FROM users WHERE username LIKE ?", (pat_all,)).rowcount
+# R13 兜底第三遍：先前的轮次可能已删用户但漏了关联行——孤儿 gateway_map 一并清
+n1 += c.execute("DELETE FROM gateway_map WHERE uid NOT IN (SELECT id FROM users)").rowcount
 c.commit()
 napi_deleted = 0
 if napi:
     nc = sqlite3.connect(napi, timeout=15)
     nc.execute("PRAGMA busy_timeout=15000")
-    for nid in [r[0] for r in nc.execute("SELECT id FROM users WHERE username LIKE ?", (pat,)).fetchall()]:
-        nc.execute("DELETE FROM logs WHERE user_id=?", (nid,))
-        nc.execute("DELETE FROM tokens WHERE user_id=?", (nid,))
-    napi_deleted = nc.execute("DELETE FROM users WHERE username LIKE ?", (pat,)).rowcount
+    for patx in (pat, pat_all):
+        for nid in [r[0] for r in nc.execute("SELECT id FROM users WHERE username LIKE ?", (patx,)).fetchall()]:
+            nc.execute("DELETE FROM logs WHERE user_id=?", (nid,))
+            nc.execute("DELETE FROM tokens WHERE user_id=?", (nid,))
+        napi_deleted += nc.execute("DELETE FROM users WHERE username LIKE ?", (patx,)).rowcount
     nc.execute("DELETE FROM tokens WHERE user_id NOT IN (SELECT id FROM users)")
     nc.commit(); nc.close()
 c.close()

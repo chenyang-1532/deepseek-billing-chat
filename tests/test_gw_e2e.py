@@ -54,12 +54,19 @@ def api(method, path, data=None, form=False):
 
 
 def prepare():
-    api("POST", "/api/register", {"u": U, "p": PWD})
+    _st = api("POST", "/api/register", {"u": U, "p": PWD})
     c = sqlite3.connect(SITE_DB)
+    _row = c.execute("SELECT id FROM users WHERE username=?", (U,)).fetchone()
+    if not _row:
+        c.close()
+        # R13：注册被拒（如用户名超 24 位校验返回 200+ok:false，或限流 429）时给出
+        # 可诊断的失败信息，不再裸 IndexError；U=len("rttest")+len(TAG)+len("_gw_e2e")
+        raise SystemExit("[PREPARE-FAIL] 注册未落库：status=%s U=%r(len=%d)——检查 RT_TAG 长度"
+                         % (_st, U, len(U)))
     c.execute("UPDATE users SET status='approved', expiry=date('now','localtime','+30 days') WHERE username=?", (U,))
     c.commit()
     c.close()
-    uid = q("SELECT id FROM users WHERE username=?", (U,))[0]["id"]
+    uid = _row[0]
     jar = http.cookiejar.CookieJar()
     adm = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), NR())
     try:

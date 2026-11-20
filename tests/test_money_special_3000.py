@@ -16,7 +16,7 @@ TAG = os.environ.get("RT_TAG", "")
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
 BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test"
-NAPI_DB = "/opt/newapi/one-api.db"
+NAPI_DB = os.environ.get("RT_NAPI_DB") or "/opt/newapi/one-api.db"  # R13 P3-1：读 env，不再写死
 guard(SITE, NAPI_DB)
 PASS, FAIL = 0, 0
 

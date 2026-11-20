@@ -1406,6 +1406,40 @@ def admin_page(request: Request):
              .replace("{{announcement}}", html.escape(announcement))
              .replace("{{paybadge}}", paybadge)]
 
+    # ── 站长告警 banner（R13 终审 P2-2）：cn_holidays_stale_alert / price_stale_alert /
+    #    price_change_alert 此前只写不读，官方价抓取失败、价格突变、节假日表过期这类
+    #    最需要人介入的事件站长在面板上看不到——现渲染为页面顶部红色条。 ──
+    _alert_items = []
+    try:
+        _raw = get_setting("cn_holidays_stale_alert", "")
+        if _raw:
+            _d = json.loads(_raw)
+            _alert_items.append("⚠️ 节假日表仅覆盖到 %s——过期日起节假日按峰时计费（多收），请按国务院通知更新" % _d.get("last_day", "?"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _raw = get_setting("price_stale_alert", "")
+        if _raw:
+            _d = json.loads(_raw)
+            _since = _d.get("since", 0)
+            _hours = max(0, int((time.time() - float(_since)) // 3600)) if _since else 0
+            _alert_items.append("⚠️ 官方价抓取已失败超过 24h（上次成功 %d 小时前），当前按旧缓存/默认价计费" % _hours)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _raw = get_setting("price_change_alert", "")
+        if _raw:
+            _d = json.loads(_raw)
+            _items = _d.get("items") or []
+            if _items:
+                _alert_items.append("⚠️ 官方价变动超 5%%：%s（已按新价计费，请核对计费配置）" % "、".join(map(str, _items)))
+    except Exception:  # noqa: BLE001
+        pass
+    if _alert_items:
+        parts.append('<div class="strip" style="background:#fef2f2;color:#dc2626;font-weight:600">'
+                     + '<br>'.join(html.escape(x) for x in _alert_items)
+                     + '</div>')
+
     # 云端备份用量汇总（接近上限的账号置顶提醒）
     BACKUP_LIMIT = BACKUP_MAX_BYTES
     warn_line = 0.8 * BACKUP_LIMIT
@@ -2235,20 +2269,22 @@ def _is_peak_now(now: datetime | None = None) -> bool:
 
 
 def _check_holiday_freshness() -> None:
-    """R6（审查 P2）：CN_HOLIDAYS 覆盖到 2026 年末——过期后会**静默**把节假日按峰时
-    （多收）。每年国务院公告后由站长在 app.py 更新一次（部署指南 §五）；过期前 30 天起
-    打印红色告警并落 cn_holidays_stale_alert 供管理面板展示。"""
+    """R6（审查 P2）/R13（终审 P2-1）：CN_HOLIDAYS 有日期覆盖范围——过期后会**静默**把节假日
+    按峰时（多收）。每年国务院公告后由站长在 app.py 更新一次（部署指南 §五）；过期前 30 天起
+    打印红色告警并落 cn_holidays_stale_alert 供管理面板展示。
+    判据用表内最大日期（max(CN_HOLIDAYS)），不用「年末 12-31」——否则表过期后告警会被
+    年末倒计时误清空（终审实测：2026-11-20 表已过期 44 天却 days_left=41 走 else 清空）。"""
     try:
-        last_year = max(int(x[:4]) for x in CN_HOLIDAYS)
+        last_day = max(CN_HOLIDAYS)  # "2026-10-07"
         today = site_now().date()
-        days_left = (datetime(last_year, 12, 31).date() - today).days
+        days_left = (date.fromisoformat(last_day) - today).days
         if days_left < 0:
-            set_setting("cn_holidays_stale_alert", json.dumps({"ts": time.time(), "last_year": last_year}))
-            print("[official-price] \033[91m⚠️ CN_HOLIDAYS 仅覆盖到 %d 年，节假日已开始按峰时计费（多收）！"
-                  "请按国务院最新通知更新后重启\033[0m" % last_year)
+            set_setting("cn_holidays_stale_alert", json.dumps({"ts": time.time(), "last_day": last_day}))
+            print("[official-price] \033[91m⚠️ CN_HOLIDAYS 仅覆盖到 %s（已过期 %d 天），节假日已开始按峰时计费（多收）！"
+                  "请按国务院最新通知更新后重启\033[0m" % (last_day, -days_left))
         elif days_left < 30:
-            set_setting("cn_holidays_stale_alert", json.dumps({"ts": time.time(), "last_year": last_year}))
-            print("[official-price] ⚠️ CN_HOLIDAYS 将于 %d-12-31 过期（剩 %d 天），请准备按国务院通知更新" % (last_year, days_left))
+            set_setting("cn_holidays_stale_alert", json.dumps({"ts": time.time(), "last_day": last_day}))
+            print("[official-price] ⚠️ CN_HOLIDAYS 将于 %s 过期（剩 %d 天），请准备按国务院通知更新" % (last_day, days_left))
         else:
             set_setting("cn_holidays_stale_alert", "")
     except Exception as e:  # noqa: BLE001

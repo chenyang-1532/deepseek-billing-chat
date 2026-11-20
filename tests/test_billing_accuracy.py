@@ -19,7 +19,7 @@ TAG = os.environ.get("RT_TAG", "")
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
 BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test/data.db"
-NAPI = "/opt/newapi/one-api.db"
+NAPI = os.environ.get("RT_NAPI_DB") or "/opt/newapi/one-api.db"  # R13 P3-1：读 env，不再写死
 guard(SITE, NAPI)
 QUSD, USD2CNY = 500000, 7.2
 PASS, FAIL = 0, 0
@@ -78,7 +78,10 @@ def q(sql, params=(), db=SITE):
 
 
 # 独立推导 mock 上游的计量逻辑（从源码解析 REPLY，不复制硬编码）
-src = open("/opt/newapi/mock_upstream.py").read()
+# R13 终审 P3-1：mock_upstream.py 已入库（tests/mock_upstream.py），优先读仓库内副本，
+# 兼容旧机器 /opt/newapi 路径——换环境/CI 不再 FileNotFoundError
+_MU_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mock_upstream.py")
+src = open(_MU_LOCAL if os.path.exists(_MU_LOCAL) else "/opt/newapi/mock_upstream.py").read()
 REPLY = re.search(r'REPLY = "([^"]+)"', src).group(1)
 OUT_TOK = max(1, len(REPLY) // 2)
 # v17.5 起倍率来自「官方价×倍数」定价引擎（峰谷时段浮动），运行时读取当前配置作为价格基准；
@@ -211,9 +214,13 @@ for row, (name, model, text, system) in zip(log_rows, CASES):
     _should_usd = (row["prompt_tokens"] / 1e6 * _base["in_miss"][_tier]
                    + row["completion_tokens"] / 1e6 * _base["out"][_tier])
     _actual_usd = row["quota"] / QUSD
+    # R13：new-api quota 为整数（最小计费粒度 1/500000 $）。谷时 n=1.0 的极小用例
+    # should=7.5 quota 被取整成 8，相对误差 6.7% 必超 2%——峰时跑反而被 n 放大稀释。
+    # 判据改为：相对误差 <2% **或** 绝对误差 ≤ 1 个最小计费粒度（1 quota）。
+    _abs_err_quota = abs(_actual_usd - _should_usd * _n) * QUSD
     _rel_err = abs(_actual_usd - _should_usd * _n) / _should_usd if _should_usd > 0 else 0
-    ck("%s: 官方价独立对账(误差<2%%, n=%.2f)" % (name, _n), _rel_err < 0.02,
-       "should=%.6f$ actual=%.6f$ rel=%.4f" % (_should_usd * _n, _actual_usd, _rel_err))
+    ck("%s: 官方价独立对账(误差<2%%, n=%.2f)" % (name, _n), _rel_err < 0.02 or _abs_err_quota <= 1,
+       "should=%.6f$ actual=%.6f$ rel=%.4f abserr=%.1fquota" % (_should_usd * _n, _actual_usd, _rel_err, _abs_err_quota))
 
 after_used = q("SELECT used_quota FROM users WHERE id=?", (nid,), NAPI)[0]["used_quota"]
 after_quota = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"]
@@ -248,6 +255,27 @@ with open("/root/.codebuddy/artifact/delivery/test_results/billing_accuracy_resu
         "expected_quota": eq, "actual_quota": aq, "diff": d
     } for (n, m, p, ct, eq, aq, d) in rows_result], f, ensure_ascii=False, indent=2)
 print("明细已存 delivery/test_results/billing_accuracy_result.json")
+
+
+# ── R13 终审 P2-1 回归：节假日表过期 → 告警必触发（判据 max(CN_HOLIDAYS)，非「年末」）──
+# 修前：max 取年份、倒计时算到 12-31，表过期 44 天时 days_left=41 走 else 把告警清空
+import importlib as _il
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(SITE)))   # 站点目录（与 guard 同源）
+A = _il.import_module("app")
+_real_holidays = A.CN_HOLIDAYS
+try:
+    A.CN_HOLIDAYS = {"2020-10-01"}          # 过期表
+    A._check_holiday_freshness()
+    _a1 = A.get_setting("cn_holidays_stale_alert", "")
+    ck("节假日表过期 → 告警必触发", bool(_a1) and json.loads(_a1).get("last_day") == "2020-10-01", _a1)
+    A.CN_HOLIDAYS = {"2999-12-31"}          # 未过期表
+    A._check_holiday_freshness()
+    _a2 = A.get_setting("cn_holidays_stale_alert", "")
+    ck("节假日表未过期 → 无告警", _a2 == "", _a2)
+finally:
+    A.CN_HOLIDAYS = _real_holidays
+    A._check_holiday_freshness()            # 恢复真实表状态下的告警位
 
 
 # P1-13：失败必须非零退出
