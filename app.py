@@ -523,9 +523,11 @@ textarea:focus{outline:none;border-color:#4f46e5;box-shadow:0 0 0 3px #eef2ff}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#0f172a;color:#fff;font-size:13px;border-radius:8px;padding:8px 16px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:50}
 .toast.on{opacity:.92}
 @media (max-width:640px){.kpis{grid-template-columns:repeat(2,1fr)}.kpi .v{font-size:17px}.wrap{padding:14px 10px 40px}.sec{padding:14px 12px}
-/* R13（终审 P3）：移动端表格横向滚动时操作列固定在右侧，不用滚到底再找按钮 */
-.tscroll th:last-child,.tscroll td:last-child{position:sticky;right:0;background:#fff;box-shadow:-6px 0 8px -6px rgba(15,23,42,.12)}
-.tscroll tbody tr:hover td:last-child{background:#fafbfc}}
+/* R13/R15（终审 P3 + 审查 R15）：移动端操作列固定右侧。只在末列为操作列的表
+（容器带 .opsfix 类）生效——不加类名的表（记录/统计类）不钉背景，避免末列
+统一变纯白打破斑马纹，也避开 border-collapse 下部分浏览器 sticky 错位。 */
+.tscroll.opsfix th:last-child,.tscroll.opsfix td:last-child{position:sticky;right:0;background:#fff;box-shadow:-6px 0 8px -6px rgba(15,23,42,.12)}
+.tscroll.opsfix tbody tr:hover td:last-child{background:#fafbfc}}
 </style></head><body><div class="wrap">
 <div class="bar"><h1>管理面板</h1>
 <form action="/admin/logout" method="get"><button class="btn ghost sm">退出</button></form></div>
@@ -612,23 +614,104 @@ async def _discard_body(request, cap: int = _BODY_DRAIN_MAX) -> None:
         pass
 
 
+class _BodyTooLarge(Exception):
+    """R15（审查 P1）：请求体超限时由计数 receive 抛出，ASGI 中间件捕获转 413。"""
+
+    def __init__(self, limit: int):
+        super().__init__("body limit %d" % limit)
+        self.limit = limit
+
+
+def _body_limit_for(path: str) -> int:
+    limit = BODY_LIMIT_DEFAULT
+    for _pref, _name in _BODY_LIMIT_RULES:
+        if path.startswith(_pref):
+            limit = globals().get(_name) or BODY_LIMIT_DEFAULT   # 常量在下方定义，延迟取值
+            break
+    return limit
+
+
+class _ASGIRequestBodyLimit:
+    """纯 ASGI 中间件（审查 R15 P1）：CL 预检 + chunked（无 CL）流式计数。
+
+    不能在 @app.middleware("http")（BaseHTTPMiddleware）里替换 request._receive：
+    starlette 0.50 的 wrapped_receive 用的是传入的原始 receive，替换传导不到下游，
+    实测 200MB chunked 照样全量读进内存。必须在 ASGI 层包 receive。
+    只透传消息、不缓存内容（内存有界）；超限抛 _BodyTooLarge → 413。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") not in ("POST", "PUT", "PATCH"):
+            await self.app(scope, receive, send)
+            return
+        limit = _body_limit_for(scope["path"])
+        cl = None
+        for _k, _v in scope.get("headers") or []:
+            if _k == b"content-length":
+                cl = _v.decode("latin-1", "replace")
+                break
+        if cl and cl.isdigit() and int(cl) > limit:
+            # 先丢弃 body（有界），客户端才能读到 413 文案而不是 Connection reset
+            _n = 0
+            while True:
+                msg = await receive()
+                if msg["type"] == "http.disconnect":
+                    break
+                _n += len(msg.get("body") or b"")
+                if not msg.get("more_body") or _n > _BODY_DRAIN_MAX:
+                    break
+            resp = JSONResponse(
+                {"ok": False, "msg": "请求体过大（上限 %d MB）" % (limit >> 20)},
+                status_code=413,
+            )
+            await resp(scope, receive, send)
+            return
+        total = 0
+
+        async def counting_receive():
+            nonlocal total
+            # 注意：不能在 body 读完（over）后伪造 http.disconnect——StreamingResponse
+            # 会并发监听 disconnect（listen_for_disconnect），收到即取消响应发送
+            # （实测流式聊天回复全部中断，"ASGI callable returned without
+            # completing response"）。正常消息一律透传，让 uvicorn 自己管理断开；
+            # 超限直接抛 _BodyTooLarge，由本中间件捕获转 413。
+            msg = await receive()
+            if msg["type"] == "http.request":
+                total += len(msg.get("body") or b"")
+                if total > limit:
+                    raise _BodyTooLarge(limit)
+            return msg
+
+        started = False
+
+        async def safe_send(msg):
+            nonlocal started
+            if msg["type"] == "http.response.start":
+                started = True
+            await send(msg)
+
+        try:
+            await self.app(scope, counting_receive, safe_send)
+        except _BodyTooLarge:
+            if started:
+                raise   # 响应已开始，无法改发 413；交由上层断开
+            resp = JSONResponse(
+                {"ok": False, "msg": "请求体过大（上限 %d MB）" % (limit >> 20)},
+                status_code=413,
+            )
+            await resp(scope, receive, send)
+        return
+
+
+# 注册顺序在后 → 位于 stack 外层：先做 CL 预检/流式计数，再进 http 中间件（上传并发闸）
+app.add_middleware(_ASGIRequestBodyLimit)
+
+
 @app.middleware("http")
 async def _body_limit_middleware(request, call_next):
-    if request.method in ("POST", "PUT", "PATCH"):
-        cl = request.headers.get("content-length")
-        if cl and cl.isdigit():
-            limit = BODY_LIMIT_DEFAULT
-            path = request.url.path
-            for _pref, _name in _BODY_LIMIT_RULES:
-                if path.startswith(_pref):
-                    limit = globals().get(_name) or BODY_LIMIT_DEFAULT   # 常量在下方定义，延迟取值
-                    break
-            if int(cl) > limit:
-                await _discard_body(request)
-                return JSONResponse(
-                    {"ok": False, "msg": "请求体过大（上限 %d MB）" % (limit >> 20)},
-                    status_code=413,
-                )
     _path = request.url.path
     if _path in _UPLOAD_PATHS or (_path == "/api/backup" and request.method == "POST"):
         if not _UPLOAD_SEM.acquire(blocking=False):
@@ -713,7 +796,8 @@ async def api_register(request: Request):
     # 客户端错误统一 400，且不写入任何状态。
     try:
         d = await request.json()
-    except Exception:  # noqa: BLE001
+    except ValueError:  # 非法 JSON（JSONDecodeError/UnicodeDecodeError）→ 400；
+        # _BodyTooLarge（R15 P1：chunked 超限）不是 ValueError，传播到 ASGI 层转 413
         return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
     if not isinstance(d, dict):
         return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
@@ -740,7 +824,8 @@ async def api_login(request: Request):
         return JSONResponse({"ok": False, "msg": "登录尝试过于频繁，请一分钟后再试"}, status_code=429)
     try:
         d = await request.json()
-    except Exception:  # noqa: BLE001
+    except ValueError:  # 非法 JSON（JSONDecodeError/UnicodeDecodeError）→ 400；
+        # _BodyTooLarge（R15 P1：chunked 超限）不是 ValueError，传播到 ASGI 层转 413
         return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
     if not isinstance(d, dict):
         return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
@@ -982,6 +1067,13 @@ def api_backup_get(request: Request, since_rev: int = 0):
     if since_rev > 0:
         with db() as c:
             _ensure_cloud_sessions(c)
+            _migrate_legacy(c, user["id"])   # R15：与全量分支对齐，老数据用户首次调增量不为空
+            bk = c.execute(
+                "SELECT updated_at FROM cloud_backups WHERE uid=?", (user["id"],)
+            ).fetchone()
+            if bk is None:
+                # R15：与全量分支行为一致——从未备份过的用户不返回空对象
+                return Response(status_code=404)
             rows = c.execute(
                 "SELECT sid, MAX(rev) AS rev FROM cloud_sessions "
                 "WHERE uid=? AND deleted=0 GROUP BY sid", (user["id"],)
@@ -1023,14 +1115,12 @@ def _backup_get_locked(user) -> Response:
             ).fetchall()
         }
     _hdrs = {"Content-Disposition": "attachment; filename=cloud-backup.zip"}
-    # R13（终审 P3-6）应用侧兜底：会话数很大时 X-Cloud-Revs 可达 40KB+，nginx 默认
-    # header buffer（4-8k）直接 502/截断。超 30KB 自动省略并给 X-Cloud-Revs-Large 提示，
-    # 客户端应改用 ?since_rev= 增量（已部署指南 §X-Cloud-Revs 一并说明）。
-    _revs_val = json.dumps(revs, separators=(",", ":"))
-    if len(_revs_val) <= 30000:
-        _hdrs["X-Cloud-Revs"] = _revs_val
-    else:
-        _hdrs["X-Cloud-Revs-Large"] = "sessions=%d" % len(revs)
+    # R5（审查 R3）：回传各会话最新 rev，供新版前端拉取后重建 base_revs 缓存。
+    # R15（审查）：header 必须无条件完整返回——曾尝试超 30KB 省略，但编译版前端
+    # 只读本头重建 base_revs，缺失会让冲突会话的 base_revs 永久停在旧值 → 每次推送
+    # 判冲突 → 拉全量也修不回来 → 多设备编辑静默丢数据。大会话量场景靠部署指南
+    # 的 proxy_buffer_size 32k + large_client_header_buffers 4 32k 兜底（见指南 §四）。
+    _hdrs["X-Cloud-Revs"] = json.dumps(revs, separators=(",", ":"))
     return Response(
         content=data,
         media_type="application/zip",
@@ -1650,7 +1740,7 @@ def admin_page(request: Request):
                 '<section class="sec" id="sec-wallet"><div class="sec-h"><h2>网关计费 · 用户余额</h2>'
                 '<span class="hint">余额实时来自 new-api，充值/扣减同步记账</span></div>'
                 + kpis
-                + '<div class="tscroll"><table><thead><tr>'
+                + '<div class="tscroll opsfix"><table><thead><tr>'
                 '<th>用户</th><th class="ta-r">余额</th><th class="ta-r">累计消耗</th>'
                 '<th class="ta-r">今日</th><th>调整余额</th></tr></thead><tbody>'
                 + lines_html + '</tbody></table></div></section>'
@@ -1774,7 +1864,7 @@ def admin_page(request: Request):
                 + f'<div class="flash ok" style="margin-bottom:8px">当前生效：<b>×{tmult:g}</b>'
                 f'（{"规则「" + html.escape(trule) + "」" if trule != "默认" else "默认倍数"}）'
                 f' · 峰谷官方价档：{"官方峰时" if tier_peak else "官方谷时"}</div>'
-                + '<div class="tscroll"><table><thead><tr><th>名称</th><th>时段（站点时区）</th>'
+                + '<div class="tscroll opsfix"><table><thead><tr><th>名称</th><th>时段（站点时区）</th>'
                 '<th class="ta-r">时段倍数</th><th></th></tr></thead><tbody>' + tm_rule_rows + '</tbody></table></div>'
                 + '<div class="ops" style="margin-top:8px">'
                 + '<form method="post" action="/admin/wallet/time-mult" class="inline">'
@@ -1868,7 +1958,7 @@ def admin_page(request: Request):
                 '<button class="btn sm">上传/更换收款码</button>'
                 '<span class="hint">png/jpg，≤2MB；用户在钱包页扫码付款</span></form></div>'
                 + f'<div class="kpi" style="margin-bottom:8px"><div class="l">待审充值申请</div><div class="v">{len(pending_pays)}</div></div>'
-                + '<div class="tscroll"><table><thead><tr><th>单号</th><th>申请时间</th><th>用户</th>'
+                + '<div class="tscroll opsfix"><table><thead><tr><th>单号</th><th>申请时间</th><th>用户</th>'
                 '<th class="ta-r">金额</th><th>操作</th></tr></thead><tbody>' + pay_rows + '</tbody></table></div>'
                 + '<div class="sec-h" style="margin-top:14px"><h3 style="font-size:14px">最近处理记录</h3></div>'
                 + '<div class="tscroll"><table><thead><tr><th>处理时间</th><th>用户</th>'
@@ -1938,7 +2028,7 @@ def admin_page(request: Request):
         f'<span class="hint">{len(rows)} 个账号 · 待审核 {npending} · 待审核与续期申请自动置顶</span></div>'
         + action_flash
         + backup_strip
-        + '<div class="tscroll"><table><thead><tr>'
+        + '<div class="tscroll opsfix"><table><thead><tr>'
         '<th>用户</th><th>状态</th><th>到期</th><th>云端备份</th><th>操作</th></tr></thead><tbody>'
         + ("".join(user_rows) or '<tr><td colspan="5" class="dim" style="text-align:center;padding:18px">暂无用户</td></tr>')
         + '</tbody></table></div></section>'
@@ -2423,6 +2513,10 @@ def _check_price_change(parsed: dict) -> None:
         if alerts:
             set_setting(PRICE_CHANGE_KEY, json.dumps({"ts": time.time(), "items": alerts}))
             print("[official-price] ⚠️ 官方价变动告警(>%d%%): %s" % (PRICE_CHANGE_ALERT_PCT * 100, "; ".join(alerts)))
+        else:
+            # R15（审查 P2）：价格恢复（或回落到阈值内）必须清掉旧告警，否则面板红条
+            # 永久挂着，运维无法区分「正在异常」和「历史异常」。
+            set_setting(PRICE_CHANGE_KEY, "")
     except Exception as e:  # noqa: BLE001
         print("[official-price] 变动检查异常:", e)
 
@@ -3619,7 +3713,9 @@ async def admin_wallet_refresh_official(request: Request):
     """手动刷新官方实时价格并重算倍率"""
     if not is_admin(request):
         return RedirectResponse("/admin", status_code=303)
-    data, ok = fetch_official_prices()
+    # R15（审查 P2）：fetch_official_prices 是同步 urllib 抓网页（实测最长 15s），
+    # 必须丢线程池执行，否则期间整个事件循环卡死——所有用户聊天/同步全部无响应。
+    data, ok = await run_in_threadpool(fetch_official_prices)
     st = recompute_ratios(data)
     return RedirectResponse("/admin?official_ok=%d&ratio_st=%s" % (1 if ok else 0, st), status_code=303)
 

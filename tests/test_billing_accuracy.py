@@ -13,7 +13,7 @@ import time
 import urllib.request
 
 import os
-from _guard import guard, assert_restart_allowed
+from _guard import guard, probe_billing_or_skip, assert_restart_allowed
 TAG = os.environ.get("RT_TAG", "")
 
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
@@ -21,6 +21,8 @@ BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test/data.db"
 NAPI = os.environ.get("RT_NAPI_DB") or "/opt/newapi/one-api.db"  # R13 P3-1：读 env，不再写死
 guard(SITE, NAPI)
+# R15（审查回归）：billing 全靠真实记账行对账，无记账环境必须与 6 个套件一样如实 SKIP
+probe_billing_or_skip(BASE, SITE, NAPI, TAG)
 QUSD, USD2CNY = 500000, 7.2
 PASS, FAIL = 0, 0
 

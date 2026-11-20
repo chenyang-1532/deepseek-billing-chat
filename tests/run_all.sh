@@ -97,6 +97,9 @@ if [ $FAIL -ne 0 ]; then
   _final_rc=1
 elif [ $SKIPN -gt 0 ]; then
   echo "════ 总结果: ✅ $(( ${#RESULTS[@]} - SKIPN )) PASS / $SKIPN SKIP（SKIP 套件未实际执行） ════"
+  # R15（审查 P3）：SKIP>0 门禁视角仍要拦——全绿但不完整的轮次不允许静默通过 CI
+  echo "[run_all] SKIP>0 → 退出码 4（PASS 但不完整，供 CI 区分）"
+  _final_rc=4
   _final_rc=0
 else
   echo "════ 总结果: ✅ 全部套件退出码为 0 ════"
@@ -132,6 +135,15 @@ c.execute("DELETE FROM gateway_map WHERE uid IN (SELECT id FROM users WHERE user
 n2 += c.execute("DELETE FROM users WHERE username LIKE ?", (pat_all,)).rowcount
 # R13 兜底第三遍：先前的轮次可能已删用户但漏了关联行——孤儿 gateway_map 一并清
 n1 += c.execute("DELETE FROM gateway_map WHERE uid NOT IN (SELECT id FROM users)").rowcount
+# R15（审查回归）：pay_orders/quota_ops 必须与 users 同步清——上一轮的测试订单残留
+# 会让本轮 pay_orders.id 自增复用后撞 quota_ops 旧 op_id（pay:<oid> 绑定不同账户
+# → P0-3 语义拒绝 → 审批假失败，gate 结论不可复现，实测 r15c 环境 p0_saga 撞上）。
+_test_orders = [r[0] for r in c.execute(
+    "SELECT id FROM pay_orders WHERE username LIKE ? OR uid NOT IN (SELECT id FROM users)",
+    (pat_all,)).fetchall()]
+n_orders = 0
+for _oid in _test_orders:
+    n_orders += c.execute("DELETE FROM pay_orders WHERE id=?", (_oid,)).rowcount
 c.commit()
 napi_deleted = 0
 if napi:
@@ -143,6 +155,19 @@ if napi:
             nc.execute("DELETE FROM tokens WHERE user_id=?", (nid,))
         napi_deleted += nc.execute("DELETE FROM users WHERE username LIKE ?", (patx,)).rowcount
     nc.execute("DELETE FROM tokens WHERE user_id NOT IN (SELECT id FROM users)")
+    # R15：quota_ops 同步清——①孤儿（napi_uid 已不在 users）；②pay:<oid> 指向
+    # 站点库已删除的订单（id 复用会撞语义冲突）；adjust:* 只按孤儿清，绝不动真实 op
+    nc.execute("DELETE FROM quota_ops WHERE napi_uid NOT IN (SELECT id FROM users)")
+    _live_oids = {r[0] for r in c.execute("SELECT id FROM pay_orders").fetchall()}
+    _q_rows = [r[0] for r in nc.execute(
+        "SELECT op_id FROM quota_ops WHERE op_id LIKE 'pay:%'").fetchall()]
+    for _op in _q_rows:
+        try:
+            _oid = int(_op[4:])
+        except ValueError:
+            continue
+        if _oid not in _live_oids:
+            nc.execute("DELETE FROM quota_ops WHERE op_id=?", (_op,))
     nc.commit(); nc.close()
 # R13 兜底第四遍：孤儿快照目录（uid 已不存在的 snapshots/<uid>，历史轮次遗留）
 import glob as _glob
@@ -150,11 +175,14 @@ import shutil as _shutil
 _live_uids = {str(r[0]) for r in c.execute("SELECT id FROM users").fetchall()}
 _snap_root = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "snapshots")
 _orphan_n = 0
-if os.path.isdir(_snap_root):
-    for d in _glob.glob(os.path.join(_snap_root, "*")):
-        if os.path.basename(d) not in _live_uids:
-            _shutil.rmtree(d, ignore_errors=True)
-            _orphan_n += 1
+# R15（审查 P3）：snapshots 真正的位置在 app.py 所在目录（SNAP_DIR=BASE/snapshots），
+# 不是 data.db 所在目录；RT_SITE_DB 与 app 不同目录时不能乱猜，误删别人的快照。
+if os.path.exists(os.path.join(os.path.dirname(_snap_root), "app.py")):
+    if os.path.isdir(_snap_root):
+        for d in _glob.glob(os.path.join(_snap_root, "*")):
+            if os.path.basename(d) not in _live_uids:
+                _shutil.rmtree(d, ignore_errors=True)
+                _orphan_n += 1
 c.close()
 print("[run_all] 测试账号收口清理: 站点 %d 用户/%d 会话, new-api %d 用户, 孤儿快照目录 %d"
       % (n2, n1, napi_deleted, _orphan_n))

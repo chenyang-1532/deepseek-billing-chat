@@ -207,15 +207,22 @@ def probe_billing_or_skip(base: str, site_db: str, napi_db: str, tag: str) -> No
                        {"model": "deepseek-flash", "max_tokens": 16,
                         "messages": [{"role": "user", "content": "ping"}]},
                        cookie=cku)
-    _time.sleep(1)   # new-api 异步落库窗口
+    _deadline = _time.time() + 5.0   # R15（审查 P3）：真实 new-api 负载下异步落库可 >1s，
+    _after = None                    # 改轮询 5s（每 0.3s），避免记账套件被误 SKIP
     nc = _sq3.connect(napi_db, timeout=15)
     try:
-        after = nc.execute("SELECT COALESCE(MAX(id),0) FROM logs WHERE user_id=?", (nid,)).fetchone()[0]
+        while _time.time() < _deadline:
+            _after = nc.execute("SELECT COALESCE(MAX(id),0) FROM logs WHERE user_id=?", (nid,)).fetchone()[0]
+            if _after > before:
+                break
+            _time.sleep(0.3)
+        if _after is None:
+            _after = nc.execute("SELECT COALESCE(MAX(id),0) FROM logs WHERE user_id=?", (nid,)).fetchone()[0]
     finally:
         nc.close()
-    if after > before:
-        print("[probe] 记账前置探测通过（logs %d→%d，status=%s）" % (before, after, st))
+    if _after > before:
+        print("[probe] 记账前置探测通过（logs %d→%d，status=%s）" % (before, _after, st))
         return
-    print("[SKIP] 记账前置探测失败：new-api logs 未 +1（before=%d after=%d status=%s）——"
-          "当前环境无记账能力（空壳网关/mock 未计量），依赖记账的套件跳过" % (before, after, st))
+    print("[SKIP] 记账前置探测失败：new-api logs 未 +1（before=%d after=%d status=%s，轮询 5s）——"
+          "当前环境无记账能力（空壳网关/mock 未计量），依赖记账的套件跳过" % (before, _after, st))
     sys.exit(3)

@@ -94,9 +94,9 @@ server {
 
 `_req_secure()` 的 HTTPS 探测顺序：`X-Forwarded-Proto` 头 → `url.scheme`。只走反代时必须配置该头，否则登录 Cookie 不带 Secure。
 
-**X-Cloud-Revs 应用侧兜底（R13 终审 P3-6）**：会话很多时该响应头可达 40KB+；应用现在超 30KB 自动省略该头并改发 `X-Cloud-Revs-Large: sessions=<n>` 提示（客户端应改用增量），不再依赖 nginx buffer 调大。增量接口：`GET /api/backup?since_rev=<已见最大 rev>` → 返回 JSON `{"ok":true,"max_rev":M,"changed":{仅 rev>since_rev 的会话},"deleted":[墓碑 sid]}`，客户端据此低成本发现变更会话，再决定是否拉全量归档。
+**X-Cloud-Revs 必须完整返回（R15 审查）**：应用无条件返回该头，**不做任何省略**——曾试过超 30KB 省略，但编译版前端只读它重建 `base_revs` 缓存，缺失会让冲突会话永久卡死（多设备编辑静默丢数据），已回滚。因此 buffer 仍需按会话量配置（见上表 `proxy_buffer_size` / `large_client_header_buffers`）。预留接口：`GET /api/backup?since_rev=<已见最大 rev>` → 返回 JSON `{"ok":true,"max_rev":M,"changed":{仅 rev>since_rev 的会话},"deleted":[墓碑 sid]}`——**当前编译版前端未消费此接口**（grep `since_rev` 0 次），仅对将来重新编译的前端有意义，运维不必为它做任何配置。
 
-`client_max_body_size` 必须 ≥ 200MB：站点侧 `/api/backup` 上限 200MB、`/api/upload` 64MB，Nginx 默认 1MB 会先返回 413（页面表现为「同步失败 / 上传失败」，服务端日志一条都没有）。反向代理同时是 chunked（无 Content-Length）请求体的唯一兜底——应用层中间件只能按 CL 预检。
+`client_max_body_size` 必须 ≥ 200MB：站点侧 `/api/backup` 上限 200MB、`/api/upload` 64MB，Nginx 默认 1MB 会先返回 413（页面表现为「同步失败 / 上传失败」，服务端日志一条都没有）。**chunked（无 Content-Length）请求体已由应用层流式计数兜底（R15）**：中间件包装 receive 累计字节数，超限同样 413，直连 uvicorn（无反代）的部署同样受保护；但内存视角仍建议反代配 `client_max_body_size`——nginx 放行的 body uvicorn 会读进内存，应用层 413 只是拒绝不是限流。
 
 ## 五、日常运维
 
