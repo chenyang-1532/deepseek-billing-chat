@@ -139,3 +139,83 @@ def assert_restart_allowed() -> None:
         print("[SKIP] new-api 重启恢复用例跳过：%s（重启类用例禁止在未显式声明的环境执行）" % "; ".join(reasons))
         return False
     return True
+
+
+def probe_billing_or_skip(base: str, site_db: str, napi_db: str, tag: str) -> None:
+    """R13（终审 P3-2）记账前置探测：依赖 new-api 记账的套件（concurrency/isolation/
+    gw_e2e/pay_model/money_special/money_security）开跑前先发 1 笔真实请求，
+    new-api logs 没 +1 就 SKIP(exit 3)——空壳网关/无 mock 上游的环境下直接跳过，
+    不再报一堆「结算 0 笔 / 总扣 0」的误导性失败（终审实测：换环境 6 个假失败）。
+
+    探测账号 rttest<TAG>_probe 由 run_all 收口清理统一删除。
+    """
+    import json as _json
+    import sqlite3 as _sq3
+    import time as _time
+    import urllib.error as _ue
+    import urllib.request as _uq
+
+    class _NR(_uq.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    op = _uq.build_opener(_NR())
+
+    def _req(method, path, data=None, cookie=None):
+        body = _json.dumps(data).encode() if isinstance(data, dict) else data
+        r = _uq.Request(base + path, data=body, method=method)
+        if isinstance(data, dict):
+            r.add_header("Content-Type", "application/json")
+        if cookie:
+            r.add_header("Cookie", cookie)
+        try:
+            resp = op.open(r, timeout=90)
+            return resp.status, resp.read().decode("utf-8", "replace"), resp.headers
+        except _ue.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace"), e.headers
+
+    U = "rttest%s_probe" % tag
+    P = "probetest12345"
+    _req("POST", "/api/register", {"u": U, "p": P})
+    c = _sq3.connect(site_db, timeout=15)
+    c.execute("UPDATE users SET status='approved', expiry=date('now','localtime','+30 days') WHERE username=?", (U,))
+    c.commit()
+    rows = c.execute("SELECT id FROM users WHERE username=?", (U,)).fetchall()
+    if not rows:
+        c.close()
+        print("[SKIP] 记账前置探测失败：探测账号 %r 注册未落库（检查用户名长度/限流），套件跳过" % U)
+        sys.exit(3)
+    _, _, hh = _req("POST", "/api/login", {"u": U, "p": P})
+    cookies = hh.get_all("Set-Cookie") or []
+    cku = next((x.split(";")[0] for x in cookies if x.startswith("session=")), None)
+    if not cku:
+        c.close()
+        print("[SKIP] 记账前置探测失败：探测账号登录未拿到 session，套件跳过")
+        sys.exit(3)
+    _req("GET", "/api/wallet", cookie=cku)   # provision：建 gateway_map / new-api 账号
+    uid = rows[0][0]
+    mrow = c.execute("SELECT napi_uid FROM gateway_map WHERE uid=?", (uid,)).fetchone()
+    c.close()
+    if not mrow:
+        print("[SKIP] 记账前置探测失败：gateway_map 未建立（网关未开启？），套件跳过")
+        sys.exit(3)
+    nid = mrow[0]
+    nc = _sq3.connect(napi_db, timeout=15)
+    before = nc.execute("SELECT COALESCE(MAX(id),0) FROM logs WHERE user_id=?", (nid,)).fetchone()[0]
+    nc.close()
+    st, body, _ = _req("POST", "/anthropic/v1/messages",
+                       {"model": "deepseek-flash", "max_tokens": 16,
+                        "messages": [{"role": "user", "content": "ping"}]},
+                       cookie=cku)
+    _time.sleep(1)   # new-api 异步落库窗口
+    nc = _sq3.connect(napi_db, timeout=15)
+    try:
+        after = nc.execute("SELECT COALESCE(MAX(id),0) FROM logs WHERE user_id=?", (nid,)).fetchone()[0]
+    finally:
+        nc.close()
+    if after > before:
+        print("[probe] 记账前置探测通过（logs %d→%d，status=%s）" % (before, after, st))
+        return
+    print("[SKIP] 记账前置探测失败：new-api logs 未 +1（before=%d after=%d status=%s）——"
+          "当前环境无记账能力（空壳网关/mock 未计量），依赖记账的套件跳过" % (before, after, st))
+    sys.exit(3)

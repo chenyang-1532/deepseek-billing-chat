@@ -144,8 +144,20 @@ if napi:
         napi_deleted += nc.execute("DELETE FROM users WHERE username LIKE ?", (patx,)).rowcount
     nc.execute("DELETE FROM tokens WHERE user_id NOT IN (SELECT id FROM users)")
     nc.commit(); nc.close()
+# R13 兜底第四遍：孤儿快照目录（uid 已不存在的 snapshots/<uid>，历史轮次遗留）
+import glob as _glob
+import shutil as _shutil
+_live_uids = {str(r[0]) for r in c.execute("SELECT id FROM users").fetchall()}
+_snap_root = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "snapshots")
+_orphan_n = 0
+if os.path.isdir(_snap_root):
+    for d in _glob.glob(os.path.join(_snap_root, "*")):
+        if os.path.basename(d) not in _live_uids:
+            _shutil.rmtree(d, ignore_errors=True)
+            _orphan_n += 1
 c.close()
-print("[run_all] 测试账号收口清理: 站点 %d 用户/%d 会话, new-api %d 用户" % (n2, n1, napi_deleted))
+print("[run_all] 测试账号收口清理: 站点 %d 用户/%d 会话, new-api %d 用户, 孤儿快照目录 %d"
+      % (n2, n1, napi_deleted, _orphan_n))
 PYEOF
 fi
 

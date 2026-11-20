@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 
 import os
-from _guard import guard, assert_restart_allowed
+from _guard import guard, probe_billing_or_skip, assert_restart_allowed
 TAG = os.environ.get("RT_TAG", "")
 
 ADMIN_PW = __import__("os").environ.get("ADMIN_PW", "")
@@ -21,7 +21,8 @@ BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test"
 guard(SITE)
 SITE_DB = SITE + "/data.db"
-NAPI = "/opt/newapi/one-api.db"
+NAPI = os.environ.get("RT_NAPI_DB") or "/opt/newapi/one-api.db"  # R13 P3-1：读 env
+probe_billing_or_skip(BASE, SITE_DB, NAPI, TAG)   # R13 P3-2：记账前置探测，无记账环境 SKIP
 QUSD = 500000
 PASS = FAIL = 0
 

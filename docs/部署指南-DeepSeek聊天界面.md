@@ -94,6 +94,8 @@ server {
 
 `_req_secure()` 的 HTTPS 探测顺序：`X-Forwarded-Proto` 头 → `url.scheme`。只走反代时必须配置该头，否则登录 Cookie 不带 Secure。
 
+**X-Cloud-Revs 应用侧兜底（R13 终审 P3-6）**：会话很多时该响应头可达 40KB+；应用现在超 30KB 自动省略该头并改发 `X-Cloud-Revs-Large: sessions=<n>` 提示（客户端应改用增量），不再依赖 nginx buffer 调大。增量接口：`GET /api/backup?since_rev=<已见最大 rev>` → 返回 JSON `{"ok":true,"max_rev":M,"changed":{仅 rev>since_rev 的会话},"deleted":[墓碑 sid]}`，客户端据此低成本发现变更会话，再决定是否拉全量归档。
+
 `client_max_body_size` 必须 ≥ 200MB：站点侧 `/api/backup` 上限 200MB、`/api/upload` 64MB，Nginx 默认 1MB 会先返回 413（页面表现为「同步失败 / 上传失败」，服务端日志一条都没有）。反向代理同时是 chunked（无 Content-Length）请求体的唯一兜底——应用层中间件只能按 CL 预检。
 
 ## 五、日常运维

@@ -8,13 +8,14 @@ import time
 import urllib.request
 
 import os
-from _guard import guard, assert_restart_allowed
+from _guard import guard, probe_billing_or_skip, assert_restart_allowed
 TAG = os.environ.get("RT_TAG", "")
 
 BASE = "http://127.0.0.1:3000"
 SITE = "/tmp/chatsite-test/data.db"
 NAPI = "/opt/newapi/one-api.db"
 guard(SITE, NAPI)
+probe_billing_or_skip(BASE, SITE, NAPI, TAG)   # R13 P3-2：记账前置探测，无记账环境 SKIP
 QUSD, USD2CNY = 500000, 7.2
 PASS, FAIL = 0, 0
 

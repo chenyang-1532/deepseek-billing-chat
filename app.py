@@ -522,7 +522,10 @@ textarea:focus{outline:none;border-color:#4f46e5;box-shadow:0 0 0 3px #eef2ff}
 .ok-msg{display:none}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#0f172a;color:#fff;font-size:13px;border-radius:8px;padding:8px 16px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:50}
 .toast.on{opacity:.92}
-@media (max-width:640px){.kpis{grid-template-columns:repeat(2,1fr)}.kpi .v{font-size:17px}.wrap{padding:14px 10px 40px}.sec{padding:14px 12px}}
+@media (max-width:640px){.kpis{grid-template-columns:repeat(2,1fr)}.kpi .v{font-size:17px}.wrap{padding:14px 10px 40px}.sec{padding:14px 12px}
+/* R13（终审 P3）：移动端表格横向滚动时操作列固定在右侧，不用滚到底再找按钮 */
+.tscroll th:last-child,.tscroll td:last-child{position:sticky;right:0;background:#fff;box-shadow:-6px 0 8px -6px rgba(15,23,42,.12)}
+.tscroll tbody tr:hover td:last-child{background:#fafbfc}}
 </style></head><body><div class="wrap">
 <div class="bar"><h1>管理面板</h1>
 <form action="/admin/logout" method="get"><button class="btn ghost sm">退出</button></form></div>
@@ -969,10 +972,31 @@ def api_backup_meta(request: Request):
 
 
 @app.get("/api/backup")
-def api_backup_get(request: Request):
+def api_backup_get(request: Request, since_rev: int = 0):
     user = get_user(request)
     if user is None or not valid_paid_user(user):
         return Response(status_code=403)
+    # R13（终审 P3-6）：since_rev>0 → 增量模式，只回 JSON 变更 rev 清单（不打包 zip），
+    # 客户端可低成本发现哪些会话更新过，再决定是否拉全量归档——会话 >5000 时全量
+    # X-Cloud-Revs header 40KB+ 会顶穿 nginx 默认 header buffer，增量模式天然绕开。
+    if since_rev > 0:
+        with db() as c:
+            _ensure_cloud_sessions(c)
+            rows = c.execute(
+                "SELECT sid, MAX(rev) AS rev FROM cloud_sessions "
+                "WHERE uid=? AND deleted=0 GROUP BY sid", (user["id"],)
+            ).fetchall()
+            max_rev = c.execute(
+                "SELECT COALESCE(MAX(rev),0) AS m FROM cloud_sessions WHERE uid=?", (user["id"],)
+            ).fetchone()["m"]
+            tomb = c.execute(
+                "SELECT sid FROM cloud_sessions WHERE uid=? AND deleted=1", (user["id"],)
+            ).fetchall()
+        revs = {r["sid"]: (r["rev"] or 0) for r in rows if (r["rev"] or 0) > since_rev}
+        return JSONResponse({
+            "ok": True, "max_rev": max_rev, "since_rev": since_rev,
+            "changed": revs, "deleted": [r["sid"] for r in tomb],
+        })
     if not _EXPORT_SEM.acquire(blocking=False):
         return _export_busy()
     try:
@@ -998,13 +1022,19 @@ def _backup_get_locked(user) -> Response:
                 "SELECT sid, rev FROM cloud_sessions WHERE uid=? AND deleted=0", (user["id"],)
             ).fetchall()
         }
+    _hdrs = {"Content-Disposition": "attachment; filename=cloud-backup.zip"}
+    # R13（终审 P3-6）应用侧兜底：会话数很大时 X-Cloud-Revs 可达 40KB+，nginx 默认
+    # header buffer（4-8k）直接 502/截断。超 30KB 自动省略并给 X-Cloud-Revs-Large 提示，
+    # 客户端应改用 ?since_rev= 增量（已部署指南 §X-Cloud-Revs 一并说明）。
+    _revs_val = json.dumps(revs, separators=(",", ":"))
+    if len(_revs_val) <= 30000:
+        _hdrs["X-Cloud-Revs"] = _revs_val
+    else:
+        _hdrs["X-Cloud-Revs-Large"] = "sessions=%d" % len(revs)
     return Response(
         content=data,
         media_type="application/zip",
-        headers={
-            "Content-Disposition": "attachment; filename=cloud-backup.zip",
-            "X-Cloud-Revs": json.dumps(revs, separators=(",", ":")),
-        },
+        headers=_hdrs,
     )
 
 
@@ -1943,12 +1973,9 @@ def _admin_login_fail(ip: str):
         for _k in list(_ADMIN_LOGIN_FAILS)[:len(_ADMIN_LOGIN_FAILS) - 4096]:
             _ADMIN_LOGIN_FAILS.pop(_k, None)
     ent = _ADMIN_LOGIN_FAILS.setdefault(ip, [0, 0.0])
-    if ent[1] > time.time():
-        # 审查 R12/P1：锁定期内继续失败不得续期，否则攻击者持续请求 = 永久锁死管理员
-        return
-    # 审查 R11（P1）：锁定期内继续失败不再累加、不续期——否则攻击者每 5 分钟打 5 次
-    # 错误密码就能把锁定时间无限延长，真正的管理员永远进不了后台（纯 DoS，无需密码）。
-    # 一次锁定最多 _ADMIN_LOCK_SECONDS，到期后重新计数。
+    # 审查 R11（P1）/R12（P1）：锁定期内继续失败不累加、不续期——否则攻击者每 5 分钟
+    # 打 5 次错误密码就能把锁定时间无限延长，真正的管理员永远进不了后台（纯 DoS）。
+    # 一次锁定最多 _ADMIN_LOCK_SECONDS，到期后重新计数。（R13/P3：原两段重复判断去重）
     if ent[1] > time.time():
         return
     ent[0] += 1
@@ -2901,11 +2928,20 @@ def api_wallet_logs(request: Request, limit: int = 50):
         return JSONResponse({"ok": False}, status_code=404)
     nid = gw_napi_uid(user)
     with napi_connect() as nc:
-        rows = nc.execute(
-            "SELECT created_at, model_name, prompt_tokens, completion_tokens, quota "
-            "FROM logs WHERE user_id=? AND type=2 ORDER BY id DESC LIMIT ?",
-            (nid, max(1, min(limit, 200))),
-        ).fetchall()
+        # R13（终审 P3-5）：老版本 new-api 的 logs 可能没有 prompt_tokens 列，裸 SELECT
+        # 直接 OperationalError → 500。探测降级：缺列时 token 列回空串，钱包流水仍可用。
+        try:
+            rows = nc.execute(
+                "SELECT created_at, model_name, prompt_tokens, completion_tokens, quota "
+                "FROM logs WHERE user_id=? AND type=2 ORDER BY id DESC LIMIT ?",
+                (nid, max(1, min(limit, 200))),
+            ).fetchall()
+        except Exception:  # noqa: BLE001  sqlite3.OperationalError（no such column）
+            rows = nc.execute(
+                "SELECT created_at, model_name, 0 AS prompt_tokens, 0 AS completion_tokens, quota "
+                "FROM logs WHERE user_id=? AND type=2 ORDER BY id DESC LIMIT ?",
+                (nid, max(1, min(limit, 200))),
+            ).fetchall()
     items = [
         {
             "time": r["created_at"],
