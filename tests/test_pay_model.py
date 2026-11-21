@@ -185,6 +185,8 @@ ck("返回 has_qr=true", j.get("has_qr") is True)
 s, body, _ = api("GET", "/admin", cookie=ckadm)
 ck("面板充值审批区渲染待审单号", 'id="sec-pay"' in body and str(oid) in body)
 ck("导航徽标显示 1", "充值审批" in body and ">1</span>" in body, body.count("充值审批"))
+ck("面板通过/拒绝表单携带 action 字段（回归：缺字段致点击无效）",
+   'name="action" value="approve"' in body and 'name="action" value="reject"' in body)
 
 # 未登录/他人不能审批
 s, _, hh = api("POST", "/admin/wallet/pay", {"oid": oid, "action": "approve"}, cookie=cku, form=True)

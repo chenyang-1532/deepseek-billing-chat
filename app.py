@@ -1992,9 +1992,11 @@ def admin_page(request: Request):
                 f'<td class="ta-r money">¥{p["cny"]:.2f}</td>'
                 f'<td><form method="post" action="/admin/wallet/pay" class="inline">'
                 f'<input type="hidden" name="oid" value="{p["id"]}">'
+                f'<input type="hidden" name="action" value="approve">'
                 f'<button class="btn sm" data-confirm="确认已收到 {html.escape(str(p["username"]))} 的 ¥{p["cny"]:g} 付款并为其到账？">{"续跑到账" if p["status"] == "processing" else "通过"}</button></form>'
                 f'<form method="post" action="/admin/wallet/pay" class="inline">'
                 f'<input type="hidden" name="oid" value="{p["id"]}">'
+                f'<input type="hidden" name="action" value="reject">'
                 f'<button class="btn sm danger" data-confirm="拒绝该笔充值申请？">拒绝</button></form></td></tr>'
                 for p in pending_pays
             ) or '<tr><td colspan="5" class="dim" style="text-align:center;padding:18px">暂无待审充值申请</td></tr>'
@@ -4005,7 +4007,7 @@ async def admin_wallet_pay(request: Request, oid: int = Form(...), action: str =
     if not is_admin(request):
         return RedirectResponse("/admin", status_code=303)
     if action not in ("approve", "reject"):
-        return RedirectResponse("/admin?pay_err=1", status_code=303)
+        return RedirectResponse("/admin?pay_err=1#sec-pay", status_code=303)
     try:
         with db() as c:
             row = c.execute("SELECT * FROM pay_orders WHERE id=?", (oid,)).fetchone()
@@ -4054,8 +4056,8 @@ async def admin_wallet_pay(request: Request, oid: int = Form(...), action: str =
         print("[pay] 订单 #%s %s ¥%s user=%s" % (oid, action, row["cny"], row["username"]))
     except Exception as e:  # noqa: BLE001
         print("[pay] 审批失败 oid=%s err=%s" % (oid, e))
-        return RedirectResponse("/admin?pay_err=1", status_code=303)
-    return RedirectResponse("/admin?pay_ok=1", status_code=303)
+        return RedirectResponse("/admin?pay_err=1#sec-pay", status_code=303)
+    return RedirectResponse("/admin?pay_ok=1#sec-pay", status_code=303)
 
 
 @app.post("/admin/wallet/qr")
