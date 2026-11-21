@@ -2324,11 +2324,20 @@ async def api_upload(request: Request):
         return JSONResponse({"error": {"message": "未登录"}}, status_code=401)
     if not valid_paid_user(user):
         return JSONResponse({"error": {"message": "账号不可用"}}, status_code=403)
-    # 网关计费模式：统一走 new-api 计费链路（服务端注入计费 Key），不再要求用户自带 Key
+    # 网关计费模式：上传不走 new-api —— new-api 对 /v1/files 按对话中转处理，强制要求
+    # model 参数（"Model name not specified" 400），而 Files API 请求本身没有 model 字段，
+    # 即 new-api 该版本不支持文件中转，网关化后上传 100% 失败（2026-11-21 生产实测）。
+    # 改为直连 DeepSeek Anthropic Files API，密钥取 new-api 渠道配置里的官方 Key：
+    # 与聊天共用同一 DeepSeek 账号，file_id 在对话请求里照常引用；上传本身不计费，
+    # 解析出的 token 在聊天时仍走 new-api 正常扣费。
     if gw_enabled():
-        api_key, _ = gw_provision(user)
-        upload_base = NEWAPI_BASE
-        upload_path = "/v1/files"
+        gw_provision(user)  # 保留开通/对账副作用
+        _plat_key = gw_files_key()
+        if not _plat_key:
+            return JSONResponse({"error": {"message": "计费网关未配置可用渠道，暂时无法上传文件"}}, status_code=503)
+        api_key = _plat_key
+        upload_base = DEEPSEEK_BASE
+        upload_path = "/anthropic/v1/files"
     else:
         api_key = request.headers.get("x-api-key") or ""
         if not api_key:
@@ -2372,10 +2381,7 @@ async def api_upload(request: Request):
         "Content-Type": f"multipart/form-data; boundary={boundary}",
         "anthropic-beta": FILES_BETA,
     }
-    if gw_enabled():
-        _up_headers["Authorization"] = "Bearer " + api_key  # new-api 只认 Bearer
-    else:
-        _up_headers["x-api-key"] = api_key
+    _up_headers["x-api-key"] = api_key  # DeepSeek Anthropic Files API 只认 x-api-key
     req = urllib.request.Request(
         upload_base + upload_path,
         data=payload,
@@ -3012,6 +3018,24 @@ def _wallet_tx(c, uid, tx_type, cny, balance_cny, note=""):
         "INSERT INTO wallet_tx(uid,type,cny,balance_cny,note,created_at) VALUES(?,?,?,?,?,?)",
         (uid, tx_type, cny, balance_cny, note, site_now().strftime("%Y-%m-%d %H:%M:%S")),
     )
+
+
+def gw_files_key() -> str | None:
+    """取 new-api 里已启用的上游渠道密钥（DeepSeek 官方 Key）。
+
+    文件上传直连上游时使用：与聊天渠道同一 DeepSeek 账号，file_id 才能被
+    对话请求引用。多渠道时取第一个启用渠道——若未来出现多账号渠道轮询，
+    此处需要改为按渠道亲和上传（当前单渠道部署下无此问题）。
+    """
+    try:
+        with napi_connect() as nc:
+            row = nc.execute(
+                "SELECT key FROM channels WHERE status=1 AND key IS NOT NULL AND key!='' "
+                "ORDER BY id LIMIT 1"
+            ).fetchone()
+            return row["key"] if row else None
+    except Exception:  # noqa: BLE001  DB 不可达时按无渠道处理
+        return None
 
 
 def gw_provision(user):
