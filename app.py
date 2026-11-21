@@ -385,11 +385,10 @@ LOGIN_PAGE_HEAD = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-
 </head><body><div class="card">
 <h1>Miandning AI</h1>
 <div class="notice" id="notice" style="display:none"></div>
-<div class="sub">注册后需管理员审核通过方可使用。<br>按钱包余额计费（充值后即可使用）。聊天记录自动云端同步，换设备登录即恢复。</div>"""
+<div class="sub">按钱包余额计费（充值后即可使用）。聊天记录自动云端同步，换设备登录即恢复。</div>"""
 
 LOGIN_PAGE_TAIL = """
 <div id="msg" class="msg"></div>
-<div class="tip">提示：注册提交后进入人工审核，审核通过并用注册的账号登录即可使用；会员到期后账号会立即被请出网站，联系管理员续费即可恢复。</div>
 </div>
 <script>
 (async()=>{try{var r=await fetch('/api/announcement');var d=await r.json();
