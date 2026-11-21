@@ -73,6 +73,24 @@ def napi_get_quota(nid):
     return q("SELECT quota AS v FROM users WHERE id=?", (nid,), NAPI)[0]["v"]
 
 
+def wait_quota_settled(nid, timeout=8.0):
+    """等待 new-api 延迟落账稳定（quota 连续两次采样相同），返回最终 quota。
+    消费日志为异步落库：请求 200 返回后 log/quota 可能晚数百毫秒~数秒才写入，
+    轮询稳定比硬 sleep 更快也更确定（gate26 实测 stream:false 链路延迟可超 2s）。"""
+    deadline = time.time() + timeout
+    last = napi_get_quota(nid)
+    while time.time() < deadline:
+        time.sleep(0.4)
+        cur = napi_get_quota(nid)
+        if cur != last:
+            last = cur
+            continue
+        time.sleep(0.4)
+        if napi_get_quota(nid) == last:
+            return last
+    return last
+
+
 print("═══ 准备：注册审核 A/B/C 并充值 ¥10/¥50/¥0 ═══")
 cookies = {}
 nids = {}
@@ -126,7 +144,7 @@ s, r, _ = api("POST", "/anthropic/v1/messages", BODY, cookie=cookies["A"])
 ck("A耗尽后被拒", s in (402, 403), s)
 s, r, _ = api("POST", "/anthropic/v1/messages", BODY, cookie=cookies["B"])
 ck("B不受A影响可正常消费", s == 200, s)
-qb2 = napi_get_quota(nids["B"])
+qb2 = wait_quota_settled(nids["B"])
 ck("B余额仍然独立正确", qb2 < qb, (qb, qb2))
 
 print("\n═══ 4. 伪造 user_id / 越权参数 ═══")
@@ -166,7 +184,7 @@ c.commit()
 c.close()
 s, r, _ = api("POST", "/anthropic/v1/messages", BODY, cookie=cookies["B"])
 ck("过期用户调用计费代理被拒", s in (402, 403), s)
-ck("过期用户B余额未变动", napi_get_quota(nids["B"]) == qb2)
+ck("过期用户B余额未变动", wait_quota_settled(nids["B"], timeout=4.0) == qb2)
 
 print("\n═══ 7. 重复注册/重复绑定不会错绑 ═══")
 s, r, _ = api("POST", "/api/register", {"u": "rttest%s_iso_A" % TAG, "p": "isotest123"})
