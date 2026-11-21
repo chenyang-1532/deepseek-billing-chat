@@ -56,19 +56,19 @@ DeepSeek 官方 API（渠道 Key，模型 deepseek-flash）
 6. **收款码上传**：≤10MB（大图 Pillow 自动压缩），成功 303 带 `#sec-pay` 锚点直达区块；用户端点击可全屏放大
 7. **admin 面板**：页签式切换（body.tabbed，仅显示当前 sec；锚点/303 重定向直达对应页签并记忆上次页签）；顶部总览条（待审充值/用户数/总余额/今日消耗/未用充值码）；移动端表格卡片化（`table.cardable` + `data-l` 标签）；已拒绝/禁用用户可「删除」（级联清理 gateway_map、cloud_sessions、wallet_tx、pay_orders、new-api 用户/token，正常用户须先禁用）
 8. **注册**：免审批即 `approved`；登录页无任何审核文案
+9. **文件上传绕过 new-api**（v24 修复）：`/api/upload` 在网关模式下**不走 new-api**——new-api 对 `/v1/files` 按对话中转强制要求 model 参数（Files API 无 model 字段）→ 必 400「Model name not specified」。改用 `gw_files_key()` 读 new-api 渠道表里启用的 DeepSeek 官方 Key，直连 `/anthropic/v1/files`（x-api-key + anthropic-beta: files-api-2025-04-14）。与聊天渠道同一 DeepSeek 账号，file_id 照常引用；上传不计费，解析 token 在聊天时仍走 new-api 扣费。**若未来 new-api 增加多渠道轮询，此处需改为按渠道亲和上传**（单渠道部署无此问题）
 
 ## 5. 测试站（新功能开发环境）
 
-- 目录：`/tmp/chatsite-test`（git 仓库，与 GitHub `chenyang-1532/deepseek-billing-chat` main 同步）
-- **代码已与生产逐字节一致**（app.py md5 `d03d1c464007`、index.html md5 `dbd0acca1e35` 均相同）；`/opt/newapi/mock_upstream.py` 与 `tests/mock_upstream.py` 已同步
-- 启动：
+- 目录：服务器（生产同机）`/tmp/chatsite-test`（git 仓库，与 GitHub `chenyang-1532/deepseek-billing-chat` main 同步；本地沙箱同名目录为开发副本）。⚠️ 服务器 `/tmp` 重启会被清空，重建方法：解压 `~/chat-site-backup-v23-full-20261121.tar.gz` → 覆盖为最新 GitHub 代码 → touch gateway.on
+- **当前状态**（2026-11-21 v24）：app.py = 生产版（md5 `7d70dc7ed94d65d294a8223549206663`），监听 `127.0.0.1:3100`（3000 被开源雷达 node 服务占用）；data.db / one-api.db 均为 v23 备份的**独立副本**，与生产库完全隔离
+- 启动（服务器上）：
   ```bash
-  cd /tmp/chatsite-test && ADMIN_PASSWORD='WIyWKVcl5Ey5sM4K' \
-    NEWAPI_DB=/opt/newapi/one-api.db NEWAPI_BASE=http://127.0.0.1:3001 \
-    GW_DEFAULT_GIFT_CNY=0 python3.11 -m uvicorn app:app --host 0.0.0.0 --port 3000
+  cd /tmp/chatsite-test && RT_ALLOWED_DB_DIRS=/tmp ADMIN_PASSWORD='WIyWKVcl5Ey5sM4K' \
+    GATEWAY_ENABLED=1 NEWAPI_DB=/tmp/chatsite-test/one-api.db NEWAPI_BASE=http://127.0.0.1:13001 \
+    nohup /home/admin/chat-site/venv/bin/uvicorn app:app --host 127.0.0.1 --port 3100 > /tmp/test3100.log 2>&1 &
   ```
-- 管理密码 `WIyWKVcl5Ey5sM4K`
-- 上游：new-api/实测均可用；聊天走本地 3001（mock 或 new-api 实例）
+- 管理密码 `WIyWKVcl5Ey5sM4K`；上传链路测试直连真实 DeepSeek（用渠道 Key，测试上传会在官方账号留下小文件，无计费影响）
 
 ### 测试纪律
 
