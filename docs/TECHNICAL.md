@@ -1,0 +1,105 @@
+# Miandning AI（deepseek-billing-chat）技术文档
+
+> 更新日期：2026-11-21 · 代码版本：`c34c913`（v23 卡片化面板后）
+> 本文档与生产部署状态同步，测试站开发新功能前请先阅读第 2、5 节。
+
+## 1. 系统概述
+
+DeepSeek 风格的 AI 聊天站（仿 DeepSeek 官网 UI），采用**余额制计费**：
+用户注册即开通 → 扫码充值（站长人工审批）→ 对话按 token 实时扣费 → 余额归零拦截（402）。
+
+```
+用户浏览器 (SPA, main.fe540c09.js)
+    │  Anthropic 协议 /anthropic/v1/messages
+    ▼
+chat-site (FastAPI/uvicorn :8300, systemd)
+    │  网关代理：余额预检 → 改写模型/参数 → 计费 Key 注入
+    ▼
+new-api (127.0.0.1:13001, 仅本机可访问)
+    │  OpenAI 格式转发，quota 结算落库 one-api.db
+    ▼
+DeepSeek 官方 API（渠道 Key，模型 deepseek-flash）
+```
+
+- 前端：DeepSeek 官网复刻 SPA（React 压缩 bundle），内容变更必须**改名 bundle**（fe540c06→07→08→09）绕过 30 天 immutable 缓存
+- 后端：单文件 `app.py`（~4400 行），SQLite `data.db`（用户/充值单/流水/云备份）+ `one-api.db`（new-api 计费库）
+
+## 2. 生产环境（勿改动，仅供参照）
+
+| 项目 | 值 |
+|---|---|
+| 服务器 | `ssh admin@120.24.229.230`（密钥 `/tmp/prod_diag_key3`） |
+| 站点目录 | `/home/admin/chat-site/`（app.py + static/ + data.db） |
+| 服务 | `systemctl restart chat-site`（uvicorn :8300，nginx HTTPS 反代 chat.miandning.xyz） |
+| new-api | `127.0.0.1:13001`（3001 被 Gitea docker 占用；iptables 限本机） |
+| 计费库 | `/home/admin/new-api/one-api.db` |
+| 管理后台 | `/admin`，密码 `Wcy0511.` |
+| 最新全量备份 | `~/chat-site-backup-v23-full-20261121.tar.gz`（42MB，含 app.py/static/data.db/one-api.db） |
+| 历史备份 | `~/chat-site-backup-20261121/`、`~/chat-site-backup-v20/`（各次改动前的单文件备份） |
+
+## 3. 模型与计费（当前生产配置）
+
+- **站点对话模型**：`deepseek-flash`（API 名，背后是 DeepSeek-V4.1-Flash-1017）。网关把所有请求的 model 统一改写为此值，用户无感知也不可选
+- **上游链路**：chat-site → new-api「DeepSeek官方渠道」→ 官方 API，**原名直传无 model_mapping**
+- **计费口径**：官方 Flash 档实时价 × 倍率 **1.2**（四个模型名均 1.2）；峰谷自动切换（峰时=UTC 周一至周五 01:00-04:00 与 06:00-10:00，中国节假日全天谷时；CN_HOLIDAYS 已录入至 2027 年）
+- **模型名映射**：`deepseek-chat`→Flash 档、`deepseek-reasoner`→Pro 档（官方 legacy 规则）；`deepseek-v4-pro` 对应 DeepSeek-V4-Pro-0813
+- 切换站点模型：后台「定价」页签 →「站点对话模型」（倍率自动随档位匹配）
+- 站长赠送额度：环境变量 `GW_DEFAULT_GIFT_CNY`（当前 0，不赠送）
+
+## 4. 关键机制（改代码前必读）
+
+1. **充值审批 saga**（`/admin/wallet/pay`）：pending →(原子占单)→ processing →(幂等加款 `quota_ops` 唯一操作号)→ approved；崩溃/重试绝不重复加款。**页面表单必须携带 `action=approve/reject`**（v21 曾因漏字段导致点击无效）
+2. **余额调账**：`/admin/wallet/adjust` 带 `dir=add/deduct`，金额恒取绝对值、按按钮定方向（v20 修复扣减变充值）
+3. **幂等充值申请**：`/api/wallet/pay-request` 强制 `client_request_id`，重复提交返回同一订单
+4. **402 拦截**：余额 < ¥0.005 拒绝对话；前端「充值」链接原地打开钱包弹窗（`window.__gwOpenWallet`），不跳外部
+5. **SSE 兼容回退**：无 ReadableStream 的魔改内核（QQ 浏览器等）自动整包解析，避免原始 SSE 文本当错误显示
+6. **收款码上传**：≤10MB（大图 Pillow 自动压缩），成功 303 带 `#sec-pay` 锚点直达区块；用户端点击可全屏放大
+7. **admin 面板**：页签式切换（body.tabbed，仅显示当前 sec；锚点/303 重定向直达对应页签并记忆上次页签）；顶部总览条（待审充值/用户数/总余额/今日消耗/未用充值码）；移动端表格卡片化（`table.cardable` + `data-l` 标签）；已拒绝/禁用用户可「删除」（级联清理 gateway_map、cloud_sessions、wallet_tx、pay_orders、new-api 用户/token，正常用户须先禁用）
+8. **注册**：免审批即 `approved`；登录页无任何审核文案
+
+## 5. 测试站（新功能开发环境）
+
+- 目录：`/tmp/chatsite-test`（git 仓库，与 GitHub `chenyang-1532/deepseek-billing-chat` main 同步）
+- **代码已与生产逐字节一致**（app.py md5 `d03d1c464007`、index.html md5 `dbd0acca1e35` 均相同）；`/opt/newapi/mock_upstream.py` 与 `tests/mock_upstream.py` 已同步
+- 启动：
+  ```bash
+  cd /tmp/chatsite-test && ADMIN_PASSWORD='WIyWKVcl5Ey5sM4K' \
+    NEWAPI_DB=/opt/newapi/one-api.db NEWAPI_BASE=http://127.0.0.1:3001 \
+    GW_DEFAULT_GIFT_CNY=0 python3.11 -m uvicorn app:app --host 0.0.0.0 --port 3000
+  ```
+- 管理密码 `WIyWKVcl5Ey5sM4K`
+- 上游：new-api/实测均可用；聊天走本地 3001（mock 或 new-api 实例）
+
+### 测试纪律
+
+- 全套件入口：`RT_TAG=xx ADMIN_PW='WIyWKVcl5Ey5sM4K' RT_ALLOWED_DB_DIRS=/opt/newapi RT_SITE_DIR=/tmp/chatsite-test RT_NAPI_DB=/opt/newapi/one-api.db bash tests/run_all.sh`（18 套件）
+- 资金类套件必须指向**运行中**的库路径（静态副本探测必失败）
+- 注册接口限流 5/分：套件间用不同 `RT_TAG`，撞限流时等 65s 再跑
+- 改动后最低回归：`regression_3000.sh`(58) + `test_pay_model.py`(62) + `test_ui_smoke.py`(35) 三件套
+- 推送 GitHub 偶发 TLS 断连：循环重试至 `git ls-remote` 确认远端 HEAD 为本地提交
+
+## 6. 部署流程（测试站 → 生产）
+
+1. 测试站全套件绿 → commit → push GitHub
+2. 备份生产对应文件（现已有 v23 全量包，单文件改动可 cp 到 `~/chat-site-backup-v20/`）
+3. `scp` 变更文件到 `/home/admin/chat-site/`；**前端 bundle 必须改名**并同步改 `static/index.html` 引用
+4. `sudo systemctl restart chat-site`；验证：`systemctl is-active` + 首页 303 + bundle 引用名
+5. 真浏览器冒烟（注册→登录→发消息→钱包→后台），测试号清理
+
+## 7. 环境变量（chat-site）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ADMIN_PASSWORD` | 必设 | 管理后台密码 |
+| `NEWAPI_DB` | 必设 | one-api.db 路径 |
+| `NEWAPI_BASE` | 必设 | new-api 地址（生产 `http://127.0.0.1:13001`） |
+| `GW_DEFAULT_GIFT_CNY` | 0 | 新用户赠送金额（元） |
+| `GW_UPSTREAM_BASE` | https://api.deepseek.com | 网关上游 |
+| `SITE_TZ` | Asia/Shanghai | 时段倍率/今日消费/时间戳基准 |
+
+## 8. 常见运维
+
+- 看生产日志：`sudo journalctl -u chat-site --since 'HH:MM' --no-pager`
+- 计费落账查询：one-api.db `logs` 表（type=2 为消费），`users.quota` 为余额（quota/1000000×7.2=人民币元；换算基准 `cny_to_quota = cny×1000000/7.2`）
+- 官方价每 10 分钟自动抓取（api-docs.deepseek.com/quick_start/pricing），抓取失败>24h 后台顶部会出现红色告警条
+- 用户反馈「看不到新功能」：先让用户强刷——bundle 改名策略下不存在缓存问题，若未改名则会命中 30 天缓存
