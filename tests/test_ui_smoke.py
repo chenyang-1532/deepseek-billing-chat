@@ -312,23 +312,17 @@ def main():
             body_adm = pageAdm.evaluate("() => (document.body.textContent||'')")
             ck("管理UI：面板渲染（表格/公告框）", "class=\"tscroll" in pageAdm.content()
                and "textarea" in pageAdm.content())
-            ck("管理UI：待审核用户出现在面板", U_C in body_adm)
-            # 审批真实点按：定位 U_C 所在行 → 通过
+            ck("管理UI：用户出现在面板", U_C in body_adm)
+            # 余额制：注册即开通（免审批），面板用户表改为余额列——
+            # 原审批点按用例改为：定位 U_C 所在行，断言行内含余额列（¥金额 或 未开通）
             row = pageAdm.locator('tr', has_text=U_C).first
-            approved = False
+            bal_ok = False
             if row.count():
-                dsel = row.locator('input[name=days], select[name=days]')
-                if dsel.count() and dsel.first.evaluate("e=>e.tagName") == "INPUT":
-                    dsel.first.fill("30")
-                row.locator('button:has-text("通过")').first.click()
-                pageAdm.wait_for_load_state("networkidle")
-                pageAdm.wait_for_timeout(1000)
-                st = sqlite3.connect(SITE_DB, timeout=15).execute(
-                    "SELECT status FROM users WHERE username=?", (U_C,)).fetchone()
-                approved = bool(st) and st[0] == "approved"
-            ck("管理UI：审批点按→用户状态 approved", approved)
+                rtext = row.evaluate("e => e.textContent")
+                bal_ok = ("¥" in rtext) or ("未开通" in rtext)
+            ck("管理UI：用户行显示余额列(余额制)", bal_ok)
             save_shot(pageAdm, "admin_approve")
-            # 审批后 C 正常登录进入聊天页（B2 收尾 + 验证审批生效）
+            # 注册即开通：C 直接登录进入聊天页（原「审批后登录」语义）
             ui_login(pageA, U_C, PWD)
             ck("登录UI：审批后正常登录进入聊天页", pageA.url.rstrip("/") == BASE,
                pageA.url)

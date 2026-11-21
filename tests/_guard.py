@@ -201,6 +201,10 @@ def probe_billing_or_skip(base: str, site_db: str, napi_db: str, tag: str) -> No
         sys.exit(3)
     nid = mrow[0]
     nc = _sq3.connect(napi_db, timeout=15)
+    # 余额制（GW_DEFAULT_GIFT_CNY 默认 0）：探测账号不再依赖开通赠送跑通首笔，
+    # 直接 SQL 充 ¥10（694444 quota）——余额不足 402 时说明网关活着但无记账样本，照样 SKIP
+    nc.execute("UPDATE users SET quota=quota+694444 WHERE id=?", (nid,))
+    nc.commit()
     before = nc.execute("SELECT COALESCE(MAX(id),0) FROM logs WHERE user_id=?", (nid,)).fetchone()[0]
     nc.close()
     st, body, _ = _req("POST", "/anthropic/v1/messages",

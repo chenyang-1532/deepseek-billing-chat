@@ -407,7 +407,7 @@ async function doLogin(e){e.preventDefault();
  var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({u:document.getElementById('li-user').value.trim(),p:document.getElementById('li-pw').value})});
  var d=await r.json();
- if(d.ok){location.href='/';}else{show(d.msg,'err');}return false;}
+ if(d.ok){try{localStorage.setItem('chat-demo:username',document.getElementById('li-user').value.trim())}catch(e){}location.href='/';}else{show(d.msg,'err');}return false;}
 async function doReg(e){e.preventDefault();
  var r=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({u:document.getElementById('rg-user').value.trim(),p:document.getElementById('rg-pw').value})});
@@ -431,7 +431,8 @@ LOGIN_FORMS = """
   <form onsubmit="return doReg(event)">
     <label>用户名（2-24位，字母数字下划线中文）</label><input id="rg-user" autocomplete="username">
     <label>密码（至少6位）</label><input id="rg-pw" type="password" autocomplete="new-password">
-    <button>提交注册申请</button>
+    <button>注 册</button>
+    <p style="font-size:12px;color:#64748b;margin-top:10px">注册即开通，充值后即可使用（按余额计费）。</p>
   </form>
 </div>"""
 
@@ -536,7 +537,7 @@ textarea:focus{outline:none;border-color:#4f46e5;box-shadow:0 0 0 3px #eef2ff}
 </style></head><body><div class="wrap">
 <div class="bar"><h1>管理面板</h1>
 <form action="/admin/logout" method="get"><button class="btn ghost sm">退出</button></form></div>
-<div class="sub">待审核与续期申请自动置顶。通过=开通会员并设有效期；续期=在当前有效期基础上追加天数；余额调整实时生效。</div>
+<div class="sub">按余额计费：注册即开通，充值/余额调整实时生效；余额为 0 时无法对话。</div>
 <nav class="nav">
 <a href="#sec-announce">公告</a><a href="#sec-users">用户</a><a href="#sec-wallet">计费</a><a href="#sec-codes">充值码</a><a href="#sec-ratios">定价</a><a href="#sec-pay">充值审批{{paybadge}}</a><a href="#sec-tx">流水</a>
 </nav>
@@ -611,7 +612,11 @@ _BODY_LIMIT_RULES = (
     ("/api/upload", "UPLOAD_MAX_BYTES"),
     ("/api/backup", "BACKUP_MAX_BYTES"),
     ("/anthropic/", "GW_BODY_MAX_BYTES"),
+    # 收款码上传：手机拍照二维码普遍 3-8MB，默认 2MB 会直接 413 且浏览器只收到
+    # JSON 无跳转（用户侧表现就是"上传不了"）；放宽到 10MB，应用层再自动压缩
+    ("/admin/wallet/qr", "QR_UPLOAD_MAX_BYTES"),
 )
+QR_UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 
 
 # 提前返回 413/503 前必须先消费掉请求体：客户端还在写 body 时直接关连接，
@@ -840,15 +845,18 @@ async def api_register(request: Request):
     if len(p) < 6:
         return JSONResponse({"ok": False, "msg": "密码至少6位"})
     _pw_hash = await run_in_threadpool(hash_pw, p)   # 审查 R12/P2：同上，勿阻塞事件循环
+    # 余额制改造：注册即开通（免审批），有效期设 10 年（余额制下仅作兼容占位，
+    # 实际可用性由账户余额决定）；赠送额度默认 0，站长可用 GW_DEFAULT_GIFT_CNY 调整。
     with db() as c:
         try:
             c.execute(
-                "INSERT INTO users(username,pw_hash,created_at) VALUES(?,?,?)",
+                "INSERT INTO users(username,pw_hash,created_at,status,expiry) VALUES(?,?,?,'approved',"
+                "date('now','localtime','+3650 days'))",
                 (u, _pw_hash, site_now().isoformat(timespec="seconds")),
             )
         except sqlite3.IntegrityError:
             return JSONResponse({"ok": False, "msg": "用户名已存在"})
-    return JSONResponse({"ok": True, "msg": "注册成功！已提交管理员审核，请等待通过后登录。"})
+    return JSONResponse({"ok": True, "msg": "注册成功，请登录"})
 
 @app.post("/api/login")
 async def api_login(request: Request):
@@ -896,9 +904,23 @@ def api_me(request: Request):
     user = get_user(request)
     if user is None:
         return JSONResponse({"ok": False})
+    # 余额制：返回实时账户余额（网关未开通/关闭时为 None，前端显示未开通）
+    balance_cny = None
+    if gw_enabled():
+        try:
+            with db() as c:
+                m = c.execute("SELECT napi_uid FROM gateway_map WHERE uid=?", (user["id"],)).fetchone()
+            if m:
+                with napi_connect() as nc:
+                    u = nc.execute("SELECT quota FROM users WHERE id=?", (m["napi_uid"],)).fetchone()
+                if u:
+                    balance_cny = round(quota_to_cny(u["quota"] or 0), 2)
+        except Exception:  # noqa: BLE001
+            balance_cny = None
     return JSONResponse({
         "ok": True, "username": user["username"], "status": user["status"],
         "expiry": user["expiry"], "expired": is_expired(user), "days_left": days_left(user),
+        "balance_cny": balance_cny,
         # 指定账号隐藏"会员剩余天数"角标（如宣传截图专用账号 admin）
         "hide_membership": user["username"] in HIDE_MEMBERSHIP_USERS,
         # 网关计费开启时，前端据此免 API Key 并显示钱包入口
@@ -1497,12 +1519,12 @@ def status_page_html(user) -> str:
         renew = "none"
     else:
         if is_expired(user):
-            st_text = "会员已到期"
-            detail = f"会员已于 {_e(user['expiry'])} 到期，可申请续期，管理员确认后即可继续使用。"
-            renew = "block"
+            st_text = "账户已停用"
+            detail = "账户状态异常，请联系管理员处理。"
+            renew = "none"
         else:
             st_text = "正常"
-            detail = f"会员有效期至 {user['expiry']}（剩 {days_left(user)} 天）。"
+            detail = f"账户状态正常，按余额计费。"
             renew = "none"
     html = STATUS_PAGE.replace("{{status_text}}", st_text).replace("{{detail}}", detail)
     return html.replace("{{renew_display}}", renew)
@@ -1630,6 +1652,7 @@ def admin_page(request: Request):
 
     # ── 网关计费（new-api 集成） ──
     wallet_html = None
+    balance_of = {}   # uid -> 余额(¥)（gw_enabled 时填充；用户管理表"余额"列用）
     if gw_enabled():
         try:
             with napi_connect() as nc:
@@ -1688,7 +1711,7 @@ def admin_page(request: Request):
                         f'<input class="num" name="amount" value="10" inputmode="decimal" aria-label="金额">'
                         f'<span class="unit">元</span>'
                         f'<button class="btn sm">开通并充值</button>'
-                        f'<span class="hint">首次对话/充值时自动开通，赠 ¥{GW_DEFAULT_GIFT_CNY:.2f}</span></form>'
+                        f'<span class="hint">输入 new-api 内部用户名（site{uid}_…）精确调整；余额实时同步</span></form>'
                     )
                 else:
                     bal_cell = f'<span class="money">¥{balance_of.get(uid, 0):.2f}</span>'
@@ -1981,7 +2004,7 @@ def admin_page(request: Request):
             qr_img = (f'<img src="/pay-qr?ts={int(time.time())}" alt="收款码" '
                       f'style="width:150px;height:150px;object-fit:contain;border:1px solid #e2e8f0;border-radius:8px;background:#fff">'
                       if has_qr else '<span class="dim">尚未上传收款码</span>')
-            qr_err_map = {"size": "图片超过 2MB", "type": "只支持 png/jpg 图片", "1": "请选择文件"}
+            qr_err_map = {"size": "图片超过 10MB", "type": "只支持 png/jpg 图片", "1": "请选择文件"}
             qr_flash = (
                 '<div class="flash err">%s</div>' % qr_err_map.get(request.query_params.get("qr_err", ""), "上传失败")
                 if request.query_params.get("qr_err") else
@@ -1996,7 +2019,7 @@ def admin_page(request: Request):
                 + '<form method="post" action="/admin/wallet/qr" enctype="multipart/form-data" class="inline">'
                 '<input type="file" name="file" accept="image/png,image/jpeg" aria-label="收款码图片">'
                 '<button class="btn sm">上传/更换收款码</button>'
-                '<span class="hint">png/jpg，≤2MB；用户在钱包页扫码付款</span></form></div>'
+                '<span class="hint">png/jpg，≤10MB（大图自动压缩）；上传后自动定位到本区块</span></form></div>'
                 + f'<div class="kpi" style="margin-bottom:8px"><div class="l">待审充值申请</div><div class="v">{len(pending_pays)}</div></div>'
                 + '<div class="tscroll opsfix"><table><thead><tr><th>单号</th><th>申请时间</th><th>用户</th>'
                 '<th class="ta-r">金额</th><th>操作</th></tr></thead><tbody>' + pay_rows + '</tbody></table></div>'
@@ -2011,7 +2034,6 @@ def admin_page(request: Request):
                     if request.query_params.get("action_err") == "1" else "")
     user_rows = []
     for r in rows:
-        left = f"{days_left(r)}天" if r["status"] == "approved" and r["expiry"] and not is_expired(r) else "—"
         ops = []
         if r["status"] != "approved":
             ops.append(
@@ -2020,11 +2042,7 @@ def admin_page(request: Request):
                 f'<span class="unit">天</span><button class="btn sm">通过</button></form>'
             )
         if r["status"] == "approved":
-            ops.append(
-                f'<form method="post" action="/admin/action" class="inline"><input type="hidden" name="uid" value="{r["id"]}">'
-                f'<input type="hidden" name="action" value="renew"><input class="num" name="days" value="30" inputmode="numeric" aria-label="天数">'
-                f'<span class="unit">天</span><button class="btn sm ghost">续期</button></form>'
-            )
+            pass  # 余额制：到期/续期概念已移除，仅保留禁用/启用与余额调整
         if r["status"] == "pending":
             # 审查 R12/P2：只有待审核用户才显示「拒绝」。对已开通用户误点会把状态改成
             # rejected，用户登录看到「注册申请未通过」，与「禁用」语义混淆（实测）。
@@ -2049,6 +2067,11 @@ def admin_page(request: Request):
         elif r["note"]:
             status_tag += f' <span class="dim">{html.escape(str(r["note"]))}</span>'
         expiry_line = html.escape(r["expiry"]) if r["expiry"] else "—"
+        # 余额制：用户管理表直接显示账户余额（来自 new-api 实时 quota），替代旧的到期天数
+        if r["id"] in balance_of:
+            bal_cell = f'<span class="money">¥{balance_of[r["id"]]:.2f}</span>'
+        else:
+            bal_cell = '<span class="dim">未开通</span>'
         backup_mb = sizes.get(r["id"], 0) / 1048576
         backup_cell = (
             f'<span class="num2">{backup_mb:.1f} MB / 200 MB（{backup_mb / 204.8:.0f}%）</span>'
@@ -2059,7 +2082,7 @@ def admin_page(request: Request):
         user_rows.append(
             f'<tr{row_cls}><td class="uname">{html.escape(str(r["username"]))}</td>'
             f'<td>{status_tag}</td>'
-            f'<td class="num2">{expiry_line}<span class="dim">（剩 {left}）</span></td>'
+            f'<td class="num2">{bal_cell}</td>'
             f'<td>{backup_cell}</td>'
             f'<td><div class="ops">{"".join(ops)}</div></td></tr>'
         )
@@ -2069,7 +2092,7 @@ def admin_page(request: Request):
         + action_flash
         + backup_strip
         + '<div class="tscroll opsfix"><table><thead><tr>'
-        '<th>用户</th><th>状态</th><th>到期</th><th>云端备份</th><th>操作</th></tr></thead><tbody>'
+        '<th>用户</th><th>状态</th><th>余额</th><th>云端备份</th><th>操作</th></tr></thead><tbody>'
         + ("".join(user_rows) or '<tr><td colspan="5" class="dim" style="text-align:center;padding:18px">暂无用户</td></tr>')
         + '</tbody></table></div></section>'
     )
@@ -2289,7 +2312,7 @@ NEWAPI_DB = os.environ.get("NEWAPI_DB", "/opt/newapi/one-api.db")
 GW_UPSTREAM_BASE = os.environ.get("GW_UPSTREAM_BASE", "https://api.deepseek.com")
 QUOTA_PER_USD = 500000          # new-api 计量单位：500000 quota = $1
 USD_TO_CNY = 7.2                # 余额展示汇率
-GW_DEFAULT_GIFT_CNY = float(os.environ.get("GW_DEFAULT_GIFT_CNY", "2"))  # 开通赠送
+GW_DEFAULT_GIFT_CNY = float(os.environ.get("GW_DEFAULT_GIFT_CNY", "0"))  # 开通赠送（余额制：默认 0，站长可环境变量调整）
 GW_REDEEM_RATE_LIMIT = 5        # 兑换接口限流：每账号每分钟最多尝试次数
 GW_BODY_MAX_BYTES = 10 * 1024 * 1024   # 网关代理请求体上限 10MB
 
@@ -2302,6 +2325,25 @@ GW_PAY_MAX_PENDING = 5          # 单用户同时在审订单上限
 GW_MAX_TOKENS_CAP = 8192        # 单请求输出 token 硬上限
 GW_MAX_TOKENS_DEFAULT = 4096    # 请求缺省 max_tokens 时的服务端默认值
 QR_PATH = os.path.join(BASE, "pay_qr.png")   # 站长收款码落盘位置
+
+
+def _shrink_image(data, max_side=1200):
+    """大图压缩重编码为 png（长边 ≤ max_side）。返回 (png_bytes,) 或 None（无 Pillow）。"""
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(data))
+        img = img.convert("RGB")
+        w, h = img.size
+        scale = min(1.0, max_side / max(w, h))
+        if scale < 1.0:
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        out = buf.getvalue()
+        return out if len(out) < len(data) else None
+    except Exception:  # noqa: BLE001
+        return None
 
 # ── 官方价 × 倍数 定价模式 ──
 # 官方价来源：https://api-docs.deepseek.com/quick_start/pricing（美元 / 每百万 tokens）
@@ -2927,9 +2969,9 @@ def gw_provision(user):
             "ON CONFLICT(uid) DO UPDATE SET napi_uid=excluded.napi_uid, token_key=excluded.token_key",
             (uid, nid, key),
         )
-        # gift 流水去重：只有首次开通才记一条
+        # gift 流水去重：只有首次开通且赠送额度 >0 才记一条（余额制默认 0 赠送）
         already = c.execute("SELECT 1 FROM wallet_tx WHERE uid=? AND type='gift'", (uid,)).fetchone()
-        if not already:
+        if not already and GW_DEFAULT_GIFT_CNY > 0:
             _wallet_tx(c, uid, "gift", GW_DEFAULT_GIFT_CNY, quota_to_cny(gift_quota), "开通赠送")
     return key, nid
 
@@ -4008,29 +4050,40 @@ async def admin_wallet_pay(request: Request, oid: int = Form(...), action: str =
 
 @app.post("/admin/wallet/qr")
 async def admin_wallet_qr(request: Request, file: UploadFile = File(None)):
-    """上传站长收款二维码（png/jpg，≤2MB）"""
+    """上传站长收款二维码（png/jpg，≤10MB；超大图自动压缩重编码）
+    修复：此前 303 回 /admin 不带锚点，页面跳回最顶部、成功/失败提示埋在
+    #sec-pay 区块深处视口外，站长误以为"划到最上方、上传不了"。现重定向
+    统一带 #sec-pay 锚点直达收款码区块。"""
     if not is_admin(request):
         return RedirectResponse("/admin", status_code=303)
     if file is None or not file.filename:
-        return RedirectResponse("/admin?qr_err=1", status_code=303)
+        return RedirectResponse("/admin?qr_err=1#sec-pay", status_code=303)
     data = await file.read()
-    if len(data) > 2 * 1024 * 1024 or not data:
-        return RedirectResponse("/admin?qr_err=size", status_code=303)
+    if not data or len(data) > 10 * 1024 * 1024:
+        return RedirectResponse("/admin?qr_err=size#sec-pay", status_code=303)
     kind = (file.content_type or "").lower()
     if not kind.startswith("image/"):
-        return RedirectResponse("/admin?qr_err=type", status_code=303)
+        return RedirectResponse("/admin?qr_err=type#sec-pay", status_code=303)
     # 魔数校验：只收 png/jpeg，防止伪装成图片的任意文件
     is_png = data[:8] == b"\x89PNG\r\n\x1a\n"
     is_jpg = data[:3] == b"\xff\xd8\xff"
     if not (is_png or is_jpg):
-        return RedirectResponse("/admin?qr_err=type", status_code=303)
+        return RedirectResponse("/admin?qr_err=type#sec-pay", status_code=303)
+    # 大图（>2MB）或尺寸超大时自动压缩重编码为 png（手机拍照收款码普遍 3-8MB）
+    if len(data) > 2 * 1024 * 1024:
+        shrunk = _shrink_image(data)
+        if shrunk is not None:
+            data, is_png, is_jpg = shrunk, True, False
+        else:
+            # 无 Pillow 环境：退回 2MB 硬限制
+            return RedirectResponse("/admin?qr_err=size#sec-pay", status_code=303)
     with open(QR_PATH, "wb") as f:
         f.write(data)
     os.chmod(QR_PATH, 0o644)
     with open(QR_PATH + ".type", "w") as f:
         f.write("image/png" if is_png else "image/jpeg")
     print("[pay] 收款码已更新 %d bytes (%s)" % (len(data), kind))
-    return RedirectResponse("/admin?qr_ok=1", status_code=303)
+    return RedirectResponse("/admin?qr_ok=1#sec-pay", status_code=303)
 
 
 # ---------- 门禁 + 静态托管（必须放在最后） ----------

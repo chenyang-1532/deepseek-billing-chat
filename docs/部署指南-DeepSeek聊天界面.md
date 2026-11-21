@@ -41,6 +41,7 @@ cp -a /path/to/secret.key /backup/secret.key   # 0600 权限一并保留
 | `SITE_TZ` | **站点时区（默认 Asia/Shanghai）**：时段倍率规则、"今日消费"起点、订单/流水时间戳的基准。Docker/云主机默认 UTC 会导致规则整体偏 8 小时——**务必显式设置** `SITE_TZ=Asia/Shanghai`（systemd: `Environment=SITE_TZ=Asia/Shanghai`；docker: `-e SITE_TZ=Asia/Shanghai`）。启动日志会打印生效时区。官方峰谷判定例外：固定按 UTC（DeepSeek 官方口径） |
 | `NEWAPI_DB` | new-api 库路径（默认 `/opt/newapi/one-api.db`），站点直连其 options/users 表 |
 | `GATEWAY_ENABLED` | 网关计费总开关（环境变量），配合 `gateway.on` 文件双保险 |
+| `GW_DEFAULT_GIFT_CNY` | 新用户开通赠送余额（**默认 0，即不给免费额度**，站长可设如 `GW_DEFAULT_GIFT_CNY=2`）。余额制下注册即开通，可用性完全由余额决定 |
 | `data.db` 设置表 | `gw_default_model`（强制改写的模型）、`gw_multipliers`（每模型倍数）、时段倍率规则等，管理面板可改 |
 
 ## 四、部署步骤

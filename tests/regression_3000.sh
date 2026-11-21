@@ -93,7 +93,7 @@ echo "$R" | grep -q '"ok":true'; ck "正常注册成功" 0 $?
 R=$(curl -s -m 10 -X POST $BASE/api/register -H "Content-Type: application/json" -d "{\"u\":\"$RREG\",\"p\":\"rtpass123\"}")
 echo "$R" | grep -q '"ok":false'; ck "重复用户名被拒" 0 $?
 R=$(curl -s -m 10 -X POST $BASE/api/login -H "Content-Type: application/json" -d "{\"u\":\"$RREG\",\"p\":\"rtpass123\"}")
-echo "$R" | grep -q '等待管理员审核'; ck "未审核用户登录被拦" 0 $?
+echo "$R" | grep -q '"ok":true'; ck "注册即开通(免审批,登录不再被审核拦截)" 0 $?
 R=$(curl -s -m 10 -X POST $BASE/api/login -H "Content-Type: application/json" -d "{\"u\":\"$RREG\",\"p\":\"wrongpass\"}")
 echo "$R" | grep -q '"ok":false'; ck "错误密码被拒" 0 $?
 
@@ -114,8 +114,8 @@ TUID=$(dbq "c.execute(\"SELECT id FROM users WHERE username='$RREG'\").fetchone(
 ck "能查到测试用户ID(本机直查)" 1 "$(echo "$TUID" | grep -cE '^[0-9]+$')"
 curl -s -b $A_JAR -m 10 -X POST $BASE/admin/action -d "uid=$TUID&action=approve&days=30" -o /dev/null
 EXP=$(dbq "c.execute(\"SELECT expiry FROM users WHERE username='$RREG'\").fetchone()[0]")
-TODAY=$(date +%F); EXPECT=$(date -d "$TODAY +30 days" +%F 2>/dev/null || date -v+30d +%F)
-ck "审核通过→到期日=今天+30($EXPECT)" "$EXPECT" "$EXP"
+TODAY=$(date +%F); EXPECT=$(date -d "$TODAY +3650 days" +%F 2>/dev/null || date -v+3650d +%F)
+ck "注册即开通→占位有效期=今天+3650天($EXPECT)" "$EXPECT" "$EXP"
 
 echo "═══ 五、登录态与聊天页 ═══"
 MAXAGE=$(curl -s -D - -o /dev/null -m 10 -X POST $BASE/api/login -H "Content-Type: application/json" -d "{\"u\":\"$RREG\",\"p\":\"rtpass123\"}" | grep -i set-cookie | grep -o "Max-Age=[0-9]*")
@@ -132,7 +132,8 @@ ck "HTML入口 no-store" "no-store, must-revalidate" "$CC"
 CC=$(curl -s -b $U_JAR -m 10 -D - -o /dev/null $BASE/static/js/$MAIN_JS | grep -i "^cache-control" | sed 's/^[Cc]ache-[Cc]ontrol: //' | tr -d "\r")
 ck "哈希JS immutable 长缓存" "public, max-age=2592000, immutable" "$CC"
 R=$(curl -s -b $U_JAR -m 10 $BASE/api/me)
-echo "$R" | grep -q '"days_left":30'; ck "/api/me 剩余30天" 0 $?
+echo "$R" | grep -q '"days_left":3[0-9][0-9][0-9]'; ck "/api/me 占位有效期>3000天(余额制不依赖到期)" 0 $?
+echo "$R" | grep -q '"balance_cny"'; ck "/api/me 返回余额字段(余额制)" 0 $?
 LOC=$(curl -s -b $U_JAR -m 10 -D - -o /dev/null $BASE/login | grep -i '^location' | tr -d "\r")
 ck "已登录访问/login→自动跳回对话页" "location: /" "$LOC"
 
@@ -169,16 +170,14 @@ CODE=$(curl -s -m 15 -b $U_JAR -X POST "$BASE/api/upload?name=t.txt" -o /dev/nul
 case "$CODE" in 400|404|502|503) CKOK=0;; *) CKOK=1;; esac
 ck "网关模式upload无需客户端Key(不再要求x-api-key)($CODE)" "$CKOK" "0"
 
-echo "═══ 八、续期流程 ═══"
+echo "═══ 八、余额制（续期接口保留兼容、面板改余额列） ═══"
 R=$(curl -s -b $U_JAR -m 10 -X POST $BASE/api/request-renewal)
-echo "$R" | grep -q '"ok":true'; ck "用户申请续期" 0 $?
-R=$(curl -s -b $U_JAR -m 10 -X POST $BASE/api/request-renewal)
-echo "$R" | grep -q '已提交过'; ck "重复申请被拦" 0 $?
+echo "$R" | grep -q '"ok"'; ck "续期接口保留(老数据兼容)" 0 $?
 BODY=$(curl -s -b $A_JAR -m 10 $BASE/admin)
-echo "$BODY" | grep -q '申请续期'; ck "面板显示续期申请标记" 0 $?
-curl -s -b $A_JAR -m 10 -X POST $BASE/admin/action -d "uid=$TUID&action=renew&days=15" -o /dev/null
+echo "$BODY" | grep -q '<th>余额</th>'; ck "面板用户表表头为余额(替代到期)" 0 $?
+echo "$BODY" | grep -q 'class="money">¥'; ck "面板用户行显示余额金额" 0 $?
 DL=$(curl -s -b $U_JAR -m 10 $BASE/api/me | grep -o '"days_left":[0-9]*' | cut -d: -f2)
-ck "续期15天→剩余45天" 45 "$DL"
+[ "$DL" -ge 3000 ] 2>/dev/null; ck "占位有效期≥3000天(续期概念已废)" 0 $?
 
 echo "═══ 九、公告系统 ═══"
 curl -s -b $A_JAR -m 10 -X POST $BASE/admin/announce --data-urlencode "text=回归测试公告ABC123" -o /dev/null
