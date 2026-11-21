@@ -542,7 +542,18 @@ textarea:focus{outline:none;border-color:#4f46e5;box-shadow:0 0 0 3px #eef2ff}
 （容器带 .opsfix 类）生效——不加类名的表（记录/统计类）不钉背景，避免末列
 统一变纯白打破斑马纹，也避开 border-collapse 下部分浏览器 sticky 错位。 */
 .tscroll.opsfix th:last-child,.tscroll.opsfix td:last-child{position:sticky;right:0;background:#fff;box-shadow:-6px 0 8px -6px rgba(15,23,42,.12)}
-.tscroll.opsfix tbody tr:hover td:last-child{background:#fafbfc}}
+.tscroll.opsfix tbody tr:hover td:last-child{background:#fafbfc}
+/* 移动端卡片式表格：免横向滚动，整行一眼看完 */
+table.cardable{display:block}
+table.cardable thead{display:none}
+table.cardable tbody{display:block}
+table.cardable tr{display:block;border:1px solid #e7eaee;border-radius:10px;padding:8px 10px;margin-bottom:10px;background:#fff}
+table.cardable tr.hot{background:#fffbeb;border-color:#f5e0a3}
+table.cardable td{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:5px 0;border-bottom:0;text-align:right;white-space:normal}
+table.cardable td[data-l]::before{content:attr(data-l);color:#64748b;font-size:12px;flex:none;text-align:left}
+table.cardable td.uname{font-size:14px}
+table.cardable td:last-child{position:static;box-shadow:none;border-top:1px dashed #e7eaee;margin-top:6px;padding-top:9px;flex-wrap:wrap;justify-content:flex-start}
+table.cardable tbody tr:hover td:last-child{background:transparent}}
 </style></head><body><div class="wrap">
 <div class="bar"><h1>管理面板</h1>
 <form action="/admin/logout" method="get"><button class="btn ghost sm">退出</button></form></div>
@@ -1767,10 +1778,10 @@ def admin_page(request: Request):
                         f'<button class="btn sm danger" name="dir" value="deduct" data-confirm="确认真金白银扣减该用户余额？">扣减</button></form>'
                     )
                 lines.append(
-                    f'<tr><td class="uname">{uname}</td>'
-                    f'<td class="ta-r">{bal_cell}</td>'
-                    f'<td class="ta-r">{used_cell}</td>'
-                    f'<td class="ta-r">{today_cell}</td>'
+                    f'<tr><td class="uname" data-l="用户">{uname}</td>'
+                    f'<td class="ta-r" data-l="余额">{bal_cell}</td>'
+                    f'<td class="ta-r num2" data-l="累计消耗">{used_cell}</td>'
+                    f'<td class="ta-r num2" data-l="今日">{today_cell}</td>'
                     f'<td><div class="ops">{ops}</div></td></tr>'
                 )
             with db() as c:
@@ -1853,7 +1864,7 @@ def admin_page(request: Request):
                 '<section class="sec" id="sec-wallet"><div class="sec-h"><h2>网关计费 · 用户余额</h2>'
                 '<span class="hint">余额实时来自 new-api，充值/扣减同步记账</span></div>'
                 + kpis
-                + '<div class="tscroll opsfix"><table><thead><tr>'
+                + '<div class="tscroll opsfix"><table class="cardable"><thead><tr>'
                 '<th>用户</th><th class="ta-r">余额</th><th class="ta-r">累计消耗</th>'
                 '<th class="ta-r">今日</th><th>调整余额</th></tr></thead><tbody>'
                 + lines_html + '</tbody></table></div></section>'
@@ -2036,9 +2047,9 @@ def admin_page(request: Request):
                     "SELECT id, username, cny, status, created_at, handled_at FROM pay_orders "
                     "WHERE status!='pending' ORDER BY id DESC LIMIT 10").fetchall()
             pay_rows = "".join(
-                f'<tr><td>{p["id"]}</td><td class="num2 dim">{html.escape(str(p["created_at"])[:16])}</td>'
-                f'<td>{html.escape(str(p["username"]))}</td>'
-                f'<td class="ta-r money">¥{p["cny"]:.2f}</td>'
+                f'<tr><td data-l="单号">{p["id"]}</td><td class="num2 dim" data-l="申请时间">{html.escape(str(p["created_at"])[:16])}</td>'
+                f'<td data-l="用户">{html.escape(str(p["username"]))}</td>'
+                f'<td class="ta-r money" data-l="金额">¥{p["cny"]:.2f}</td>'
                 f'<td><form method="post" action="/admin/wallet/pay" class="inline">'
                 f'<input type="hidden" name="oid" value="{p["id"]}">'
                 f'<input type="hidden" name="action" value="approve">'
@@ -2078,7 +2089,7 @@ def admin_page(request: Request):
                 '<button class="btn sm">上传/更换收款码</button>'
                 '<span class="hint">png/jpg，≤10MB（大图自动压缩）；上传后自动定位到本区块</span></form></div>'
                 + f'<div class="kpi" style="margin-bottom:8px"><div class="l">待审充值申请</div><div class="v">{len(pending_pays)}</div></div>'
-                + '<div class="tscroll opsfix"><table><thead><tr><th>单号</th><th>申请时间</th><th>用户</th>'
+                + '<div class="tscroll opsfix"><table class="cardable"><thead><tr><th>单号</th><th>申请时间</th><th>用户</th>'
                 '<th class="ta-r">金额</th><th>操作</th></tr></thead><tbody>' + pay_rows + '</tbody></table></div>'
                 + '<div class="sec-h" style="margin-top:14px"><h3 style="font-size:14px">最近处理记录</h3></div>'
                 + '<div class="tscroll"><table><thead><tr><th>处理时间</th><th>用户</th>'
@@ -2089,10 +2100,12 @@ def admin_page(request: Request):
     npending = sum(1 for r in rows if r["status"] == "pending")
     action_flash = ('<div class="flash err">只有「待审核」用户可以拒绝；已开通用户请用「禁用」。</div>'
                     if request.query_params.get("action_err") == "1" else "")
+    if request.query_params.get("action_err") == "2":
+        action_flash += '<div class="flash err">只能删除「已拒绝」或「已禁用」的账号；正常用户请先禁用。</div>'
     user_rows = []
     for r in rows:
         ops = []
-        if r["status"] != "approved":
+        if r["status"] in ("pending", "rejected"):
             ops.append(
                 f'<form method="post" action="/admin/action" class="inline"><input type="hidden" name="uid" value="{r["id"]}">'
                 f'<input type="hidden" name="action" value="approve"><input class="num" name="days" value="30" inputmode="numeric" aria-label="天数">'
@@ -2112,7 +2125,12 @@ def admin_page(request: Request):
                 f'<form method="post" action="/admin/action" class="inline"><input type="hidden" name="uid" value="{r["id"]}">'
                 f'<input type="hidden" name="action" value="enable"><button class="btn sm ghost">启用</button></form>'
             )
-        else:
+        if r["status"] == "rejected":
+            ops.append(
+                f'<form method="post" action="/admin/action" class="inline"><input type="hidden" name="uid" value="{r["id"]}">'
+                f'<input type="hidden" name="action" value="delete"><button class="btn sm danger" data-confirm="彻底删除该用户？将清除其账号、余额与云端备份，不可恢复。">删除</button></form>'
+            )
+        if r["status"] not in ("disabled", "rejected"):
             ops.append(
                 f'<form method="post" action="/admin/action" class="inline"><input type="hidden" name="uid" value="{r["id"]}">'
                 f'<input type="hidden" name="action" value="disable"><button class="btn sm danger" data-confirm="禁用该用户？其将无法登录和使用 AI">禁用</button></form>'
@@ -2137,10 +2155,10 @@ def admin_page(request: Request):
         )
         row_cls = ' class="hot"' if hot else ""
         user_rows.append(
-            f'<tr{row_cls}><td class="uname">{html.escape(str(r["username"]))}</td>'
-            f'<td>{status_tag}</td>'
-            f'<td class="num2">{bal_cell}</td>'
-            f'<td>{backup_cell}</td>'
+            f'<tr{row_cls}><td class="uname" data-l="用户">{html.escape(str(r["username"]))}</td>'
+            f'<td data-l="状态">{status_tag}</td>'
+            f'<td class="num2" data-l="余额">{bal_cell}</td>'
+            f'<td class="num2" data-l="云端备份">{backup_cell}</td>'
             f'<td><div class="ops">{"".join(ops)}</div></td></tr>'
         )
     parts.append(
@@ -2148,7 +2166,7 @@ def admin_page(request: Request):
         f'<span class="hint">{len(rows)} 个账号 · 待审核 {npending} · 待审核与续期申请自动置顶</span></div>'
         + action_flash
         + backup_strip
-        + '<div class="tscroll opsfix"><table><thead><tr>'
+        + '<div class="tscroll opsfix"><table class="cardable"><thead><tr>'
         '<th>用户</th><th>状态</th><th>余额</th><th>云端备份</th><th>操作</th></tr></thead><tbody>'
         + ("".join(user_rows) or '<tr><td colspan="5" class="dim" style="text-align:center;padding:18px">暂无用户</td></tr>')
         + '</tbody></table></div></section>'
@@ -2257,6 +2275,26 @@ async def admin_action(request: Request, uid: int = Form(...), action: str = For
             c.execute("UPDATE users SET status='rejected', renewal_requested=0 WHERE id=?", (uid,))
         elif action == "disable":
             c.execute("UPDATE users SET status='disabled' WHERE id=?", (uid,))
+        elif action == "delete":
+            # 仅允许删除已拒绝/已禁用账号（正常用户请先禁用再删），防误删在用用户
+            if row["status"] not in ("rejected", "disabled"):
+                return RedirectResponse("/admin?action_err=2", status_code=303)
+            _m = c.execute("SELECT napi_uid FROM gateway_map WHERE uid=?", (uid,)).fetchone()
+            c.execute("DELETE FROM gateway_map WHERE uid=?", (uid,))
+            c.execute("DELETE FROM cloud_sessions WHERE uid=?", (uid,))
+            c.execute("DELETE FROM wallet_tx WHERE uid=?", (uid,))
+            c.execute("DELETE FROM pay_orders WHERE uid=?", (uid,))
+            c.execute("DELETE FROM users WHERE id=?", (uid,))
+            if _m and gw_enabled():
+                try:
+                    _nc = napi_connect()
+                    _nc.execute("DELETE FROM tokens WHERE user_id=?", (_m["napi_uid"],))
+                    _nc.execute("DELETE FROM users WHERE id=?", (_m["napi_uid"],))
+                    _nc.commit()
+                    _nc.close()
+                except Exception as e:  # noqa: BLE001
+                    print("[admin] 删除用户清理计费库失败 uid=%s err=%s" % (uid, e))
+            print("[admin] 用户已删除 uid=%s username=%s" % (uid, row["username"]))
         elif action == "enable":
             # 审查 R11（P2）：原实现只改 status，过期账号启用后仍是 approved+过去日期 →
             # 依旧登录不了（表现为"点了启用没反应"）。未过期则原样恢复，已过期则补足有效期。
