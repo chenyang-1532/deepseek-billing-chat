@@ -34,6 +34,33 @@ PASS=0; FAIL=0
 A_JAR=/tmp/rt_admin.jar; U_JAR=/tmp/rt_user.jar
 rm -f $A_JAR $U_JAR
 
+# ── R20（审查建议，不阻塞签字）：注册限流桶自检 ──
+# 前一轮测试（同分钟）可能已把 127.0.0.1 注册桶打满，开跑即 31 次 429，
+# CI 会把污染误判为回归（R20 轮实测 24/33、R17 轮同型事故）。
+# 探测用非法用户名（1 字符，[\w]{2,24} 校验拒绝 → 400）——不建号，但请求
+# 仍进限流计数：桶正常=400，被污染=429。探测本身占 2 个名额（10/分钟）。
+_bucket_429() {
+  local c1 c2
+  c1=$(curl -s -o /dev/null -m 10 -w "%{http_code}" -X POST $BASE/api/register \
+        -H "Content-Type: application/json" -d '{"u":"x","p":"probe"}')
+  c2=$(curl -s -o /dev/null -m 10 -w "%{http_code}" -X POST $BASE/api/register \
+        -H "Content-Type: application/json" -d '{"u":"x","p":"probe"}')
+  [ "$c1" = "429" ] && [ "$c2" = "429" ]
+}
+if _bucket_429; then
+  if [ "${RT_BUCKET_FAILFAST:-0}" = "1" ]; then
+    echo "🛑 [BUCKET] 注册限流桶被前序测试污染（连续 429），RT_BUCKET_FAILFAST=1 → 退出码 3" >&2
+    exit 3
+  fi
+  echo "⚠️  [BUCKET] 注册限流桶被污染（连续 429），等待 ${RT_BUCKET_COOLDOWN:-65}s 后重试…" >&2
+  sleep "${RT_BUCKET_COOLDOWN:-65}"
+  if _bucket_429; then
+    echo "🛑 [BUCKET] 冷却后仍 429 → 退出码 3（请增大 RT_BUCKET_COOLDOWN 或排查并行 runner）" >&2
+    exit 3
+  fi
+  echo "  ✅ 限流桶已恢复"
+fi
+
 ck() { if [ "$2" = "$3" ]; then PASS=$((PASS+1)); echo "  ✅ $1"; else FAIL=$((FAIL+1)); echo "  ❌ $1 (期望:$2 实际:$3)"; fi; }
 dbq() { (cd "$SITE_DIR" && python3 -c "
 import sqlite3
