@@ -23,7 +23,7 @@ export RT_ALLOWED_DB_DIRS=/opt/newapi RT_ALLOW_RESTART=1
 bash tests/run_all.sh
 ```
 
-串行 12 套件 + 65s 限流冷却；任一失败总退出码 1。
+串行 17 套件（1 个 bash 回归 + 16 个 Python 套件）+ 65s 限流冷却。退出码：有失败=1；全 PASS 但有 SKIP=4（不完整轮次，CI 需与 0 区分）；全 PASS 无 SKIP=0。
 
 ## 数据铁律
 

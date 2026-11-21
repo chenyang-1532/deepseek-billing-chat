@@ -48,7 +48,7 @@ cp -a /path/to/secret.key /backup/secret.key   # 0600 权限一并保留
 ```bash
 # 1. 依赖
 apt install python3.11 python3-pip sqlite3
-pip3 install fastapi uvicorn requests
+pip3 install fastapi uvicorn requests python-multipart
 
 # 2. new-api（计费网关）
 #    部署于 :3001，库文件默认 /opt/newapi/one-api.db
@@ -134,7 +134,7 @@ echo "$NEWPW"   # 仅本次显示，立即转存密码管理器并清终端历�
 export RT_TAG=<唯一标签> ADMIN_PW=<管理密码>
 export RT_ALLOWED_DB_DIRS=/opt/newapi   # 显式声明测试实例目录（防误跑生产机）
 export RT_ALLOW_RESTART=1               # 仅测试环境允许 new-api 重启类用例
-bash tests/run_all.sh                   # 统一门禁：1 个 bash 回归 + 16 个 Python 套件串行，任一失败总退出码 1
+bash tests/run_all.sh                   # 统一门禁：1 个 bash 回归 + 16 个 Python 套件串行。退出码：有失败=1；全 PASS 但有 SKIP=4（不完整轮次，CI 需与 0 区分）；全 PASS 无 SKIP=0
 ```
 
 **禁止在生产机执行**：所有 `tests/` 脚本会写数据库、删除测试用户、（在显式允许时）重启 new-api 进程。`_guard()` 会在数据库路径不在 `/tmp/` 且未声明 `RT_ALLOWED_DB_DIRS` 时以退出码 2 拒绝执行；`regression_3000.sh` 另有一道实例校验——3000 端口上 uvicorn 的工作目录必须等于 `/tmp/chatsite-test`，否则同样以退出码 2 拒绝（生产部署也用 3000，这道检查防的是「知道管理密码就直接跑回归」）。

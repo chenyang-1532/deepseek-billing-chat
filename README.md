@@ -5,24 +5,28 @@
 ## 仓库结构
 
 ```
-├── app.py                # 站点后端（v17.6，单文件 Python/HTTP，约 2600 行）
+├── app.py                # 站点后端（单文件 FastAPI，约 3900 行；版本演进见 git log 与 docs/运维维护手册）
 ├── static/               # 前端 bundle（含计费改版补丁：钱包流水/扫码充值/时段倍率）
 ├── docs/
 │   ├── 运维维护手册-MiandningAI.md   # 运维、守护进程、防火墙、数据铁律
 │   ├── 部署指南-DeepSeek聊天界面.md  # 部署步骤
 │   └── 执行铁律-数据保护.md          # 测试数据纪律（rttest 前缀、真实用户保护）
-└── tests/                # 全量回归测试套件（10 个脚本，275+ 项）
-    ├── regression_3000.sh                  # 54 项基础回归
-    ├── test_money_special_3000.py          # 25 项资金专项
-    ├── test_money_security.py              # 25 项资金安全
-    ├── test_pay_model.py                   # 57 项新功能专项（扫码充值/实时定价/时段倍率）
-    ├── test_billing_accuracy.py            # 28 项计费逐笔对账
-    ├── test_concurrency.py                 # 28 项并发扣费安全
-    ├── test_isolation.py                   # 24 项用户数据隔离
-    ├── test_reconciliation.py              # 17 项账务对账（含 new-api 重启恢复）
-    ├── test_gw_e2e.py                      # 13 项网关端到端
-    ├── test_performance.py                 # 4 项性能
-    └── test_time_mult.py                   # 37 项时段倍率专项
+└── tests/                # 全量回归测试套件（17 个套件 = 1 bash 回归 + 16 Python，390+ 项断言）
+    ├── regression_3000.sh                  # 57 项基础回归（含客户端中途断开收口断言）
+    ├── test_money_special_3000.py          # 资金专项
+    ├── test_money_security.py              # 资金安全
+    ├── test_pay_model.py                   # 新功能专项（扫码充值/实时定价/时段倍率）
+    ├── test_billing_accuracy.py            # 计费逐笔对账
+    ├── test_concurrency.py                 # 并发扣费安全
+    ├── test_isolation.py                   # 用户数据隔离
+    ├── test_reconciliation.py              # 账务对账（含 new-api 重启恢复）
+    ├── test_gw_e2e.py                      # 网关端到端
+    ├── test_performance.py                 # 性能
+    ├── test_time_mult.py                   # 时段倍率专项
+    ├── test_p0_saga.py / p0_r3 / p0_acceptance   # P0 故障注入专项
+    ├── test_p1_sid.py / p1_cloud / p1_price      # P1 归档安全 / 云同步冲突 / 官方价加固
+    ├── run_all.sh                          # 统一门禁（退出码：失败=1 / SKIP>0=4 / 全过=0）
+    └── _guard.py                           # 防误跑生产机守卫
 ```
 
 ## 核心设计（供审查参考）
@@ -49,5 +53,6 @@ RT_TAG=$RT_TAG python3.11 tests/test_pay_model.py
 
 ## 当前状态
 
-- 全量回归 275+ 项 × 3 轮并行子代理验证，除环境瞬态外全过
-- 待办：接入真实 DeepSeek Key（OpenAI 协议渠道）、正式站部署、放置 gateway.on
+- 最新完整轮次 gate24：**11 PASS / 6 SKIP / 0 FAIL**（SKIP 为依赖真实记账环境未设置，未实际执行，不声称 17/17 全绿）、进程退出码 4、regression 57/0
+- 审查闭环：R10–R19 复验轮次记录见 Issue #1（安全收口：请求体上限/chunked、ClientDisconnect、RecursionError、multipart、版本兼容均已实测）
+- 待办：接入真实 DeepSeek Key（OpenAI 协议渠道）、正式站部署
