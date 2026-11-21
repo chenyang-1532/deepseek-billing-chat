@@ -98,9 +98,10 @@ if [ $FAIL -ne 0 ]; then
 elif [ $SKIPN -gt 0 ]; then
   echo "════ 总结果: ✅ $(( ${#RESULTS[@]} - SKIPN )) PASS / $SKIPN SKIP（SKIP 套件未实际执行） ════"
   # R15（审查 P3）：SKIP>0 门禁视角仍要拦——全绿但不完整的轮次不允许静默通过 CI
+  # R16：上一行 _final_rc=4 曾被紧跟的 _final_rc=0 覆盖，整轮进程退出码恒 0，
+  # CI if:failure() 对 8 个 SKIP 的轮次照样绿（审查 R16 回归实测印证）——删掉覆盖行
   echo "[run_all] SKIP>0 → 退出码 4（PASS 但不完整，供 CI 区分）"
   _final_rc=4
-  _final_rc=0
 else
   echo "════ 总结果: ✅ 全部套件退出码为 0 ════"
   _final_rc=0

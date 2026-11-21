@@ -39,6 +39,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "data.db")
@@ -583,6 +584,18 @@ STATUS_TEXT = {
 }
 
 app = FastAPI(title="Paid Chat Gate")
+
+
+# ── 审查 R16-2：ClientDisconnect 全局收口 ──
+# 客户端在上传请求体途中断开（弱网切换/关页面/代理超时）时，Request.stream() 抛
+# ClientDisconnect（非 ValueError 子类）：register/login 的 except ValueError 收窄后
+# 它会一路冒到 uvicorn → "Exception in ASGI application" + 5.2KB traceback/次，
+# 未登录可达（/api/register）即可刷日志（实测 20 次/秒 ≈ 9GB/天）。
+# 端点级修补只补两个洞（/api/backup 等读 body 无 try 的端点照旧），全局 handler 一次收口：
+# 客户端已断开，响应发不发得出去无所谓，关键是别让 traceback 冒到 uvicorn。
+@app.exception_handler(ClientDisconnect)
+async def _client_disconnect_handler(request: Request, exc: ClientDisconnect):
+    return Response(status_code=400)
 
 
 # ── 审查 R8/R9：请求体上限「读之前拦」而非「读完再判」 ──
@@ -3093,7 +3106,10 @@ async def api_wallet_redeem(request: Request):
         return JSONResponse({"ok": False, "msg": "尝试过于频繁，请一分钟后再试"}, status_code=429)
     try:
         body = json.loads(await request.body())
-    except Exception:
+    except ValueError:
+        # R16：收窄到 ValueError（JSONDecodeError/UnicodeDecodeError 均为其子类），
+        # 否则 chunked 超限的 _BodyTooLarge 会被吞成 400（应为 413）；
+        # ClientDisconnect 不在捕获范围，冒泡到全局 handler 收口（R16-2）
         return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
     # 审查 R12/P2：json.loads 成功但 body 不是对象时 body.get 抛 AttributeError → 500
     if not isinstance(body, dict):
@@ -3422,7 +3438,10 @@ async def api_wallet_pay_request(request: Request):
             )
     except json.JSONDecodeError:
         return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
-    except Exception:  # noqa: BLE001
+    except (ValueError, TypeError, AttributeError):
+        # R16：收窄（同 redeem）——但必须保留 TypeError/AttributeError：
+        # float(None)/body 非对象在此处会抛，行为与旧 except Exception 一致仍 400；
+        # ClientDisconnect/_BodyTooLarge 不在捕获范围，分别冒泡到全局 handler / 中间件 413
         return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
     if not math.isfinite(amount) or not (GW_PAY_MIN_CNY <= amount <= GW_PAY_MAX_CNY):
         return JSONResponse(

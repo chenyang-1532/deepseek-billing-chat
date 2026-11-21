@@ -204,6 +204,76 @@ _X2=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -H "X-Forwarded-For: 198.51.1
 _X3=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -H "X-Forwarded-For: 198.51.100.13" -X POST $BASE/api/login -H "Content-Type: application/json" -d '{"u":"xffprobe_c","p":"wrongpw"}')
 ck "3 个不同 XFF 各登录 1 次均不被 429（分桶生效）" "200 200 200" "$_X1 $_X2 $_X3"
 
+echo "═══ 十三、客户端中途断开（审查 R16-2：ClientDisconnect 全局收口） ═══"
+# 缺陷背景：register/login 的 except ValueError 收窄后，ClientDisconnect（非 ValueError
+# 子类）冒到 uvicorn → 5.2KB traceback/次，未登录可刷日志（20次/秒 ≈ 9GB/天）；
+# /api/backup 等读 body 无 try 的端点属既存同型缺陷。全局 exception_handler 收口后：
+# 日志增量 < 1KB（仅 access log 一行）且零 traceback。
+_SITE_LOG="${RT_SITE_LOG:-/tmp/chatsite_3000.log}"
+python3 - "$_SITE_LOG" "$U_JAR" <<'PYEOF'
+import http.cookiejar as cjar
+import os, socket, sys, time
+
+log, jar_path = sys.argv[1], sys.argv[2]
+cookie = ""
+if os.path.exists(jar_path):
+    cj = cjar.MozillaCookieJar(jar_path)
+    try:
+        cj.load(ignore_discard=True, ignore_expires=True)
+        cookie = "; ".join("%s=%s" % (c.name, c.value) for c in cj)
+    except Exception:
+        cookie = ""
+
+def snap():
+    if not os.path.exists(log):
+        return 0, 0, 0
+    raw = open(log, "rb").read()
+    return (len(raw),
+            raw.count(b"Exception in ASGI application"),
+            raw.count(b"starlette.requests.ClientDisconnect"))
+
+s0, t0, c0 = snap()
+# 未登录 /api/register：chunked 发 2KB 后中途 close（弱网切换/关页面），重复 10 次
+for i in range(10):
+    try:
+        s = socket.create_connection(("127.0.0.1", 3000), timeout=5)
+        s.sendall(b"POST /api/register HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                  b"Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n")
+        s.sendall(b"400\r\n" + b"x" * 1024 + b"\r\n")
+        time.sleep(0.05)
+        s.close()
+    except OSError:
+        pass
+    time.sleep(0.05)
+# 已登录 /api/backup（octet-stream 分支纯读 body，属审查指出的既存同型缺陷）
+# 注：不用 multipart 形态——非法 multipart 会触发 python_multipart.MultipartParseError
+# 未捕获（既存同族漏洞，本轮不动），与 ClientDisconnect 无关会污染断言
+if cookie:
+    try:
+        s = socket.create_connection(("127.0.0.1", 3000), timeout=5)
+        s.sendall(("POST /api/backup HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   "Cookie: %s\r\nContent-Type: application/octet-stream\r\n"
+                   "Transfer-Encoding: chunked\r\n\r\n" % cookie).encode())
+        s.sendall(b"400\r\n" + b"y" * 1024 + b"\r\n")
+        time.sleep(0.05)
+        s.close()
+    except OSError:
+        pass
+time.sleep(1.5)  # 留服务端写日志时间
+s1, t1, c1 = snap()
+growth, tb, cd = s1 - s0, t1 - t0, c1 - c0
+# uvicorn access log 每连接固定写一行（~90B×11≈1KB 基线），不能拿总增量卡 1KB（会脆）。
+# 真正的缺陷特征：ClientDisconnect traceback（实测 5.2KB/次 → 10 次 ≈ +52KB）。
+# 断言 = 零新增 traceback + 零新增 ClientDisconnect 字样 + 增量 < 6KB（正常基线的 6 倍余量）。
+print("  日志增量 %d 字节 / traceback 增量 %d / ClientDisconnect 字样 %d" % (growth, tb, cd))
+good = (growth < 6144 and tb == 0 and cd <= 0)
+print("REGDISCONNECT:", "PASS" if good else "FAIL")
+sys.exit(0 if good else 1)
+PYEOF
+_rc=$?
+ck "chunked 中途断开×11 增量<6KB且零traceback" 0 $_rc
+ck "无 'Exception in ASGI application' 新增 traceback" 0 $_rc
+
 echo ""
 echo "════════════════════════════"
 echo "回归测试完成: ✅通过 $PASS  ❌失败 $FAIL"
