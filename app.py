@@ -475,9 +475,19 @@ h1{font-size:19px;font-weight:700}
 .num{width:64px;height:30px;padding:0 8px;border:1px solid #d9dde3;border-radius:7px;font-size:13px;color:#0f172a;text-align:right;font-variant-numeric:tabular-nums}
 .num:focus{outline:none;border-color:#4f46e5;box-shadow:0 0 0 3px #eef2ff}
 .num.note{width:88px;text-align:left}
-.nav{display:flex;gap:4px;position:sticky;top:0;z-index:20;background:rgba(246,247,249,.92);backdrop-filter:blur(8px);padding:8px 0;margin-bottom:12px;overflow-x:auto}
+.nav{display:flex;gap:4px;position:sticky;top:0;z-index:20;background:rgba(246,247,249,.92);backdrop-filter:blur(8px);padding:8px 0;margin-bottom:10px;overflow-x:auto}
 .nav a{padding:6px 12px;border-radius:999px;font-size:13px;color:#475569;text-decoration:none;white-space:nowrap}
 .nav a:hover{background:#eceef2;color:#0f172a}
+.nav a.on{background:#4f46e5;color:#fff}
+.nav a.on:hover{background:#4338ca;color:#fff}
+/* 页签式面板：JS 激活后仅显示当前区块，无 JS 时全部展示（兜底） */
+body.tabbed .sec{display:none}
+body.tabbed .sec.on{display:block}
+.ovbar{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;background:#fff;border:1px solid #e7eaee;border-radius:10px;padding:8px 14px;margin-bottom:12px;font-size:12.5px;color:#475569}
+.ovbar:empty{display:none}
+.ovbar b{font-variant-numeric:tabular-nums;color:#0f172a;font-weight:700}
+.ovbar a{color:#4f46e5;text-decoration:none;font-weight:600;display:inline-flex;align-items:center;gap:5px}
+.ovbar .ov-warn{background:#dc2626;color:#fff;border-radius:999px;padding:1px 8px;font-size:11px;font-weight:600}
 .sec{background:#fff;border:1px solid #e7eaee;border-radius:14px;padding:18px;margin-bottom:14px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
 .sec-h{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .sec h2{font-size:15px;font-weight:700}
@@ -537,9 +547,10 @@ textarea:focus{outline:none;border-color:#4f46e5;box-shadow:0 0 0 3px #eef2ff}
 <div class="bar"><h1>管理面板</h1>
 <form action="/admin/logout" method="get"><button class="btn ghost sm">退出</button></form></div>
 <div class="sub">按余额计费：注册即开通，充值/余额调整实时生效；余额为 0 时无法对话。</div>
-<nav class="nav">
+<nav class="nav" id="anav">
 <a href="#sec-announce">公告</a><a href="#sec-users">用户</a><a href="#sec-wallet">计费</a><a href="#sec-codes">充值码</a><a href="#sec-ratios">定价</a><a href="#sec-pay">充值审批{{paybadge}}</a><a href="#sec-tx">流水</a>
 </nav>
+<div class="ovbar">{{ovbar}}</div>
 
 <section class="sec" id="sec-announce">
   <div class="sec-h"><h2>登录页公告</h2><span class="hint">展示在登录页顶部，留空不显示；换行会保留</span></div>
@@ -554,6 +565,33 @@ textarea:focus{outline:none;border-color:#4f46e5;box-shadow:0 0 0 3px #eef2ff}
 ADMIN_PAGE_FOOT = """</div>
 <div class="toast" id="toast"></div>
 <script>
+/* ── 页签式面板：点页签秒切区块；锚点（303 重定向 #sec-pay 等）直达；
+   记住上次停留页签；无 JS 时所有区块平铺（兜底可用） ── */
+(function(){
+  var links=[].slice.call(document.querySelectorAll('.nav a'));
+  var secs=[].slice.call(document.querySelectorAll('.sec'));
+  function activate(id,push){
+    var found=false;
+    secs.forEach(function(s){var on=s.id===id;s.classList.toggle('on',on);if(on)found=true;});
+    links.forEach(function(a){a.classList.toggle('on',found&&a.getAttribute('href')==='#'+id);});
+    if(found){document.body.classList.add('tabbed');
+      if(push){try{history.replaceState(null,'','#'+id)}catch(e){}}
+      window.scrollTo(0,0);}
+    return found;
+  }
+  var h=(location.hash||'').replace('#','');
+  if(!(h&&activate(h,false))){
+    var saved='';try{saved=localStorage.getItem('admin:tab')||''}catch(e){}
+    if(!(saved&&activate(saved,false))&&secs.length)activate(secs[0].id,false);
+  }
+  links.forEach(function(a){a.addEventListener('click',function(e){
+    e.preventDefault();var id=(a.getAttribute('href')||'').slice(1);
+    if(activate(id,true)){try{localStorage.setItem('admin:tab',id)}catch(e){}}
+  });});
+  window.addEventListener('hashchange',function(){
+    var id=(location.hash||'').replace('#','');if(id)activate(id,true);
+  });
+})();
 document.querySelectorAll('[data-confirm]').forEach(function(b){
   b.addEventListener('click', function(e){
     if(!confirm(b.getAttribute('data-confirm'))) e.preventDefault();
@@ -1583,6 +1621,7 @@ def admin_page(request: Request):
             npay = c.execute("SELECT COUNT(*) AS n FROM pay_orders WHERE status='pending'").fetchone()["n"]
         if npay:
             paybadge = f' <span style="background:#dc2626;color:#fff;border-radius:999px;padding:1px 7px;font-size:11px">{npay}</span>'
+    ovbar = ""  # 网关关闭时总览条为空（CSS :empty 隐藏）
     parts = [ADMIN_PAGE_HEAD
              .replace("{{announcement}}", html.escape(announcement))
              .replace("{{paybadge}}", paybadge)]
@@ -1798,6 +1837,17 @@ def admin_page(request: Request):
                 f'<div class="kpi"><div class="l">今日消耗</div><div class="v">¥{today_sum:.2f}</div></div>'
                 f'<div class="kpi"><div class="l">未用充值码</div><div class="v">{agg["n"]} <span class="dim" style="font-size:13px">张 · ¥{agg["s"]:g}</span></div></div>'
                 '</div>'
+            )
+            # ── 顶部总览条（页签式面板）：关键数据常驻页面顶部，一眼看完 ──
+            pay_chip = (
+                f'<span class="ov-warn">{npay}</span>' if npay else f'<b>{npay}</b>'
+            )
+            ovbar = (
+                f'<a href="#sec-pay">待审充值 {pay_chip}</a>'
+                f'<span>用户 <b>{len(rows)}</b></span>'
+                f'<span>平台总余额 <b>¥{total_bal:.2f}</b></span>'
+                f'<span>今日消耗 <b>¥{today_sum:.2f}</b></span>'
+                f'<span>未用充值码 <b>{agg["n"]}</b> 张 · ¥{agg["s"]:g}</span>'
             )
             head = (
                 '<section class="sec" id="sec-wallet"><div class="sec-h"><h2>网关计费 · 用户余额</h2>'
@@ -2105,6 +2155,7 @@ def admin_page(request: Request):
     )
     if wallet_html:
         parts.append(wallet_html)
+    parts[0] = parts[0].replace("{{ovbar}}", ovbar)
     parts.append(ADMIN_PAGE_FOOT)
     return HTMLResponse("".join(parts))
 
