@@ -40,6 +40,7 @@ from fastapi.responses import (
 )
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
+from python_multipart.exceptions import MultipartParseError
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "data.db")
@@ -801,17 +802,32 @@ def _auth_rate_limited(ip: str, limit: int) -> bool:
     return win[1] > limit
 
 
+def _json_body(raw: bytes, msg: str = "请求格式错误"):
+    """审查 R17：统一 JSON 解析边界，login/register/redeem/pay-request 共用。
+
+    逐异常类型加 handler 补不完（R16-2 只收了 ClientDisconnect，R17 实测深嵌套 JSON
+    数组 "["*1100+"]"*1100 → json.loads 递归爆栈抛 RecursionError（RuntimeError 子类，
+    非 ValueError）→ 未登录 500 + 5.6KB traceback/次，20 并发 ≈ 231GB/天，与
+    ClientDisconnect 完全同族同量级）。在解析边界统一收口 ValueError（含
+    JSONDecodeError/UnicodeDecodeError）+ RecursionError → 400；
+    _BodyTooLarge 等其余异常不在捕获范围，按各自语义传播（413 / 全局 handler）。
+    不用 @app.exception_handler(RecursionError) 兜底——那会把内部真实递归 bug 也盖掉。
+    返回 (解析结果, None) 或 (None, 400 响应)。"""
+    try:
+        return json.loads(raw), None
+    except (ValueError, RecursionError):
+        return None, JSONResponse({"ok": False, "msg": msg}, status_code=400)
+
+
 @app.post("/api/register")
 async def api_register(request: Request):
     if _auth_rate_limited(request.client.host if request.client else "?", 10):
         return JSONResponse({"ok": False, "msg": "注册尝试过于频繁，请一分钟后再试"}, status_code=429)
     # 审查 R11（P2）：非法 JSON / 非对象 body 会让 d.get 抛异常 → 500（实测 6/6 全 500）。
     # 客户端错误统一 400，且不写入任何状态。
-    try:
-        d = await request.json()
-    except ValueError:  # 非法 JSON（JSONDecodeError/UnicodeDecodeError）→ 400；
-        # _BodyTooLarge（R15 P1：chunked 超限）不是 ValueError，传播到 ASGI 层转 413
-        return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
+    d, _err = _json_body(await request.body())
+    if _err is not None:
+        return _err
     if not isinstance(d, dict):
         return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
     u = str(d.get("u", "")).strip()
@@ -835,11 +851,9 @@ async def api_register(request: Request):
 async def api_login(request: Request):
     if _auth_rate_limited(request.client.host if request.client else "?", 20):
         return JSONResponse({"ok": False, "msg": "登录尝试过于频繁，请一分钟后再试"}, status_code=429)
-    try:
-        d = await request.json()
-    except ValueError:  # 非法 JSON（JSONDecodeError/UnicodeDecodeError）→ 400；
-        # _BodyTooLarge（R15 P1：chunked 超限）不是 ValueError，传播到 ASGI 层转 413
-        return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
+    d, _err = _json_body(await request.body())
+    if _err is not None:
+        return _err
     if not isinstance(d, dict):
         return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
     u = str(d.get("u", "")).strip()
@@ -1173,7 +1187,14 @@ async def api_backup_post(request: Request):
         return JSONResponse({"ok": False}, status_code=403)
     ctype = (request.headers.get("content-type") or "").lower()
     if ctype.startswith("multipart/"):
-        form = await request.form()
+        # 审查 R17：畸形 part header（如 "------X\r\n@@@no-colon@@@..."）会让
+        # python_multipart 抛 MultipartParseError → 未捕获 500 + 5.7KB traceback/次
+        # （×3 稳定复现）。前置 valid_paid_user → 需已审核账号才可达（非匿名），但
+        # 攻击模型不变，在解析边界收口为 400（ValueError 兜 FormParser 的其他解析异常）
+        try:
+            form = await request.form()
+        except (ValueError, MultipartParseError):
+            return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
         upload = form.get("file")
         deleted = str(form.get("deleted") or "")
         if upload is None or isinstance(upload, str):
@@ -3104,13 +3125,9 @@ async def api_wallet_redeem(request: Request):
         return JSONResponse({"ok": False, "msg": "网关未开启"}, status_code=404)
     if _redeem_rate_limited(user["id"]):
         return JSONResponse({"ok": False, "msg": "尝试过于频繁，请一分钟后再试"}, status_code=429)
-    try:
-        body = json.loads(await request.body())
-    except ValueError:
-        # R16：收窄到 ValueError（JSONDecodeError/UnicodeDecodeError 均为其子类），
-        # 否则 chunked 超限的 _BodyTooLarge 会被吞成 400（应为 413）；
-        # ClientDisconnect 不在捕获范围，冒泡到全局 handler 收口（R16-2）
-        return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
+    body, _err = _json_body(await request.body(), msg="参数错误")
+    if _err is not None:
+        return _err
     # 审查 R12/P2：json.loads 成功但 body 不是对象时 body.get 抛 AttributeError → 500
     if not isinstance(body, dict):
         return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
@@ -3425,8 +3442,10 @@ async def api_wallet_pay_request(request: Request):
         return JSONResponse({"ok": False, "msg": "网关未开启"}, status_code=404)
     if _pay_rate_limited(user["id"]):
         return JSONResponse({"ok": False, "msg": "提交过于频繁，请一分钟后再试"}, status_code=429)
+    body, _err = _json_body(await request.body(), msg="参数错误")
+    if _err is not None:
+        return _err
     try:
-        body = json.loads(await request.body())
         amount = round(float(body.get("cny")), 2)
         # 客户端幂等键（P0-4，审查 R1 复审）：强制要求合法 client_request_id，
         # 缺失/非法一律 400 拒绝——不得降级为无幂等键创建（否则旧客户端/隐私模式/直接调 API 仍可重复下单）
@@ -3436,12 +3455,10 @@ async def api_wallet_pay_request(request: Request):
                 {"ok": False, "msg": "缺少有效的客户端幂等键（client_request_id），请刷新页面后重试"},
                 status_code=400,
             )
-    except json.JSONDecodeError:
-        return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
     except (ValueError, TypeError, AttributeError):
-        # R16：收窄（同 redeem）——但必须保留 TypeError/AttributeError：
-        # float(None)/body 非对象在此处会抛，行为与旧 except Exception 一致仍 400；
-        # ClientDisconnect/_BodyTooLarge 不在捕获范围，分别冒泡到全局 handler / 中间件 413
+        # R16：保留 TypeError/AttributeError——float(None)/body 非对象在此处会抛，
+        # 行为与旧 except Exception 一致仍 400；ClientDisconnect/_BodyTooLarge
+        # 不在捕获范围，分别冒泡到全局 handler / 中间件 413
         return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
     if not math.isfinite(amount) or not (GW_PAY_MIN_CNY <= amount <= GW_PAY_MAX_CNY):
         return JSONResponse(

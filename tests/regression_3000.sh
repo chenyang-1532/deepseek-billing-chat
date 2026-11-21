@@ -80,7 +80,7 @@ ck "正确管理密码登录" 303 "$CODE"
 CODE=$(curl -s -b $A_JAR -m 10 $BASE/admin -o /dev/null -w "%{http_code}")
 ck "管理面板可访问" 200 "$CODE"
 BODY=$(curl -s -b $A_JAR -m 10 $BASE/admin)
-echo "$BODY" | grep -q 'class="tscroll"'; ck "面板表格化布局(v17.3改版)" 0 $?
+echo "$BODY" | grep -q 'class="tscroll'; ck "面板表格化布局(v17.3改版)" 0 $?
 echo "$BODY" | grep -q 'textarea'; ck "公告编辑框存在" 0 $?
 echo "$BODY" | grep -q "$RREG"; ck "待审核用户出现在面板" 0 $?
 TUID=$(dbq "c.execute(\"SELECT id FROM users WHERE username='$RREG'\").fetchone()[0]")
@@ -208,9 +208,11 @@ echo "═══ 十三、客户端中途断开（审查 R16-2：ClientDisconnect
 # 缺陷背景：register/login 的 except ValueError 收窄后，ClientDisconnect（非 ValueError
 # 子类）冒到 uvicorn → 5.2KB traceback/次，未登录可刷日志（20次/秒 ≈ 9GB/天）；
 # /api/backup 等读 body 无 try 的端点属既存同型缺陷。全局 exception_handler 收口后：
-# 日志增量 < 1KB（仅 access log 一行）且零 traceback。
+# 正常态仅剩 access log 行（~90B/连接）；缺陷态特征是 5.2KB/次 traceback。
 _SITE_LOG="${RT_SITE_LOG:-/tmp/chatsite_3000.log}"
-python3 - "$_SITE_LOG" "$U_JAR" <<'PYEOF'
+# R17 P3-3：python 只跑一次、输出落临时文件，两条断言各自独立 grep 判定（不复用同一 rc）
+_PYLOG=$(mktemp)
+python3 - "$_SITE_LOG" "$U_JAR" > "$_PYLOG" 2>&1 <<'PYEOF'
 import http.cookiejar as cjar
 import os, socket, sys, time
 
@@ -245,9 +247,11 @@ for i in range(10):
     except OSError:
         pass
     time.sleep(0.05)
-# 已登录 /api/backup（octet-stream 分支纯读 body，属审查指出的既存同型缺陷）
-# 注：不用 multipart 形态——非法 multipart 会触发 python_multipart.MultipartParseError
-# 未捕获（既存同族漏洞，本轮不动），与 ClientDisconnect 无关会污染断言
+# 已登录 /api/backup octet-stream 中途断开 ×1（multipart 形态的 MultipartParseError
+# 已在本轮单独收口，用 octet-stream 保持本断言纯净）
+# R17b P3：cookie 缺失不得静默跳过计 PASS——直接判 FAIL（cookie jar 来自前置登录，
+# 完整轮次里必然存在，缺失说明环境坏了，断言必须红）
+backup_done = False
 if cookie:
     try:
         s = socket.create_connection(("127.0.0.1", 3000), timeout=5)
@@ -257,23 +261,25 @@ if cookie:
         s.sendall(b"400\r\n" + b"y" * 1024 + b"\r\n")
         time.sleep(0.05)
         s.close()
+        backup_done = True
     except OSError:
         pass
-time.sleep(1.5)  # 留服务端写日志时间
+time.sleep(1.5)
 s1, t1, c1 = snap()
 growth, tb, cd = s1 - s0, t1 - t0, c1 - c0
-# uvicorn access log 每连接固定写一行（~90B×11≈1KB 基线），不能拿总增量卡 1KB（会脆）。
-# 真正的缺陷特征：ClientDisconnect traceback（实测 5.2KB/次 → 10 次 ≈ +52KB）。
-# 断言 = 零新增 traceback + 零新增 ClientDisconnect 字样 + 增量 < 6KB（正常基线的 6 倍余量）。
+# R17 P3-2：日志文件存在且非空是硬前提——否则 snap() 恒 (0,0,0) 断言恒真（假绿）
+log_ok = os.path.exists(log) and os.path.getsize(log) > 0
+print("  日志文件存在且非空:", log_ok, "/ 已登录backup用例实际执行:", backup_done)
 print("  日志增量 %d 字节 / traceback 增量 %d / ClientDisconnect 字样 %d" % (growth, tb, cd))
-good = (growth < 6144 and tb == 0 and cd <= 0)
-print("REGDISCONNECT:", "PASS" if good else "FAIL")
-sys.exit(0 if good else 1)
+print("REGDISCONNECT:", "PASS" if (log_ok and backup_done and growth < 6144 and cd <= 0) else "FAIL")
+print("REGNOTRACE:", "PASS" if (log_ok and backup_done and tb == 0) else "FAIL")
 PYEOF
-_rc=$?
-ck "chunked 中途断开×11 增量<6KB且零traceback" 0 $_rc
-ck "无 'Exception in ASGI application' 新增 traceback" 0 $_rc
-
+cat "$_PYLOG"
+grep -q "REGDISCONNECT: PASS" "$_PYLOG"; _rc1=$?
+grep -q "REGNOTRACE: PASS" "$_PYLOG"; _rc2=$?
+rm -f "$_PYLOG"
+ck "chunked 中途断开×11 增量<6KB且零ClientDisconnect（日志存在硬断言）" 0 $_rc1
+ck "断开零 'Exception in ASGI application' 新增 traceback" 0 $_rc2
 echo ""
 echo "════════════════════════════"
 echo "回归测试完成: ✅通过 $PASS  ❌失败 $FAIL"
