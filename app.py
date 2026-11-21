@@ -1707,6 +1707,7 @@ def admin_page(request: Request):
                     ops = (
                         f'<form method="post" action="/admin/wallet/adjust" class="inline">'
                         f'<input type="hidden" name="uid" value="{uid}">'
+                        f'<input type="hidden" name="dir" value="add">'
                         f'<input type="hidden" name="op_id" value="{adjust_op_id}">'
                         f'<input class="num" name="amount" value="10" inputmode="decimal" aria-label="金额">'
                         f'<span class="unit">元</span>'
@@ -1724,8 +1725,8 @@ def admin_page(request: Request):
                         f'<input class="num" name="amount" value="10" inputmode="decimal" aria-label="金额">'
                         f'<span class="unit">元</span>'
                         f'<input class="num note" name="note" placeholder="备注" aria-label="备注">'
-                        f'<button class="btn sm">充值</button>'
-                        f'<button class="btn sm danger" data-confirm="确认真金白银扣减该用户余额？">扣减</button></form>'
+                        f'<button class="btn sm" name="dir" value="add">充值</button>'
+                        f'<button class="btn sm danger" name="dir" value="deduct" data-confirm="确认真金白银扣减该用户余额？">扣减</button></form>'
                     )
                 lines.append(
                     f'<tr><td class="uname">{uname}</td>'
@@ -1831,7 +1832,12 @@ def admin_page(request: Request):
             ratio_err_qp = request.query_params.get("ratio_err", "")
             ratio_flash = ""
             if request.query_params.get("ratio_ok") == "1":
-                ratio_flash = '<div class="flash ok">已保存：倍率=官方实时价×倍数，本站预检即时生效，new-api 结算约 1 分钟内同步。</div>'
+                _cur = _gw_load_ratios()
+                _mr_txt = "；".join(
+                    "%s=%g" % (m, _cur[0].get(m, 0)) for m in SITE_MODELS
+                )
+                ratio_flash = ('<div class="flash ok">已保存并写回计费库（本站预检即时生效，new-api 结算约 1 分钟内同步）。'
+                               '当前输入/输出倍率：%s</div>' % html.escape(_mr_txt))
             elif request.query_params.get("official_ok") == "1":
                 ratio_flash = '<div class="flash ok">已抓取官方最新价格并重算倍率。</div>'
             elif request.query_params.get("official_ok") == "0":
@@ -1897,7 +1903,7 @@ def admin_page(request: Request):
                 fin_out = pout * n_eff
                 ratio_rows.append(
                     f'<form method="post" action="/admin/wallet/ratios" class="inline" '
-                    f'onsubmit="return confirm(\'确认将 {html.escape(mname)} 的定价改为官方价 × {n:g}？\')">'
+                    f'onsubmit="return confirm(\'确认将 {html.escape(mname)} 的定价改为官方价 × \'+this.elements.mult.value+\'？\')">'
                     f'<input type="hidden" name="model" value="{html.escape(mname)}">'
                     f'<b style="min-width:150px;display:inline-block">{html.escape(mname)}</b>'
                     f'<span class="hint">官方（{html.escape(src)}）：输入 ${pin:g} / 输出 ${pout:g}（每百万 token）</span>'
@@ -3770,17 +3776,21 @@ GW_ADJUST_MAX_CNY = 100000  # 单次后台调整上限，防误操作/注入异�
 
 @app.post("/admin/wallet/adjust")
 async def admin_wallet_adjust(request: Request, uid: int = Form(...), amount: str = Form(""),
-                              note: str = Form(""), op_id: str = Form("")):
+                              note: str = Form(""), op_id: str = Form(""), dir: str = Form("add")):
     """调账 saga（审查 P0-3）：加款与流水都有持久化操作号凭据。
     - 加款：quota_ops 唯一表（adjust:<op_id>），同事务原子生效，重试绝不重复加款
     - 流水：wallet_tx.ref='adjust:<op_id>' 唯一索引，加款成功后流水可安全重写
-    - 页面失败时回传同一 op_id，管理员重试自动续跑未完成步骤，不会重复加款"""
+    - 页面失败时回传同一 op_id，管理员重试自动续跑未完成步骤，不会重复加款
+    - dir=add/deduct 由按钮显式区分（修复：此前扣减按钮与充值共用同一表单，金额恒为正，
+      点「扣减」实际是加钱）；金额一律取绝对值后按 dir 定符号，杜绝歧义"""
     if not is_admin(request):
         return RedirectResponse("/admin", status_code=303)
     if not op_id or len(op_id) > 64 or not re.fullmatch(r"[0-9a-f\-]{8,64}", op_id):
         op_id = uuid.uuid4().hex
     try:
-        amount_cny = round(float(amount), 2)
+        amount_cny = round(abs(float(amount)), 2)
+        if dir == "deduct":
+            amount_cny = -amount_cny
         if not math.isfinite(amount_cny) or abs(amount_cny) > GW_ADJUST_MAX_CNY or amount_cny == 0:
             raise ValueError("金额非法")
         delta = cny_to_quota(amount_cny)

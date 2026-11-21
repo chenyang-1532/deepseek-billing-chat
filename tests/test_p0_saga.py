@@ -145,6 +145,10 @@ ck("P0-3 流水余额快照已回填", tx3 and tx3[0]["balance_cny"] is not None
 A.gw_add_quota(nid, -delta_real, op_id="rb2:%s" % op3)
 
 # ── 负向扣减原子性（审查 R1/P1-02：禁止 MAX(0,...) 截断） ──
+# R22 余额制（GW_DEFAULT_GIFT_CNY=0）后注册零赠送：并发扣减用例需要初始余额，不足则直充 ¥10
+bal_pre = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"] or 0
+if bal_pre < 300000:
+    A.gw_add_quota(nid, 694444, op_id="topup:%s" % op3)
 bal0 = q("SELECT quota FROM users WHERE id=?", (nid,), NAPI)[0]["quota"] or 0
 # 1) 余额不足扣减 → 必须报错，余额分毫不变（不再被截断到 0）
 try:
