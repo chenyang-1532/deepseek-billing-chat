@@ -50,6 +50,16 @@ async def messages(request: Request):
     model = body.get("model", "deepseek-chat")
     msg_id = "msg_demo_0001"
 
+    # stream:false → 非流式 JSON 响应（网关 v21 强制非流式路径用：new-api 透传后
+    # 站点把 JSON 转回 SSE 回填前端）
+    if body.get("stream") is False:
+        return JSONResponse({
+            "id": msg_id, "type": "message", "role": "assistant", "model": model,
+            "content": [{"type": "text", "text": REPLY}],
+            "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        })
+
     async def stream():
         yield sse("message_start", {
             "type": "message_start",

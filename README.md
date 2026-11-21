@@ -11,7 +11,7 @@
 │   ├── 运维维护手册-MiandningAI.md   # 运维、守护进程、防火墙、数据铁律
 │   ├── 部署指南-DeepSeek聊天界面.md  # 部署步骤
 │   └── 执行铁律-数据保护.md          # 测试数据纪律（rttest 前缀、真实用户保护）
-└── tests/                # 全量回归测试套件（17 个套件 = 1 bash 回归 + 16 Python，390+ 项断言）
+└── tests/                # 全量回归测试套件（18 个套件 = 1 bash 回归 + 17 Python，425+ 项断言）
     ├── regression_3000.sh                  # 57 项基础回归（含客户端中途断开收口断言）
     ├── test_money_special_3000.py          # 资金专项
     ├── test_money_security.py              # 资金安全
@@ -21,6 +21,7 @@
     ├── test_isolation.py                   # 用户数据隔离
     ├── test_reconciliation.py              # 账务对账（含 new-api 重启恢复）
     ├── test_gw_e2e.py                      # 网关端到端
+    ├── test_ui_smoke.py                    # 前端真浏览器 UI 冒烟（playwright；无浏览器环境 SKIP 退出码 3）
     ├── test_performance.py                 # 性能
     ├── test_time_mult.py                   # 时段倍率专项
     ├── test_p0_saga.py / p0_r3 / p0_acceptance   # P0 故障注入专项

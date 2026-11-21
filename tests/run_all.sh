@@ -87,6 +87,12 @@ run reconciliation python3.11 tests/test_reconciliation.py
 cooldown
 run gw_e2e        python3.11 tests/test_gw_e2e.py
 cooldown
+# 前端真浏览器 UI 冒烟（审查建议任务）：playwright headless chromium；
+# 无浏览器/playwright/服务未就绪时 [SKIP] 退出码 3，run() 归类 SKIP 不算失败。
+# 放在 performance 之前：本套件会故意烧满注册限流桶（429 文案用例），
+# 收尾统一按 RT_TAG 清理。
+run ui_smoke      python3.11 tests/test_ui_smoke.py
+cooldown
 run performance   python3.11 tests/test_performance.py
 
 echo

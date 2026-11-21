@@ -23,7 +23,9 @@ export RT_ALLOWED_DB_DIRS=/opt/newapi RT_ALLOW_RESTART=1
 bash tests/run_all.sh
 ```
 
-串行 17 套件（1 个 bash 回归 + 16 个 Python 套件）+ 65s 限流冷却。退出码：有失败=1；全 PASS 但有 SKIP=4（不完整轮次，CI 需与 0 区分）；全 PASS 无 SKIP=0。
+串行 18 套件（1 个 bash 回归 + 17 个 Python 套件）+ 65s 限流冷却。退出码：有失败=1；全 PASS 但有 SKIP=4（不完整轮次，CI 需与 0 区分）；全 PASS 无 SKIP=0。
+
+`test_ui_smoke.py`（前端真浏览器冒烟）依赖 playwright headless chromium：`pip3 install playwright && playwright install chromium`；playwright/浏览器/站点服务未就绪时输出 `[SKIP]` 并以退出码 3 跳过（run_all 归类 SKIP，不算失败）。
 
 ## 数据铁律
 

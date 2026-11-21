@@ -2408,6 +2408,16 @@ CN_HOLIDAYS = {
     "2026-06-19", "2026-06-20", "2026-06-21",
     "2026-09-25", "2026-09-26", "2026-09-27",
     "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07",
+    # 2027（国务院办公厅国办发明电〔2026〕10号，2026-11-05 发布）：
+    # 元旦 1/1-1/3；春节 2/5(除夕)-2/13；清明 4/3-4/5；劳动节 5/1-5/5；
+    # 端午 6/9；中秋 9/15；国庆 10/1-10/7（调休上班日 1/31、2/14、5/8、9/26、10/9 不入表）
+    "2027-01-01", "2027-01-02", "2027-01-03",
+    "2027-02-05", "2027-02-06", "2027-02-07", "2027-02-08", "2027-02-09", "2027-02-10", "2027-02-11", "2027-02-12", "2027-02-13",
+    "2027-04-03", "2027-04-04", "2027-04-05",
+    "2027-05-01", "2027-05-02", "2027-05-03", "2027-05-04", "2027-05-05",
+    "2027-06-09",
+    "2027-09-15",
+    "2027-10-01", "2027-10-02", "2027-10-03", "2027-10-04", "2027-10-05", "2027-10-06", "2027-10-07",
 }
 
 
@@ -3241,6 +3251,61 @@ async def api_wallet_redeem(request: Request):
     return JSONResponse({"ok": True, "balance_cny": round(quota_to_cny(newq), 4)})
 
 
+def _upstream_content(r):
+    """requests 流式响应的整包读取（.content 触发网络 I/O，必须经 run_in_threadpool 调用）"""
+    return r.content
+
+
+def _sse_from_message(m):
+    """把非流式 Messages 响应 JSON 转成 Anthropic SSE 事件流字节。
+
+    v21 32K 修复移植（正式站 /api/dsproxy 同语义，部署生产前并入网关路径）：
+    DeepSeek 官方流式管线对 >32K 输入直接拒绝（生产实测 115,348 tokens 流式 400、
+    160,004 非流式放行），messages 请求强制改非流式绕过，响应再转回 SSE 给前端。
+    """
+    usage = m.get("usage") or {}
+    ev = []
+
+    def add(name, obj):
+        ev.append("event: %s\ndata: %s\n\n" % (name, json.dumps(obj, ensure_ascii=False)))
+
+    add("message_start", {"type": "message_start", "message": {
+        "id": m.get("id"), "type": "message", "role": "assistant", "model": m.get("model"),
+        "content": [], "stop_reason": None, "stop_sequence": None,
+        "usage": {"input_tokens": usage.get("input_tokens", 0),
+                  "cache_creation_input_tokens": 0,
+                  "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+                  "output_tokens": 0, "service_tier": "standard"}}})
+    idx = 0
+    for blk in m.get("content") or []:
+        t = blk.get("type")
+        if t == "thinking":
+            add("content_block_start", {"type": "content_block_start", "index": idx,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+            th = blk.get("thinking") or ""
+            if th:
+                add("content_block_delta", {"type": "content_block_delta", "index": idx,
+                    "delta": {"type": "thinking_delta", "thinking": th}})
+            if blk.get("signature"):
+                add("content_block_delta", {"type": "content_block_delta", "index": idx,
+                    "delta": {"type": "signature_delta", "signature": blk.get("signature")}})
+            add("content_block_stop", {"type": "content_block_stop", "index": idx})
+        elif t == "text":
+            add("content_block_start", {"type": "content_block_start", "index": idx,
+                "content_block": {"type": "text", "text": ""}})
+            tx = blk.get("text") or ""
+            if tx:
+                add("content_block_delta", {"type": "content_block_delta", "index": idx,
+                    "delta": {"type": "text_delta", "text": tx}})
+            add("content_block_stop", {"type": "content_block_stop", "index": idx})
+        idx += 1
+    add("message_delta", {"type": "message_delta",
+        "delta": {"stop_reason": m.get("stop_reason"), "stop_sequence": None},
+        "usage": {"output_tokens": usage.get("output_tokens", 0)}})
+    add("message_stop", {"type": "message_stop"})
+    return "".join(ev).encode("utf-8")
+
+
 async def _gw_proxy(request: Request, method: str):
     """浏览器 → new-api 网关：同源转发，服务端注入计费 Key（不暴露给前端）"""
     user = get_user(request)
@@ -3360,6 +3425,19 @@ async def _gw_proxy(request: Request, method: str):
     for h in ("anthropic-version", "anthropic-beta"):
         if request.headers.get(h):
             headers[h] = request.headers[h]
+    # v21 32K 修复移植：messages 请求强制改为非流式（绕过官方流式管线的 32K 输入检查），
+    # 上游 200 后把 JSON 转回 SSE 回填前端；非流式仍 400 时按 v21 同款穷举降级形态重试
+    forced_nonstream = False
+    payload = None
+    if method == "POST" and path.endswith("messages"):
+        try:
+            payload = json.loads(body.decode("utf-8", "ignore"))
+            if isinstance(payload, dict) and payload.get("stream") is True:
+                payload["stream"] = False
+                forced_nonstream = True
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        except Exception:  # noqa: BLE001
+            payload = None
     try:
         # P1-14（审查 R1）：同步 requests 必须移出事件循环，避免慢上游阻塞全站
         upstream = await run_in_threadpool(
@@ -3372,6 +3450,95 @@ async def _gw_proxy(request: Request, method: str):
         return JSONResponse(
             {"error": {"type": "upstream_error", "message": "计费网关暂时不可用，请稍后重试"}},
             status_code=502,
+        )
+
+    if forced_nonstream and upstream.status_code == 200:
+        # 非流式整包读取 → SSE 回填（计费按 new-api 收到的真实 usage 落账，不受回填影响）
+        data = await run_in_threadpool(_upstream_content, upstream)
+        try:
+            upstream.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _gw_inflight_release(user["id"])
+        try:
+            sse = _sse_from_message(json.loads(data.decode("utf-8", "ignore")))
+        except Exception:  # noqa: BLE001
+            sse = data
+        return Response(
+            sse, status_code=200, media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
+
+    if forced_nonstream and upstream.status_code == 400:
+        # 非流式仍报超限时：穷举降级形态（去联网工具/关思考），找官方接受的形态（v21 同款）
+        try:
+            err_body = await run_in_threadpool(_upstream_content, upstream)
+        except Exception:  # noqa: BLE001
+            err_body = b""
+        try:
+            upstream.close()
+        except Exception:  # noqa: BLE001
+            pass
+        msg = ""
+        try:
+            msg = (json.loads(err_body.decode("utf-8", "ignore")).get("error") or {}).get("message", "")
+        except Exception:  # noqa: BLE001
+            pass
+        if isinstance(payload, dict) and "user input too long" in msg:
+            for name, extra in (
+                ("v1_notools", {"tools": []}),
+                ("v2_notools_nothink", {"tools": [], "thinking": {"type": "disabled"}}),
+                ("v3_nothink", {"thinking": {"type": "disabled"}}),
+            ):
+                obj = {**payload, **extra}
+                b2 = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                try:
+                    r2 = await run_in_threadpool(
+                        http_requests.request,
+                        "POST", target, data=b2, headers=headers, stream=True, timeout=(10, 300),
+                    )
+                except Exception:  # noqa: BLE001
+                    break
+                s2 = r2.status_code
+                if s2 == 200:
+                    data = await run_in_threadpool(_upstream_content, r2)
+                    try:
+                        r2.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _gw_inflight_release(user["id"])
+                    try:
+                        sse = _sse_from_message(json.loads(data.decode("utf-8", "ignore")))
+                    except Exception:  # noqa: BLE001
+                        sse = data
+                    return Response(
+                        sse, status_code=200, media_type="text/event-stream",
+                        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+                    )
+                try:
+                    await run_in_threadpool(_upstream_content, r2)
+                    r2.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        _gw_inflight_release(user["id"])
+        return Response(err_body, status_code=400, media_type="application/json")
+
+    if forced_nonstream:
+        # 非流式但其他状态（401/402/429/5xx）：读完原样透传，不让半开连接挂线程池
+        data = b""
+        try:
+            data = (await run_in_threadpool(_upstream_content, upstream)) or b""
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            upstream.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _gw_inflight_release(user["id"])
+        return Response(
+            data,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "application/json"),
         )
 
     def gen():
