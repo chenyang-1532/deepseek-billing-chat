@@ -40,7 +40,10 @@ from fastapi.responses import (
 )
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
-from python_multipart.exceptions import MultipartParseError
+# 审查 R18：不顶层硬导入 python_multipart——旧版 python-multipart（≤0.0.9，包名
+# 只有 multipart）没有 python_multipart 模块，硬导入会让旧依赖环境启动即崩
+# （ModuleNotFoundError）。starlette 0.50 自身是双名兼容的，无需此导入；
+# MultipartParseError 的 MRO 是 FormParserError→ValueError，except ValueError 已覆盖。
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "data.db")
@@ -1187,13 +1190,16 @@ async def api_backup_post(request: Request):
         return JSONResponse({"ok": False}, status_code=403)
     ctype = (request.headers.get("content-type") or "").lower()
     if ctype.startswith("multipart/"):
-        # 审查 R17：畸形 part header（如 "------X\r\n@@@no-colon@@@..."）会让
-        # python_multipart 抛 MultipartParseError → 未捕获 500 + 5.7KB traceback/次
-        # （×3 稳定复现）。前置 valid_paid_user → 需已审核账号才可达（非匿名），但
-        # 攻击模型不变，在解析边界收口为 400（ValueError 兜 FormParser 的其他解析异常）
+        # 审查 R17/R18：畸形 part header（如 "------X\r\n@@@no-colon@@@..."）会让
+        # 解析器抛 MultipartParseError → 未捕获 500 + 5.7KB traceback/次（×3 稳定复现）。
+        # 前置 valid_paid_user → 需已审核账号才可达（非匿名），但攻击模型不变。
+        # 只捕 ValueError 即可：MultipartParseError（FormParserError→ValueError 子类）
+        # 与 starlette 包装的 MultiPartException 均在其内，且不引入对 python_multipart
+        # 包名的顶层依赖（旧版 python-multipart ≤0.0.9 只有 multipart 模块，见 R18）；
+        # 畸形体经 starlette 包装转 MultiPartException → FastAPI 已转 400，此处再兜底
         try:
             form = await request.form()
-        except (ValueError, MultipartParseError):
+        except ValueError:
             return JSONResponse({"ok": False, "msg": "请求格式错误"}, status_code=400)
         upload = form.get("file")
         deleted = str(form.get("deleted") or "")
