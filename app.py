@@ -2346,8 +2346,12 @@ async def api_upload(request: Request):
         upload_path = "/anthropic/v1/files"
     name = (request.query_params.get("name") or "file").replace('"', "").replace("\r", "").replace("\n", "")
     # 审查 R12/P3：purpose 直接拼进 multipart 头，未白名单时 CRLF 可破坏自建结构
+    # rich_layout_recognition：前端对 pdf/doc/docx/ppt/pptx 传此值，走 DeepSeek 文档
+    # 版式解析流程——漏了会导致 purpose 被丢弃、上游 400（2026-11-22 生产实测）
     _purpose = (request.query_params.get("purpose") or "").strip()
-    purpose = _purpose if _purpose in ("assistants", "batch", "fine-tune", "vision", "user_data") else None
+    purpose = _purpose if _purpose in (
+        "assistants", "batch", "fine-tune", "vision", "user_data", "rich_layout_recognition"
+    ) else None
     body = await request.body()
     if not body:
         return JSONResponse({"error": {"message": "空文件"}}, status_code=400)

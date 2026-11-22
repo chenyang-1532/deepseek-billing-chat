@@ -57,6 +57,7 @@ DeepSeek 官方 API（渠道 Key，模型 deepseek-flash）
 7. **admin 面板**：页签式切换（body.tabbed，仅显示当前 sec；锚点/303 重定向直达对应页签并记忆上次页签）；顶部总览条（待审充值/用户数/总余额/今日消耗/未用充值码）；移动端表格卡片化（`table.cardable` + `data-l` 标签）；已拒绝/禁用用户可「删除」（级联清理 gateway_map、cloud_sessions、wallet_tx、pay_orders、new-api 用户/token，正常用户须先禁用）
 8. **注册**：免审批即 `approved`；登录页无任何审核文案
 9. **文件上传绕过 new-api**（v24 修复）：`/api/upload` 在网关模式下**不走 new-api**——new-api 对 `/v1/files` 按对话中转强制要求 model 参数（Files API 无 model 字段）→ 必 400「Model name not specified」。改用 `gw_files_key()` 读 new-api 渠道表里启用的 DeepSeek 官方 Key，直连 `/anthropic/v1/files`（x-api-key + anthropic-beta: files-api-2025-04-14）。与聊天渠道同一 DeepSeek 账号，file_id 照常引用；上传不计费，解析 token 在聊天时仍走 new-api 扣费。**若未来 new-api 增加多渠道轮询，此处需改为按渠道亲和上传**（单渠道部署无此问题）
+10. **purpose 白名单必须与前端对齐**（v24.1 修复）：前端对 pdf/doc/docx/ppt/pptx 传 `purpose=rich_layout_recognition`（DeepSeek 文档版式解析），其余传 `user_data`；服务端白名单漏掉 `rich_layout_recognition` 会导致 purpose 被静默丢弃、上游 400——表现为「图片传得上、Word 传不上」（2026-11-22 生产实测）。后续前端若新增 purpose 取值，必须同步扩服务端白名单
 
 ## 5. 测试站（新功能开发环境）
 
