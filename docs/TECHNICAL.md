@@ -21,7 +21,7 @@ new-api (127.0.0.1:13001, 仅本机可访问)
 DeepSeek 官方 API（渠道 Key，模型 deepseek-flash）
 ```
 
-- 前端：DeepSeek 官网复刻 SPA（React 压缩 bundle），内容变更必须**改名 bundle**（fe540c06→07→08→09）绕过 30 天 immutable 缓存
+- 前端：DeepSeek 官网复刻 SPA（React 压缩 bundle），内容变更必须**改名 bundle**（fe540c06→07→08→09）绕过 30 天 immutable 缓存；v25 起另有独立群聊模块 `static/js/group-chat.v2.js`（同样按文件名版本绕缓存）
 - 后端：单文件 `app.py`（~4400 行），SQLite `data.db`（用户/充值单/流水/云备份）+ `one-api.db`（new-api 计费库）
 
 ## 2. 生产环境（勿改动，仅供参照）
@@ -58,6 +58,14 @@ DeepSeek 官方 API（渠道 Key，模型 deepseek-flash）
 8. **注册**：免审批即 `approved`；登录页无任何审核文案
 9. **文件上传绕过 new-api**（v24 修复）：`/api/upload` 在网关模式下**不走 new-api**——new-api 对 `/v1/files` 按对话中转强制要求 model 参数（Files API 无 model 字段）→ 必 400「Model name not specified」。改用 `gw_files_key()` 读 new-api 渠道表里启用的 DeepSeek 官方 Key，直连 `/anthropic/v1/files`（x-api-key + anthropic-beta: files-api-2025-04-14）。与聊天渠道同一 DeepSeek 账号，file_id 照常引用；上传不计费，解析 token 在聊天时仍走 new-api 扣费。**若未来 new-api 增加多渠道轮询，此处需改为按渠道亲和上传**（单渠道部署无此问题）
 10. **purpose 白名单必须与前端对齐**（v24.1 修复）：前端对 pdf/doc/docx/ppt/pptx 传 `purpose=rich_layout_recognition`（DeepSeek 文档版式解析），其余传 `user_data`；服务端白名单漏掉 `rich_layout_recognition` 会导致 purpose 被静默丢弃、上游 400——表现为「图片传得上、Word 传不上」（2026-11-22 生产实测）。后续前端若新增 purpose 取值，必须同步扩服务端白名单
+11. **角色群聊**（v25 新增）：把几个单聊角色拉进一个群，用户发一条消息后所有角色**按加入顺序各发言一次**（固定一轮、轮内可接话，硬上限=成员数×1 次调用，绝不自增轮次防烧钱）。要点：
+    - 数据模型：`chat_groups`（uid/name/members_json）、`chat_group_messages`（sender_type=user/persona/system）、`persona_group_memory`（uid+角色名 主键），全部 `CREATE TABLE IF NOT EXISTS` 平滑升级
+    - 编排端点 `POST /api/groups/{gid}/messages` 返回 SSE（user/reply_start/delta/reply_end/reply_error/done）；单角色失败发 `reply_error(kind=persona_failed)` 不阻塞他人；余额不足（<¥0.005 或预估成本超余额）发 `kind=insufficient_balance` 并终止整轮；发消息前还有 402 第一道闸与 10 条/分钟限流
+    - 计费：每个角色一次独立 LLM 调用，直连 `NEWAPI_BASE/v1/messages`（Bearer=发起用户 token），走 new-api 正常扣费；done 事件带回合总消耗（logs 表落账有延迟，最多等 10s，未落账则提示以钱包流水为准）
+    - 记忆双写：每条角色回复完成后立即把「本轮用户消息+截至该角色的全部发言」追加进该角色的 `persona_group_memory`（单条目封顶 600 字/角色、总量 12000 字滚动裁剪，BEGIN IMMEDIATE 防并发写）；**单聊时**由 `_gw_proxy` 解析 system 里的`【角色名】`自动把记忆注入 system（`GET /api/persona-memory` 可查，`GC_SINGLE_INJECT_CHARS=3000` 控制注入成本）
+    - 前端：独立 overlay 模块 `static/js/group-chat.v2.js`（**主 bundle 未改动，无需改名**；本文件自身变更需改名版本号绕 immutable 缓存），index.html 追加引用。选人数据源是 `GET /api/personas`（服务端解析 cloud_sessions 里的 persona，头像服务端缩到 96px）——云端会话是权威数据源，本机 IndexedDB 只作回退；侧栏尝试注入「👥角色群聊」入口（中英文案都匹配），另有右下角 FAB 兜底；群面板自带群会话列表/消息渲染（角色名+头像）/费用提示与回合消耗条；402 时尝试原地打开钱包弹窗（window.__gwOpenWallet）
+    - 选人要求：群名 1-30 字；成员 2-8 个、角色名唯一≤24 字（来自已有单聊角色的 persona.name）
+    - 已知取舍（待站长决策）：一轮制编排（不做 LLM 选人/多轮自动互聊）；群定义与消息存服务端、换设备一致；群成员头像取建群时快照，之后改单聊人设不会回写
 
 ## 5. 测试站（新功能开发环境）
 

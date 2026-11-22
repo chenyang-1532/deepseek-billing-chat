@@ -13,6 +13,7 @@
 import html
 import math
 import os
+import asyncio
 import fcntl
 import threading
 import re
@@ -260,6 +261,39 @@ def init_db():
         c.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pay_orders_crid ON pay_orders(uid, client_request_id) "
             "WHERE client_request_id IS NOT NULL"
+        )
+        # ── 角色群聊（v25）：老库平滑升级，全部 CREATE TABLE IF NOT EXISTS ──
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS chat_groups(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                members_json TEXT NOT NULL,
+                created_at TEXT,
+                deleted INTEGER DEFAULT 0
+            )"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS chat_group_messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                sender_type TEXT NOT NULL,
+                sender_name TEXT DEFAULT '',
+                content TEXT NOT NULL,
+                created_at TEXT
+            )"""
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gc_msg ON chat_group_messages(group_id, id)"
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS persona_group_memory(
+                uid INTEGER NOT NULL,
+                persona_name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                updated_at TEXT,
+                PRIMARY KEY(uid, persona_name)
+            )"""
         )
 
 def today() -> str:
@@ -3598,10 +3632,28 @@ async def _gw_proxy(request: Request, method: str):
     if method == "POST" and path.endswith("messages"):
         try:
             payload = json.loads(body.decode("utf-8", "ignore"))
-            if isinstance(payload, dict) and payload.get("stream") is True:
-                payload["stream"] = False
-                forced_nonstream = True
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            if isinstance(payload, dict):
+                # ── 群聊记忆注入（v25）：单聊请求的 system 里带【角色名】时，
+                # 把该角色的群聊记忆追加进 system，让角色单聊时记得群里发生了什么。
+                # 注入失败绝不影响正常聊天（静默跳过）。
+                try:
+                    _pn = _gc_extract_persona_name(payload.get("system"))
+                    if _pn:
+                        _mem = _gc_memory_load(user["id"], _pn)
+                        if _mem:
+                            _inj = _gc_single_inject_block(_mem)
+                            _sys = payload.get("system")
+                            if isinstance(_sys, str):
+                                payload["system"] = _sys + "\n\n" + _inj
+                            elif isinstance(_sys, list):
+                                payload["system"] = list(_sys) + [{"type": "text", "text": _inj}]
+                            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                except Exception as _e:  # noqa: BLE001
+                    print("[group-chat] 记忆注入失败(忽略):", _e)
+                if payload.get("stream") is True:
+                    payload["stream"] = False
+                    forced_nonstream = True
+                    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         except Exception:  # noqa: BLE001
             payload = None
     try:
@@ -4215,6 +4267,682 @@ async def admin_wallet_qr(request: Request, file: UploadFile = File(None)):
 
 
 # ---------- 门禁 + 静态托管（必须放在最后） ----------
+# ---------- 角色群聊（v25） ----------
+# 编排规则（参考 SillyTavern Group Chat 的 List order + AutoGen GroupChat 的
+# max_rounds 硬上限）：每条用户消息触发「固定一轮」——所有成员按加入顺序各
+# 发言一次，后发言者能看到先发言者的回复（轮内自然接话）。轮次不自增、不
+# 互相点名续聊，硬上限 = 成员数 × 1 次调用，成本可预期且绝不无限互聊。
+GC_MAX_MEMBERS = 8                 # 群成员上限（防成本失控）
+GC_MIN_MEMBERS = 2                 # 至少 2 个角色（群聊语义）
+GC_CONTEXT_MESSAGES = 30           # 注入 LLM 的最近群聊条数（共享上下文）
+GC_MEMORY_MAX_CHARS = 12000        # 单角色群聊记忆上限（超出从头部整行裁剪）
+GC_SINGLE_INJECT_CHARS = 3000      # 单聊注入记忆上限（控制单聊成本）
+GC_MAX_TOKENS = 1024               # 群聊单次回复输出上限
+GC_SEND_RATE_LIMIT = 10            # 群聊发送限流：每用户每分钟条数
+GC_MSG_MAX_CHARS = 4000            # 用户单条群消息长度上限
+GC_REPLY_MAX_CHARS = 20000         # 角色回复入库长度上限
+GC_MEMBER_NAME_MAX = 24            # 角色名长度上限
+GC_AVATAR_MAX_CHARS = 140000       # 单个头像 data URL 上限（前端已缩到 96px）
+GC_UPSTREAM_TIMEOUT = (10, 300)
+GC_COST_WAIT_SECONDS = 10          # 回合结束后等 new-api 落账的最长时间
+_GC_NAME_RE = re.compile(r"【角色名】([^\n】]{1,32})")
+_GC_ATTEMPTS = {}
+
+
+class _GCUpstreamError(Exception):
+    def __init__(self, status, detail):
+        super().__init__("upstream %s" % status)
+        self.status = status
+        self.detail = detail
+
+
+def _gc_rate_limited(uid: int) -> bool:
+    """群聊发送限流（结构同 _REDEEM_ATTEMPTS：{uid: [窗口起始, 次数]}，进程内）"""
+    now = time.time()
+    arr = _GC_ATTEMPTS.get(uid)
+    if not arr or now - arr[0] >= 60:
+        _GC_ATTEMPTS[uid] = [now, 1]
+        return False
+    arr[1] += 1
+    return arr[1] > GC_SEND_RATE_LIMIT
+
+
+def _gc_extract_persona_name(system) -> str:
+    """从单聊请求的 system prompt 中提取角色名（前端人设块格式：【角色名】xxx）。
+    健壮性：名字行若无换行跟随，按常见中文标点截断（防「诸葛明，始终以…」整句被当名字）。"""
+    texts = []
+    if isinstance(system, str):
+        texts = [system]
+    elif isinstance(system, list):
+        texts = [b.get("text", "") for b in system
+                 if isinstance(b, dict) and b.get("type") == "text"]
+    for t in texts:
+        m = _GC_NAME_RE.search(t)
+        if m:
+            cand = m.group(1).strip()
+            for sep in ("，", "。", "！", "？", "；", "、", ",", ";"):
+                idx = cand.find(sep)
+                if idx > 0:
+                    cand = cand[:idx]
+            return cand.strip()
+    return ""
+
+
+def _gc_memory_load(uid: int, persona_name: str) -> str:
+    if not persona_name:
+        return ""
+    try:
+        with db() as c:
+            row = c.execute(
+                "SELECT content FROM persona_group_memory WHERE uid=? AND persona_name=?",
+                (uid, persona_name),
+            ).fetchone()
+        return (row["content"] or "") if row else ""
+    except Exception:  # noqa: BLE001  记忆表异常不阻塞聊天
+        return ""
+
+
+def _gc_memory_append(uid: int, persona_name: str, entry: str) -> None:
+    """把一段群聊经历追加进角色记忆（BEGIN IMMEDIATE 串行化并发写；超限从头部裁）"""
+    entry = (entry or "").strip()
+    if not entry or not persona_name:
+        return
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            row = c.execute(
+                "SELECT content FROM persona_group_memory WHERE uid=? AND persona_name=?",
+                (uid, persona_name),
+            ).fetchone()
+            old = row["content"] if row else ""
+            new = (old + "\n\n" + entry) if old else entry
+            if len(new) > GC_MEMORY_MAX_CHARS:
+                new = new[-GC_MEMORY_MAX_CHARS:]
+                nl = new.find("\n")
+                if nl >= 0:
+                    new = new[nl + 1:]
+            c.execute(
+                "INSERT INTO persona_group_memory(uid,persona_name,content,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(uid,persona_name) DO UPDATE SET "
+                "content=excluded.content, updated_at=excluded.updated_at",
+                (uid, persona_name, new, site_now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+
+
+def _gc_single_inject_block(mem: str) -> str:
+    mem = (mem or "").strip()
+    if len(mem) > GC_SINGLE_INJECT_CHARS:
+        mem = mem[-GC_SINGLE_INJECT_CHARS:]
+        nl = mem.find("\n")
+        if nl >= 0:
+            mem = mem[nl + 1:]
+    return (
+        "【群聊记忆】以下是你在以往群聊中的经历片段（仅供保持记忆连续性，"
+        "单聊时不必主动提起，除非用户问到）：\n" + mem
+    )
+
+
+def _gc_persona_block(member: dict) -> str:
+    """与前端 ef() 的人设块同构：【角色名】【身份与背景】【性格】【说话风格】【示例对话】"""
+    p = member.get("persona") or {}
+    if isinstance(p, str):
+        return p.strip()
+    r = []
+    if p.get("name"):
+        r.append("【角色名】%s" % p["name"])
+    if p.get("description"):
+        r.append("【身份与背景】%s" % p["description"])
+    if p.get("personality"):
+        r.append("【性格】%s" % p["personality"])
+    if p.get("style"):
+        r.append("【说话风格】%s" % p["style"])
+    if p.get("example"):
+        r.append("【示例对话】（仅用于学习语言风格与格式，不要原样复读） %s" % p["example"])
+    if not r:
+        return "你是一位参与群聊的 AI 角色。"
+    return "\n".join(r)
+
+
+def _gc_build_system(member: dict, group_name: str, member_names, memory: str) -> str:
+    names = "、".join(member_names)
+    block = _gc_persona_block(member)
+    lines = [
+        block,
+        "",
+        "【群聊场景】你现在在一个多人群聊「%s」中，群成员：用户、%s。" % (group_name, names),
+        "群聊规则：",
+        "1. 群聊记录会以「发言人：内容」逐行放在用户消息里提供给你；",
+        "2. 你只以「%s」的身份发言：直接输出你的一条发言内容，不要带名字前缀，"
+        "不要替其他角色或用户发言，不要复述群聊记录；" % member.get("name", ""),
+        "3. 保持你的人设与说话风格，可以回应用户或其他成员的发言；发言简洁自然，一般不超过 200 字。",
+    ]
+    if memory:
+        mem = memory.strip()
+        if len(mem) > GC_SINGLE_INJECT_CHARS:
+            mem = mem[-GC_SINGLE_INJECT_CHARS:]
+            nl = mem.find("\n")
+            if nl >= 0:
+                mem = mem[nl + 1:]
+        lines += [
+            "",
+            "【群聊记忆】以下是你在以往群聊中的经历片段（供保持记忆连续性，不要逐条复述）：",
+            mem,
+        ]
+    return "\n".join(lines)
+
+
+def _gc_transcript(rows, username: str) -> str:
+    out = []
+    for r in rows:
+        who = username if r["sender_type"] == "user" else r["sender_name"]
+        out.append("%s：%s" % (who, r["content"]))
+    return "\n".join(out)
+
+
+def _gc_call_llm(token_key: str, system: str, user_text: str) -> str:
+    """群聊单角色调用：直连 new-api（与网关代理同链路），计费自动落到发起用户 token"""
+    payload = {
+        "model": get_setting(GW_DEFAULT_MODEL_KEY, "deepseek-flash"),
+        "system": system,
+        "max_tokens": GC_MAX_TOKENS,
+        "thinking": {"type": "disabled"},
+        "messages": [{"role": "user", "content": user_text}],
+    }
+    r = http_requests.post(
+        NEWAPI_BASE + "/v1/messages",
+        json=payload,
+        headers={"Authorization": "Bearer " + token_key, "Content-Type": "application/json"},
+        timeout=GC_UPSTREAM_TIMEOUT,
+    )
+    if r.status_code != 200:
+        raise _GCUpstreamError(r.status_code, (r.text or "")[:300])
+    try:
+        data = r.json()
+    except Exception:  # noqa: BLE001
+        raise _GCUpstreamError(502, "上游返回非 JSON")
+    text = "".join(
+        b.get("text", "") for b in (data.get("content") or [])
+        if isinstance(b, dict) and b.get("type") == "text"
+    )
+    return text.strip()
+
+
+def _gc_balance(nid: int) -> int | None:
+    try:
+        with napi_connect() as nc:
+            row = nc.execute("SELECT quota FROM users WHERE id=?", (nid,)).fetchone()
+        return (row["quota"] or 0) if row else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gc_cost_quota(nid: int, before_id: int) -> int:
+    """读回合期间 new-api 落账的消费 quota（logs 表 type=2；落账有延迟由调用方重试）"""
+    try:
+        with napi_connect() as nc:
+            row = nc.execute(
+                "SELECT COALESCE(SUM(quota),0) AS s FROM logs WHERE user_id=? AND type=2 AND id>?",
+                (nid, before_id),
+            ).fetchone()
+        return int(row["s"] or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _gc_log_max_id(nid: int) -> int:
+    try:
+        with napi_connect() as nc:
+            row = nc.execute(
+                "SELECT COALESCE(MAX(id),0) AS m FROM logs WHERE user_id=?", (nid,)
+            ).fetchone()
+        return int(row["m"] or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _gc_sse(event: str, data: dict) -> str:
+    return "event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))
+
+
+def _gc_load_group(c, gid: int, uid: int):
+    return c.execute(
+        "SELECT * FROM chat_groups WHERE id=? AND uid=? AND deleted=0", (gid, uid)
+    ).fetchone()
+
+
+def _gc_parse_members(raw) -> list:
+    try:
+        members = json.loads(raw or "[]")
+        return members if isinstance(members, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def _gc_round(user, group, content: str):
+    """群聊回合编排器（SSE 事件流）。角色失败不阻塞后续角色；余额不足立即终止整轮。"""
+    gid = group["id"]
+    uid = user["id"]
+    username = user["username"]
+    members = _gc_parse_members(group["members_json"])
+    names = [m.get("name", "") for m in members if m.get("name")]
+    token_key, nid = gw_provision(user)
+    now_str = site_now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with db() as c:
+            cur = c.execute(
+                "INSERT INTO chat_group_messages(group_id,sender_type,sender_name,content,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (gid, "user", "", content[:GC_MSG_MAX_CHARS], now_str),
+            )
+            umid = cur.lastrowid
+    except Exception as e:  # noqa: BLE001
+        yield _gc_sse("error", {"message": "消息写入失败，请稍后重试"})
+        return
+    yield _gc_sse("user", {"id": umid, "content": content[:GC_MSG_MAX_CHARS], "created_at": now_str})
+
+    before_log = await run_in_threadpool(_gc_log_max_id, nid)
+    ok_calls = 0
+    round_lines = []            # 本轮已产生的发言 [(name, text)]，用于记忆条目
+    aborted = False             # 余额不足时终止整轮
+
+    for i, m in enumerate(members):
+        name = (m.get("name") or "").strip()
+        if not name:
+            continue
+        seq = i
+        # ── 余额预检（第二道闸同款口径）：不足则终止整轮并明确告知 ──
+        bal = await run_in_threadpool(_gc_balance, nid)
+        if bal is None or bal < cny_to_quota(0.005):
+            yield _gc_sse("reply_error", {
+                "seq": seq, "sender": name, "kind": "insufficient_balance",
+                "message": "钱包余额不足，本轮未发言的角色已停止（充值后可继续使用群聊）",
+            })
+            aborted = True
+            break
+        # ── 构建上下文（含先发言者的回复，轮内自然接话） ──
+        with db() as c:
+            rows = c.execute(
+                "SELECT sender_type, sender_name, content FROM chat_group_messages "
+                "WHERE group_id=? AND sender_type!='system' ORDER BY id DESC LIMIT ?",
+                (gid, GC_CONTEXT_MESSAGES),
+            ).fetchall()
+        rows.reverse()
+        memory = await run_in_threadpool(_gc_memory_load, uid, name)
+        system = _gc_build_system(m, group["name"], [n for n in names if n != name], memory)
+        user_text = (
+            "以下是群聊「%s」最近的记录（时间从早到晚）：\n%s\n---\n"
+            "现在轮到你（%s）发言，直接输出你的发言内容。"
+            % (group["name"], _gc_transcript(rows, username), name)
+        )
+        # 成本预估预检（与网关同口径：粗估成本超余额即拒绝）
+        est_body = json.dumps({
+            "model": get_setting(GW_DEFAULT_MODEL_KEY, "deepseek-flash"),
+            "system": system, "max_tokens": GC_MAX_TOKENS, "messages": [
+                {"role": "user", "content": user_text}]}, ensure_ascii=False).encode()
+        est = _gw_estimate_quota(est_body, get_setting(GW_DEFAULT_MODEL_KEY, "deepseek-flash"))
+        if est and bal < est:
+            yield _gc_sse("reply_error", {
+                "seq": seq, "sender": name, "kind": "insufficient_balance",
+                "message": "余额不足以完成本次群聊回复（预估成本超过余额），本轮提前结束",
+            })
+            aborted = True
+            break
+        yield _gc_sse("reply_start", {"seq": seq, "sender": name})
+        if not _gw_inflight_acquire(uid):
+            yield _gc_sse("reply_error", {
+                "seq": seq, "sender": name, "kind": "rate_limited",
+                "message": "当前在途请求过多，%s 这轮没排上，请稍后再发一条" % name,
+            })
+            continue
+        try:
+            text = await run_in_threadpool(_gc_call_llm, token_key, system, user_text)
+        except Exception as e:  # noqa: BLE001  单角色失败不阻塞其他角色
+            _gw_inflight_release(uid)
+            detail = ""
+            status = 0
+            if isinstance(e, _GCUpstreamError):
+                status = e.status
+                detail = e.detail[:120]
+            elif isinstance(e, Exception):
+                detail = str(e)[:120]
+            print("[group-chat] 角色 %s 调用失败 group=%s status=%s err=%s" % (name, gid, status, detail))
+            err_row = "（系统：%s 生成失败，本轮跳过）" % name
+            with db() as c:
+                c.execute(
+                    "INSERT INTO chat_group_messages(group_id,sender_type,sender_name,content,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (gid, "system", name, err_row, site_now().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+            yield _gc_sse("reply_error", {
+                "seq": seq, "sender": name, "kind": "persona_failed",
+                "message": "%s 这次没回复成功，其他角色继续" % name,
+            })
+            continue
+        _gw_inflight_release(uid)
+        if not text:
+            yield _gc_sse("reply_error", {
+                "seq": seq, "sender": name, "kind": "persona_failed",
+                "message": "%s 这次返回了空内容，本轮跳过" % name,
+            })
+            continue
+        text = text[:GC_REPLY_MAX_CHARS]
+        rnow = site_now().strftime("%Y-%m-%d %H:%M:%S")
+        with db() as c:
+            cur = c.execute(
+                "INSERT INTO chat_group_messages(group_id,sender_type,sender_name,content,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (gid, "persona", name, text, rnow),
+            )
+            mid = cur.lastrowid
+        ok_calls += 1
+        round_lines.append((name, text))
+        # 逐 token 观感的分段下发（上游为非流式，切小块回填）
+        CH = 160
+        for k in range(0, len(text), CH):
+            yield _gc_sse("delta", {"seq": seq, "text": text[k:k + CH]})
+        yield _gc_sse("reply_end", {"seq": seq, "sender": name, "message_id": mid, "created_at": rnow})
+        # ── 记忆双写：该角色亲眼见过的本轮内容（用户消息 + 至自己的全部发言）──
+        seen = [("用户", username, content[:GC_MSG_MAX_CHARS])] + \
+               [(n, n, t) for n, t in round_lines]
+        entry_lines = ["［群聊「%s」 %s］" % (group["name"], rnow)]
+        for _w, _n, _t in seen:
+            entry_lines.append("%s：%s" % (_w, _t[:600]))
+        entry_lines.append("（以上是你以「%s」身份参与的一段群聊经历）" % name)
+        try:
+            await run_in_threadpool(
+                _gc_memory_append, uid, name, "\n".join(entry_lines))
+        except Exception as e:  # noqa: BLE001
+            print("[group-chat] 记忆写入失败 uid=%s name=%s err=%s" % (uid, name, e))
+
+    # ── 费用汇总：等 new-api 落账（实测落账可延迟 >2s），超时按已落账部分返回 ──
+    total_quota = 0
+    if ok_calls > 0:
+        deadline = time.time() + GC_COST_WAIT_SECONDS
+        while time.time() < deadline:
+            total_quota = await run_in_threadpool(_gc_cost_quota, nid, before_log)
+            if total_quota > 0:
+                break
+            await asyncio.sleep(1.5)
+    yield _gc_sse("done", {
+        "ok": True,
+        "replies": ok_calls,
+        "aborted": aborted,
+        "total_quota": total_quota,
+        "total_cny": round(quota_to_cny(total_quota), 6) if total_quota else None,
+        "note": "" if total_quota else "计费落账有延迟，实际费用以钱包流水为准",
+    })
+
+
+@app.get("/api/groups")
+def api_groups_list(request: Request):
+    user = get_user(request)
+    if not valid_paid_user(user):
+        return JSONResponse({"ok": False}, status_code=403)
+    with db() as c:
+        rows = c.execute(
+            "SELECT id, name, members_json, created_at FROM chat_groups "
+            "WHERE uid=? AND deleted=0 ORDER BY id DESC", (user["id"],)
+        ).fetchall()
+        last = {}
+        for r in rows:
+            row = c.execute(
+                "SELECT content, created_at FROM chat_group_messages WHERE group_id=? "
+                "ORDER BY id DESC LIMIT 1", (r["id"],)
+            ).fetchone()
+            last[r["id"]] = {"content": (row["content"] or "")[:50], "created_at": row["created_at"]} if row else None
+    items = []
+    for r in rows:
+        members = _gc_parse_members(r["members_json"])
+        items.append({
+            "id": r["id"],
+            "name": r["name"],
+            "member_count": len(members),
+            "member_names": [m.get("name", "") for m in members],
+            "created_at": r["created_at"],
+            "last": last.get(r["id"]),
+        })
+    return JSONResponse({"ok": True, "groups": items})
+
+
+@app.get("/api/groups/{gid}")
+def api_group_detail(gid: int, request: Request):
+    user = get_user(request)
+    if not valid_paid_user(user):
+        return JSONResponse({"ok": False}, status_code=403)
+    with db() as c:
+        g = _gc_load_group(c, gid, user["id"])
+    if g is None:
+        return JSONResponse({"ok": False, "msg": "群聊不存在"}, status_code=404)
+    members = _gc_parse_members(g["members_json"])
+    return JSONResponse({
+        "ok": True,
+        "group": {
+            "id": g["id"], "name": g["name"], "created_at": g["created_at"],
+            "member_count": len(members),
+            "member_names": [m.get("name", "") for m in members],
+            "members": [{"name": m.get("name", ""), "avatar": m.get("avatar", "")} for m in members],
+        },
+    })
+
+
+@app.post("/api/groups")
+async def api_groups_create(request: Request):
+    user = get_user(request)
+    if not valid_paid_user(user):
+        return JSONResponse({"ok": False}, status_code=403)
+    body, _err = _json_body(await request.body(), msg="参数错误")
+    if _err is not None:
+        return _err
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "msg": "参数错误"}, status_code=400)
+    name = str(body.get("name") or "").strip()
+    members = body.get("members")
+    if not name or len(name) > 30:
+        return JSONResponse({"ok": False, "msg": "群名需为 1-30 个字符"}, status_code=400)
+    if not isinstance(members, list) or not (GC_MIN_MEMBERS <= len(members) <= GC_MAX_MEMBERS):
+        return JSONResponse(
+            {"ok": False, "msg": "群聊需要 %d-%d 个角色" % (GC_MIN_MEMBERS, GC_MAX_MEMBERS)},
+            status_code=400)
+    clean = []
+    seen_names = set()
+    total_avatar = 0
+    for m in members:
+        if not isinstance(m, dict):
+            return JSONResponse({"ok": False, "msg": "成员格式错误"}, status_code=400)
+        mn = str(m.get("name") or "").strip()
+        if not mn or len(mn) > GC_MEMBER_NAME_MAX:
+            return JSONResponse(
+                {"ok": False, "msg": "角色名需为 1-%d 个字符" % GC_MEMBER_NAME_MAX}, status_code=400)
+        if mn in seen_names:
+            return JSONResponse({"ok": False, "msg": "角色名重复：%s" % mn}, status_code=400)
+        seen_names.add(mn)
+        avatar = m.get("avatar") or ""
+        if not isinstance(avatar, str) or len(avatar) > GC_AVATAR_MAX_CHARS:
+            avatar = ""   # 超限头像直接丢弃（前端已预缩，正常不触发）
+        total_avatar += len(avatar)
+        p = m.get("persona") or {}
+        if isinstance(p, str):
+            persona = {"description": str(p)[:4000]}
+        elif isinstance(p, dict):
+            persona = {k: str(p.get(k) or "")[:4000]
+                       for k in ("description", "personality", "style", "example", "firstMes")}
+        else:
+            persona = {}
+        clean.append({"name": mn, "avatar": avatar, "persona": persona})
+    if total_avatar > 900000:
+        return JSONResponse({"ok": False, "msg": "头像总体积过大，请精简后重试"}, status_code=400)
+    now_str = site_now().strftime("%Y-%m-%d %H:%M:%S")
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO chat_groups(uid, name, members_json, created_at) VALUES(?,?,?,?)",
+            (user["id"], name, json.dumps(clean, ensure_ascii=False), now_str),
+        )
+        gid = cur.lastrowid
+    return JSONResponse({"ok": True, "id": gid, "name": name})
+
+
+@app.delete("/api/groups/{gid}")
+async def api_group_delete(gid: int, request: Request):
+    user = get_user(request)
+    if not valid_paid_user(user):
+        return JSONResponse({"ok": False}, status_code=403)
+    with db() as c:
+        g = _gc_load_group(c, gid, user["id"])
+        if g is None:
+            return JSONResponse({"ok": False, "msg": "群聊不存在"}, status_code=404)
+        c.execute("UPDATE chat_groups SET deleted=1 WHERE id=?", (gid,))
+        c.execute("DELETE FROM chat_group_messages WHERE group_id=?", (gid,))
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/groups/{gid}/messages")
+def api_group_messages(gid: int, request: Request, after_id: int = 0, limit: int = 100):
+    user = get_user(request)
+    if not valid_paid_user(user):
+        return JSONResponse({"ok": False}, status_code=403)
+    with db() as c:
+        g = _gc_load_group(c, gid, user["id"])
+        if g is None:
+            return JSONResponse({"ok": False, "msg": "群聊不存在"}, status_code=404)
+        rows = c.execute(
+            "SELECT id, sender_type, sender_name, content, created_at FROM chat_group_messages "
+            "WHERE group_id=? AND id>? ORDER BY id ASC LIMIT ?",
+            (gid, max(0, after_id), max(1, min(limit, 200))),
+        ).fetchall()
+    return JSONResponse({"ok": True, "messages": [
+        {"id": r["id"], "sender_type": r["sender_type"], "sender_name": r["sender_name"],
+         "content": r["content"], "created_at": r["created_at"]} for r in rows]})
+
+
+@app.post("/api/groups/{gid}/messages")
+async def api_group_chat(gid: int, request: Request):
+    user = get_user(request)
+    if user is None:
+        return JSONResponse({"ok": False}, status_code=401)
+    if not gw_enabled():
+        return JSONResponse(
+            {"error": {"type": "gateway_disabled", "message": "网关未开启"}}, status_code=503)
+    if not valid_paid_user(user):
+        msg = ("账号已被禁用，请联系管理员" if user["status"] == "disabled"
+               else "账号待审核，暂不可使用" if user["status"] == "pending"
+               else "账号已过期，请联系管理员续费")
+        return JSONResponse({"error": {"type": "account_" + str(user["status"]), "message": msg}},
+                            status_code=403)
+    if _gc_rate_limited(user["id"]):
+        return JSONResponse(
+            {"ok": False, "msg": "发送太频繁，请一分钟后再试（群聊每条消息会触发所有角色回复）"},
+            status_code=429)
+    body, _err = _json_body(await request.body(), msg="参数错误")
+    if _err is not None:
+        return _err
+    content = str((body or {}).get("content") or "").strip() if isinstance(body, dict) else ""
+    if not content:
+        return JSONResponse({"ok": False, "msg": "消息不能为空"}, status_code=400)
+    if len(content) > GC_MSG_MAX_CHARS:
+        return JSONResponse(
+            {"ok": False, "msg": "消息过长（上限 %d 字）" % GC_MSG_MAX_CHARS}, status_code=400)
+    with db() as c:
+        g = _gc_load_group(c, gid, user["id"])
+    if g is None:
+        return JSONResponse({"ok": False, "msg": "群聊不存在"}, status_code=404)
+    members = _gc_parse_members(g["members_json"])
+    if not members:
+        return JSONResponse({"ok": False, "msg": "群聊没有成员"}, status_code=400)
+    # 第一道余额闸：余额为 0 直接拒绝（不打扰任何角色）
+    _, nid = gw_provision(user)
+    bal = await run_in_threadpool(_gc_balance, nid)
+    if bal is None or bal < cny_to_quota(0.005):
+        return JSONResponse(
+            {"error": {"type": "insufficient_balance", "message": "钱包余额不足，请充值后再使用"}},
+            status_code=402)
+    return StreamingResponse(
+        _gc_round(user, g, content),
+        status_code=200,
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/api/personas")
+def api_personas(request: Request):
+    """用户全部单聊角色清单（群聊「选人」数据源）。
+
+    来源：cloud_sessions（云端会话是权威数据，本机 IndexedDB 不一定有）。
+    头像服务端缩到 96px 后随名单返回（控制体积），解析失败/无名字的会话跳过。
+    """
+    import base64 as _b64
+    user = get_user(request)
+    if not valid_paid_user(user):
+        return JSONResponse({"ok": False}, status_code=403)
+    personas = []
+    seen = {}
+    try:
+        with db() as c:
+            _ensure_cloud_sessions(c)
+            rows = c.execute(
+                "SELECT sid, session_json, updated_at FROM cloud_sessions "
+                "WHERE uid=? AND deleted=0 AND session_json IS NOT NULL ORDER BY sid",
+                (user["id"],),
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        rows = []
+    for r in rows:
+        try:
+            s = json.loads(r["session_json"])
+        except Exception:  # noqa: BLE001
+            continue
+        p = s.get("persona") if isinstance(s, dict) else None
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or "").strip()
+        if not name or len(name) > GC_MEMBER_NAME_MAX:
+            continue
+        avatar = p.get("avatar") or ""
+        if isinstance(avatar, str) and avatar.startswith("data:image/"):
+            try:
+                raw = _b64.b64decode(avatar.split(",", 1)[1])
+                small = _shrink_image(raw, 96)
+                avatar = ("data:image/png;base64," + _b64.b64encode(small).decode()
+                          if small else "")
+            except Exception:  # noqa: BLE001
+                avatar = ""
+        else:
+            avatar = ""
+        item = {
+            "sid": r["sid"],
+            "title": str(s.get("title") or "")[:40],
+            "name": name,
+            "avatar": avatar,
+            "description": str(p.get("description") or "")[:4000],
+            "personality": str(p.get("personality") or "")[:4000],
+            "style": str(p.get("style") or "")[:4000],
+            "example": str(p.get("example") or "")[:4000],
+            "firstMes": str(p.get("firstMes") or "")[:4000],
+        }
+        # 同名角色取 updated_at 最新的一场
+        if name not in seen or (r["updated_at"] or "") > seen[name]["_u"]:
+            item["_u"] = r["updated_at"] or ""
+            seen[name] = item
+    personas = [v for k, v in sorted(seen.items())][:50]
+    for it in personas:
+        it.pop("_u", None)
+    return JSONResponse({"ok": True, "personas": personas})
+
+
+@app.get("/api/persona-memory")
+def api_persona_memory(request: Request, name: str = ""):
+    """角色群聊记忆查询（自测/透明用途：前端不依赖）"""
+    user = get_user(request)
+    if not valid_paid_user(user):
+        return JSONResponse({"ok": False}, status_code=403)
+    name = name.strip()[:GC_MEMBER_NAME_MAX]
+    return JSONResponse({"ok": True, "name": name, "content": _gc_memory_load(user["id"], name)})
+
+
 @app.get("/{full_path:path}")
 def gate(full_path: str, request: Request):
     if full_path in ("favicon.ico", "robots.txt"):
