@@ -8,6 +8,8 @@ secret.key.*
 *.lock
 .admin_password
 data.db
+data.db-shm
+data.db-wal
 /official_price_snapshot.html
 /official_price_snapshot.html.meta.json
 
