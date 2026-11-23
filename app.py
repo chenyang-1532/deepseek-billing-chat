@@ -2176,11 +2176,12 @@ def admin_page(request: Request):
         elif r["note"]:
             status_tag += f' <span class="dim">{html.escape(str(r["note"]))}</span>'
         expiry_line = html.escape(r["expiry"]) if r["expiry"] else "—"
-        # 余额制：用户管理表直接显示账户余额（来自 new-api 实时 quota），替代旧的到期天数
+        # 余额制：用户管理表直接显示账户余额（来自 new-api 实时 quota），替代旧的到期天数；
+        # 无 gateway_map 记录或 new-api 侧用户缺失时显示「—」
         if r["id"] in balance_of:
             bal_cell = f'<span class="money">¥{balance_of[r["id"]]:.2f}</span>'
         else:
-            bal_cell = '<span class="dim">未开通</span>'
+            bal_cell = '<span class="dim">—</span>'
         backup_mb = sizes.get(r["id"], 0) / 1048576
         backup_cell = (
             f'<span class="num2">{backup_mb:.1f} MB / 200 MB（{backup_mb / 204.8:.0f}%）</span>'
