@@ -261,6 +261,34 @@ def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pay_orders_crid ON pay_orders(uid, client_request_id) "
             "WHERE client_request_id IS NOT NULL"
         )
+        # ── 工单系统：平滑升级（老库无表自动创建，老数据不受影响） ──
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS tickets(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'other',
+                subject TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                closed_by TEXT DEFAULT '',
+                unread_for_admin INTEGER DEFAULT 0,
+                unread_for_user INTEGER DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT
+            )"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS ticket_replies(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                sender TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT
+            )"""
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tickets_uid ON tickets(uid, id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status, id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ticket_replies_tid ON ticket_replies(ticket_id, id)")
 
 def today() -> str:
     return site_now().date().isoformat()
@@ -559,7 +587,7 @@ table.cardable tbody tr:hover td:last-child{background:transparent}}
 <form action="/admin/logout" method="get"><button class="btn ghost sm">退出</button></form></div>
 <div class="sub">按余额计费：注册即开通，充值/余额调整实时生效；余额为 0 时无法对话。</div>
 <nav class="nav" id="anav">
-<a href="#sec-announce">公告</a><a href="#sec-users">用户</a><a href="#sec-wallet">计费</a><a href="#sec-codes">充值码</a><a href="#sec-ratios">定价</a><a href="#sec-pay">充值审批{{paybadge}}</a><a href="#sec-tx">流水</a>
+<a href="#sec-announce">公告</a><a href="#sec-users">用户</a><a href="#sec-wallet">计费</a><a href="#sec-codes">充值码</a><a href="#sec-ratios">定价</a><a href="#sec-pay">充值审批{{paybadge}}</a><a href="#sec-tickets">工单{{tickbadge}}</a><a href="#sec-tx">流水</a>
 </nav>
 <div class="ovbar">{{ovbar}}</div>
 
@@ -635,6 +663,50 @@ STATUS_TEXT = {
     "rejected": "已拒绝",
     "disabled": "已禁用",
 }
+
+# ---------- 工单系统 ----------
+# 分类：预设 5 类（比自由文本好定位问题、便于后台筛选统计；「其他」兜底）
+TICKET_CATEGORIES = [
+    ("bug", "功能故障"), ("billing", "计费充值"), ("account", "账号问题"),
+    ("feature", "功能建议"), ("other", "其他"),
+]
+_TICKET_CAT_SET = {k for k, _ in TICKET_CATEGORIES}
+# 状态流：open(待处理) → admin回复 → replied(等用户确认) → 用户补充回复回流 open；
+# 双方均可关闭；用户在已关闭工单上补充回复会自动重新打开（回流待处理）。
+TICKET_STATUS_TEXT = {"open": "待处理", "replied": "已回复", "closed": "已关闭"}
+TICKET_SUBJECT_MAX = 100     # 标题上限（字符）
+TICKET_BODY_MAX = 2000       # 正文/回复上限（字符）
+TICKET_RATE_LIMIT = 5        # 每用户每小时最多提 5 条新工单（防刷）
+TICKET_RATE_WINDOW = 3600
+_TICKET_CREATE_ATTEMPTS: dict[int, list] = {}   # uid -> [窗口起点, 次数]（内存态，重启清零）
+
+def _ticket_rate_limited(uid: int) -> bool:
+    now = time.time()
+    win = _TICKET_CREATE_ATTEMPTS.get(uid)
+    if win is None or now - win[0] >= TICKET_RATE_WINDOW:
+        if len(_TICKET_CREATE_ATTEMPTS) > 10000:   # 兜底防内存膨胀
+            _TICKET_CREATE_ATTEMPTS.clear()
+        _TICKET_CREATE_ATTEMPTS[uid] = [now, 1]
+        return False
+    win[1] += 1
+    return win[1] > TICKET_RATE_LIMIT
+
+def _ticket_cat_text(cat: str) -> str:
+    for k, t in TICKET_CATEGORIES:
+        if k == cat:
+            return t
+    return "其他"
+
+def _ticket_status_tag(t) -> str:
+    st = t["status"]
+    tag = f'<span class="tag {st}">{TICKET_STATUS_TEXT.get(st, st)}</span>'
+    # 未读标识：用户新回复/新单（后台视角）或 admin 新回复（用户视角）
+    if t["status"] != "closed":
+        if t["status"] == "open" and t["unread_for_admin"]:
+            tag += ' <span class="tag hot">新回复</span>'
+        if t["status"] == "replied" and t["unread_for_user"]:
+            tag += ' <span class="tag hot">有新回复</span>'
+    return tag
 
 app = FastAPI(title="Paid Chat Gate")
 
@@ -1632,10 +1704,17 @@ def admin_page(request: Request):
             npay = c.execute("SELECT COUNT(*) AS n FROM pay_orders WHERE status='pending'").fetchone()["n"]
         if npay:
             paybadge = f' <span style="background:#dc2626;color:#fff;border-radius:999px;padding:1px 7px;font-size:11px">{npay}</span>'
+    # 工单徽标（导航"工单(N)"）：待处理工单数
+    with db() as c:
+        n_open_tickets = c.execute("SELECT COUNT(*) AS n FROM tickets WHERE status='open'").fetchone()["n"]
+    tickbadge = ""
+    if n_open_tickets:
+        tickbadge = f' <span style="background:#dc2626;color:#fff;border-radius:999px;padding:1px 7px;font-size:11px">{n_open_tickets}</span>'
     ovbar = ""  # 网关关闭时总览条为空（CSS :empty 隐藏）
     parts = [ADMIN_PAGE_HEAD
              .replace("{{announcement}}", html.escape(announcement))
-             .replace("{{paybadge}}", paybadge)]
+             .replace("{{paybadge}}", paybadge)
+             .replace("{{tickbadge}}", tickbadge)]
 
     # ── 站长告警 banner（R13 终审 P2-2）：cn_holidays_stale_alert / price_stale_alert /
     #    price_change_alert 此前只写不读，官方价抓取失败、价格突变、节假日表过期这类
@@ -2174,6 +2253,51 @@ def admin_page(request: Request):
     )
     if wallet_html:
         parts.append(wallet_html)
+
+    # ── 工单页签：状态筛选 + 未读标识（用户新回复标红） ──
+    tf = request.query_params.get("tf", "")
+    tf_where = {"open": "status='open'", "replied": "status='replied'", "closed": "status='closed'"}.get(tf)
+    if tf_where is None:
+        tf = ""
+        tf_where = "1=1"
+    with db() as c:
+        trows = c.execute(
+            f"SELECT * FROM tickets WHERE {tf_where} ORDER BY "
+            "CASE WHEN status='open' THEN 0 WHEN status='replied' THEN 1 ELSE 2 END, id DESC LIMIT 100"
+        ).fetchall()
+    tf_counts = {}
+    with db() as c:
+        for r in c.execute("SELECT status, COUNT(*) AS n FROM tickets GROUP BY status").fetchall():
+            tf_counts[r["status"]] = r["n"]
+    tf_chips = "".join(
+        f'<a href="/admin?tf={k}#sec-tickets" class="{"on" if tf == k else ""}">{label}'
+        + (f'（{tf_counts.get(k, 0)}）' if k else f'（{sum(tf_counts.values())}）')
+        + "</a>"
+        for k, label in [("", "全部"), ("open", "待处理"), ("replied", "已回复"), ("closed", "已关闭")]
+    )
+    tk_err_flash = (
+        '<div class="flash err">工单不存在或已被删除。</div>'
+        if request.query_params.get("tk_err") == "notfound" else ""
+    )
+    ticket_rows = "".join(
+        f'<tr><td data-l="单号">#{t["id"]}</td>'
+        f'<td class="uname" data-l="用户">{html.escape(str(t["username"]))}</td>'
+        f'<td data-l="分类">{_ticket_cat_text(t["category"])}</td>'
+        f'<td data-l="主题"><a href="/admin/tickets?id={t["id"]}" style="color:#4f46e5;text-decoration:none;word-break:break-all">{html.escape(t["subject"])}</a></td>'
+        f'<td data-l="状态">{_ticket_status_tag(t)}</td>'
+        f'<td class="num2 dim" data-l="更新">{html.escape(str(t["updated_at"] or t["created_at"])[:16])}</td>'
+        f'<td><div class="ops"><a class="btn sm ghost" href="/admin/tickets?id={t["id"]}">查看</a></div></td></tr>'
+        for t in trows
+    ) or '<tr><td colspan="7" class="dim" style="text-align:center;padding:18px">暂无工单</td></tr>'
+    parts.append(
+        '<section class="sec" id="sec-tickets"><div class="sec-h"><h2>工单</h2>'
+        '<span class="hint">用户提交的问题与反馈；待处理排前，红色「新回复」= 用户有新消息</span></div>'
+        + tk_err_flash
+        + f'<div class="chips">{tf_chips}</div>'
+        + '<div class="tscroll opsfix"><table class="cardable"><thead><tr>'
+        '<th>单号</th><th>用户</th><th>分类</th><th>主题</th><th>状态</th><th>更新时间</th><th>操作</th>'
+        '</tr></thead><tbody>' + ticket_rows + '</tbody></table></div></section>'
+    )
     parts[0] = parts[0].replace("{{ovbar}}", ovbar)
     parts.append(ADMIN_PAGE_FOOT)
     return HTMLResponse("".join(parts))
@@ -4214,6 +4338,355 @@ async def admin_wallet_qr(request: Request, file: UploadFile = File(None)):
     print("[pay] 收款码已更新 %d bytes (%s)" % (len(data), kind))
     return RedirectResponse("/admin?qr_ok=1#sec-pay", status_code=303)
 
+
+# ---------- 工单系统（用户侧 /tickets 服务端渲染 + 后台页签，不碰 React bundle） ----------
+TICKETS_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#f6f7f9;color:#0f172a;font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:760px;margin:0 auto;padding:20px 14px 60px}
+.bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:8px;flex-wrap:wrap}
+h1{font-size:18px}
+a.lnk{color:#4f46e5;text-decoration:none;font-size:13px}
+.sec{background:#fff;border:1px solid #e7eaee;border-radius:14px;padding:16px;margin-bottom:14px}
+h2{font-size:15px;margin-bottom:8px}
+label{display:block;font-size:13px;color:#475569;margin:10px 0 4px}
+input,select,textarea{width:100%;padding:9px 11px;border:1px solid #d9dde3;border-radius:8px;font-size:14px;font-family:inherit;background:#fff;color:#0f172a}
+textarea{min-height:110px;resize:vertical;line-height:1.6}
+.btn{display:inline-flex;align-items:center;justify-content:center;height:36px;padding:0 18px;border:0;border-radius:8px;font-size:14px;cursor:pointer;background:#4f46e5;color:#fff;text-decoration:none}
+.btn:hover{background:#4338ca}
+.btn.ghost{background:#fff;border:1px solid #d9dde3;color:#374151}
+.btn.danger{background:#fff;border:1px solid #f1c7c7;color:#d92d20}
+.btn.sm{height:30px;padding:0 12px;font-size:13px}
+.flash{border-radius:8px;padding:9px 12px;font-size:13px;margin-bottom:12px;word-break:break-word}
+.flash.ok{background:#e7f6ef;color:#067647}
+.flash.err{background:#fdecec;color:#b42318}
+.tag{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;white-space:nowrap}
+.tag.open{background:#fef3c7;color:#92400e}
+.tag.replied{background:#eaf1fe;color:#175cd3}
+.tag.closed{background:#eceef2;color:#475569}
+.tag.hot{background:#fee2e2;color:#b42318;font-weight:600}
+.titem{display:block;border:1px solid #e7eaee;border-radius:10px;padding:10px 12px;margin-bottom:10px;color:inherit;text-decoration:none}
+.titem:hover{border-color:#c7d2fe;background:#fafbff}
+.titem .r1{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap}
+.titem .subj{font-weight:600;word-break:break-all}
+.titem .meta{color:#94a3b8;font-size:12px;margin-top:4px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.dim{color:#94a3b8;font-size:12px}
+.conv{display:flex;flex-direction:column;gap:10px;margin:6px 0 2px}
+.msg{max-width:86%;padding:9px 12px;border-radius:12px;font-size:14px;white-space:pre-wrap;word-break:break-word}
+.msg.user{align-self:flex-start;background:#eceef2;color:#1e293b;border-bottom-left-radius:4px}
+.msg.admin{align-self:flex-end;background:#4f46e5;color:#fff;border-bottom-right-radius:4px}
+.msg .who{font-size:11px;opacity:.75;margin-bottom:2px}
+.frow{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;align-items:center}
+.frow form.tw{display:flex;gap:8px;flex:1;min-width:220px;flex-wrap:wrap}
+.frow textarea{min-height:70px;flex:1;min-width:200px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.chips a{padding:5px 12px;border-radius:999px;font-size:13px;background:#eceef2;color:#475569;text-decoration:none}
+.chips a.on{background:#4f46e5;color:#fff}
+@media (max-width:520px){.msg{max-width:94%}.frow form.tw{min-width:100%}}
+"""
+
+def _ticket_page_head(title: str, back_link: str, back_text: str) -> str:
+    return ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{html.escape(title)}</title><style>{TICKETS_CSS}</style></head>'
+            '<body><div class="wrap"><div class="bar"><h1>' + html.escape(title) + '</h1>'
+            + f'<a class="lnk" href="{back_link}">← {back_text}</a></div>')
+
+_TICKET_PAGE_TAIL = "</div></body></html>"
+
+_TICKET_FLASH_OK = {
+    "created": "工单已提交，管理员会尽快处理。",
+    "replied": "回复已发送。",
+    "closed": "工单已关闭。",
+    "reopened": "工单已重新打开。",
+}
+_TICKET_FLASH_ERR = {
+    "rate": f"提交过于频繁：每小时最多创建 {TICKET_RATE_LIMIT} 条工单，请稍后再试。",
+    "invalid": "请选择分类并填写标题与问题描述。",
+    "notfound": "工单不存在或无权访问。",
+    "empty": "回复内容不能为空。",
+}
+
+def _conversation_html(replies) -> str:
+    parts = ['<div class="conv">']
+    for r in replies:
+        if r["sender"] == "admin":
+            parts.append(
+                '<div class="msg admin"><div class="who">客服 · '
+                f'{html.escape(str(r["created_at"])[:16])}</div>'
+                f'{html.escape(str(r["body"]))}</div>'
+            )
+        else:
+            parts.append(
+                '<div class="msg user"><div class="who">'
+                f'{html.escape(str(r["created_at"])[:16])}</div>'
+                f'{html.escape(str(r["body"]))}</div>'
+            )
+    parts.append("</div>")
+    return "".join(parts)
+
+def _user_tickets_home(user, rows, ok: str, err: str) -> str:
+    cat_opts = "".join(f'<option value="{k}">{t}</option>' for k, t in TICKET_CATEGORIES)
+    items = "".join(
+        f'<a class="titem" href="/tickets?id={t["id"]}"><div class="r1">'
+        f'<span class="subj">#{t["id"]} {html.escape(t["subject"])}</span>'
+        f'<span>{_ticket_status_tag(t)}</span></div>'
+        f'<div class="meta"><span>{_ticket_cat_text(t["category"])}</span>'
+        f'<span>更新 {html.escape(str(t["updated_at"] or t["created_at"])[:16])}</span></div></a>'
+        for t in rows
+    ) or '<div class="dim">还没有工单，有问题就提交吧。</div>'
+    flash = (f'<div class="flash ok">{ok}</div>' if ok else "") + (f'<div class="flash err">{err}</div>' if err else "")
+    return (
+        _ticket_page_head("客服工单", "/", "返回首页")
+        + flash
+        + '<div class="sec"><h2>提交新工单</h2>'
+        '<form method="post" action="/tickets/create">'
+        f'<label>问题分类</label><select name="category">{cat_opts}</select>'
+        f'<label>标题（{TICKET_SUBJECT_MAX} 字以内）</label>'
+        f'<input name="subject" maxlength="{TICKET_SUBJECT_MAX}" required placeholder="一句话描述问题">'
+        f'<label>问题描述（{TICKET_BODY_MAX} 字以内）</label>'
+        '<textarea name="body" maxlength="%d" required placeholder="详细描述：做了什么操作、期望什么、实际发生什么；计费问题请附时间与金额"></textarea>'
+        '<div style="margin-top:12px"><button class="btn">提交工单</button></div></form></div>'
+        + f'<div class="sec"><h2>我的工单（{len(rows)}）</h2>{items}</div>'
+        + _TICKET_PAGE_TAIL
+    )
+
+def _user_ticket_detail(user, t, replies, ok: str, err: str) -> str:
+    flash = (f'<div class="flash ok">{ok}</div>' if ok else "") + (f'<div class="flash err">{err}</div>' if err else "")
+    closed = t["status"] == "closed"
+    closed_note = ""
+    if closed:
+        closed_note = f'<div class="dim" style="margin-bottom:8px">该工单已关闭（{ "用户" if t["closed_by"] == "user" else "客服" }关闭）。仍可补充回复，回复后自动重新打开。</div>'
+    ops = []
+    if not closed:
+        ops.append(
+            '<form method="post" action="/tickets/close" onsubmit="return confirm(\'确认关闭该工单？关闭后如仍有问题可回复重新打开。\')">'
+            f'<input type="hidden" name="tid" value="{t["id"]}"><button class="btn sm ghost">关闭工单</button></form>'
+        )
+    return (
+        _ticket_page_head(f"工单 #{t['id']}", "/tickets", "返回工单列表")
+        + flash
+        + '<div class="sec"><div class="r1" style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'
+        f'<span class="subj" style="font-weight:600;word-break:break-all">{html.escape(t["subject"])}</span>'
+        f'<span>{_ticket_status_tag(t)}</span></div>'
+        f'<div class="meta dim" style="font-size:12px;color:#94a3b8;margin-bottom:10px">'
+        f'{_ticket_cat_text(t["category"])} · 提交于 {html.escape(str(t["created_at"])[:16])}</div>'
+        + _conversation_html(replies)
+        + closed_note
+        + '<form method="post" action="/tickets/reply" class="frow" style="display:flex">'
+        f'<input type="hidden" name="tid" value="{t["id"]}">'
+        f'<textarea name="body" maxlength="{TICKET_BODY_MAX}" required class="tw" placeholder="{"补充说明 / 追问（发送后自动回到待处理）" if not closed else "补充回复将自动重新打开工单"}"></textarea>'
+        '<button class="btn">发送</button></form>'
+        + ('<div class="frow">' + "".join(ops) + "</div>" if ops else "")
+        + '</div>' + _TICKET_PAGE_TAIL
+    )
+
+@app.get("/api/tickets/unread")
+def api_tickets_unread(request: Request):
+    """用户侧未读新回复数（index.html 浮动入口红点用；轻量 JSON，无缓存）"""
+    user = get_user(request)
+    if user is None or user["status"] != "approved":
+        return JSONResponse({"ok": False, "n": 0})
+    with db() as c:
+        n = c.execute(
+            "SELECT COALESCE(SUM(unread_for_user),0) AS n FROM tickets WHERE uid=?",
+            (user["id"],),
+        ).fetchone()["n"]
+    return JSONResponse({"ok": True, "n": n}, headers={"Cache-Control": "no-store"})
+
+@app.get("/tickets", response_class=HTMLResponse)
+def tickets_page(request: Request, id: int = 0):
+    user = get_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    if user["status"] != "approved":
+        return HTMLResponse(status_page_html(user), status_code=403)
+    qp = request.query_params
+    ok = _TICKET_FLASH_OK.get(qp.get("ok", ""), "")
+    err = _TICKET_FLASH_ERR.get(qp.get("err", ""), "")
+    if id > 0:
+        with db() as c:
+            t = c.execute("SELECT * FROM tickets WHERE id=? AND uid=?", (id, user["id"])).fetchone()
+            if t is None:
+                return HTMLResponse(
+                    _ticket_page_head("客服工单", "/", "返回首页")
+                    + '<div class="sec"><div class="flash err">工单不存在或无权访问。</div>'
+                      '<a class="lnk" href="/tickets">返回工单列表</a></div>' + _TICKET_PAGE_TAIL,
+                    status_code=404,
+                )
+            replies = c.execute(
+                "SELECT * FROM ticket_replies WHERE ticket_id=? ORDER BY id", (id,)
+            ).fetchall()
+            if t["unread_for_user"]:
+                c.execute("UPDATE tickets SET unread_for_user=0 WHERE id=?", (id,))
+        return HTMLResponse(_user_ticket_detail(user, t, replies, ok, err))
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM tickets WHERE uid=? ORDER BY id DESC LIMIT 100", (user["id"],)
+        ).fetchall()
+    return HTMLResponse(_user_tickets_home(user, rows, ok, err))
+
+@app.post("/tickets/create")
+async def tickets_create(
+    request: Request,
+    category: str = Form(""),
+    subject: str = Form(""),
+    body: str = Form(""),
+):
+    user = get_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    if user["status"] != "approved":
+        return HTMLResponse(status_page_html(user), status_code=403)
+    if _ticket_rate_limited(user["id"]):
+        return RedirectResponse("/tickets?err=rate", status_code=303)
+    subject = subject.strip()[:TICKET_SUBJECT_MAX]
+    body = body.strip()[:TICKET_BODY_MAX]
+    if category not in _TICKET_CAT_SET or not subject or not body:
+        return RedirectResponse("/tickets?err=invalid", status_code=303)
+    now = site_now().isoformat(timespec="seconds")
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO tickets(uid,username,category,subject,status,unread_for_admin,unread_for_user,"
+            "created_at,updated_at) VALUES(?,?,?,?,'open',1,0,?,?)",
+            (user["id"], user["username"], category, subject, now, now),
+        )
+        tid = cur.lastrowid
+        c.execute(
+            "INSERT INTO ticket_replies(ticket_id,sender,body,created_at) VALUES(?,'user',?,?)",
+            (tid, body, now),
+        )
+    print(f"[ticket] #{tid} 用户 {user['username']} 提交工单：{subject}")
+    return RedirectResponse("/tickets?id=%d&ok=created" % tid, status_code=303)
+
+@app.post("/tickets/reply")
+async def tickets_reply(request: Request, tid: int = Form(0), body: str = Form("")):
+    user = get_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    if user["status"] != "approved":
+        return HTMLResponse(status_page_html(user), status_code=403)
+    body = body.strip()[:TICKET_BODY_MAX]
+    if not body:
+        return RedirectResponse("/tickets?id=%d&err=empty" % tid, status_code=303)
+    now = site_now().isoformat(timespec="seconds")
+    with db() as c:
+        t = c.execute("SELECT id FROM tickets WHERE id=? AND uid=?", (tid, user["id"])).fetchone()
+        if t is None:
+            return RedirectResponse("/tickets?err=notfound", status_code=303)
+        c.execute(
+            "INSERT INTO ticket_replies(ticket_id,sender,body,created_at) VALUES(?,'user',?,?)",
+            (tid, body, now),
+        )
+        # 用户补充回复：状态回流待处理（已关闭的工单也自动重新打开）
+        c.execute(
+            "UPDATE tickets SET status='open', unread_for_admin=1, unread_for_user=0, updated_at=? WHERE id=?",
+            (now, tid),
+        )
+    return RedirectResponse("/tickets?id=%d&ok=replied" % tid, status_code=303)
+
+@app.post("/tickets/close")
+def tickets_close(request: Request, tid: int = Form(0)):
+    user = get_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    if user["status"] != "approved":
+        return HTMLResponse(status_page_html(user), status_code=403)
+    now = site_now().isoformat(timespec="seconds")
+    with db() as c:
+        cur = c.execute(
+            "UPDATE tickets SET status='closed', closed_by='user', unread_for_admin=0, unread_for_user=0, "
+            "updated_at=? WHERE id=? AND uid=? AND status!='closed'",
+            (now, tid, user["id"]),
+        )
+        if cur.rowcount == 0:
+            return RedirectResponse("/tickets?err=notfound", status_code=303)
+    print(f"[ticket] #{tid} 用户 {user['username']} 关闭工单")
+    return RedirectResponse("/tickets?id=%d&ok=closed" % tid, status_code=303)
+
+def _admin_ticket_detail_html(t, replies) -> str:
+    closed = t["status"] == "closed"
+    closed_note = ""
+    if closed:
+        closed_note = f'<div class="dim" style="margin-bottom:8px">该工单已关闭（{ "用户" if t["closed_by"] == "user" else "客服" }关闭）。再次回复会自动重新打开。</div>'
+    ops = []
+    if not closed:
+        ops.append(
+            '<form method="post" action="/admin/tickets/close" onsubmit="return confirm(\'确认关闭该工单？用户仍可回复重新打开。\')">'
+            f'<input type="hidden" name="tid" value="{t["id"]}"><button class="btn sm ghost">关闭工单</button></form>'
+        )
+    return (
+        _ticket_page_head(f"工单 #{t['id']} · {t['username']}", "/admin?tf=open#sec-tickets", "返回管理面板")
+        + '<div class="sec"><div class="r1" style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'
+        f'<span class="subj" style="font-weight:600;word-break:break-all">{html.escape(t["subject"])}</span>'
+        f'<span>{_ticket_status_tag(t)}</span></div>'
+        f'<div class="meta dim" style="font-size:12px;color:#94a3b8;margin-bottom:10px">'
+        f'用户 {html.escape(str(t["username"]))} · {_ticket_cat_text(t["category"])} · '
+        f'提交于 {html.escape(str(t["created_at"])[:16])}</div>'
+        + _conversation_html(replies)
+        + closed_note
+        + '<form method="post" action="/admin/tickets/reply" class="frow" style="display:flex">'
+        f'<input type="hidden" name="tid" value="{t["id"]}">'
+        f'<textarea name="body" maxlength="{TICKET_BODY_MAX}" required class="tw" placeholder="回复用户（发送后工单变为「已回复」）"></textarea>'
+        '<button class="btn">发送回复</button></form>'
+        + ('<div class="frow">' + "".join(ops) + "</div>" if ops else "")
+        + '</div>' + _TICKET_PAGE_TAIL
+    )
+
+@app.get("/admin/tickets", response_class=HTMLResponse)
+def admin_ticket_detail(request: Request, id: int = 0):
+    if not is_admin(request):
+        return RedirectResponse("/admin", status_code=303)
+    if id <= 0:
+        return RedirectResponse("/admin#sec-tickets", status_code=303)
+    with db() as c:
+        t = c.execute("SELECT * FROM tickets WHERE id=?", (id,)).fetchone()
+        if t is None:
+            return RedirectResponse("/admin?tk_err=notfound#sec-tickets", status_code=303)
+        replies = c.execute(
+            "SELECT * FROM ticket_replies WHERE ticket_id=? ORDER BY id", (id,)
+        ).fetchall()
+        if t["unread_for_admin"]:
+            c.execute("UPDATE tickets SET unread_for_admin=0 WHERE id=?", (id,))
+    return HTMLResponse(_admin_ticket_detail_html(t, replies))
+
+@app.post("/admin/tickets/reply")
+async def admin_ticket_reply(request: Request, tid: int = Form(0), body: str = Form("")):
+    if not is_admin(request):
+        return RedirectResponse("/admin", status_code=303)
+    body = body.strip()[:TICKET_BODY_MAX]
+    if not body:
+        return RedirectResponse("/admin/tickets?id=%d" % tid, status_code=303)
+    now = site_now().isoformat(timespec="seconds")
+    with db() as c:
+        t = c.execute("SELECT id FROM tickets WHERE id=?", (tid,)).fetchone()
+        if t is None:
+            return RedirectResponse("/admin?tk_err=notfound#sec-tickets", status_code=303)
+        c.execute(
+            "INSERT INTO ticket_replies(ticket_id,sender,body,created_at) VALUES(?,'admin',?,?)",
+            (tid, body, now),
+        )
+        # 已关闭工单被再次回复 = 自动重新打开
+        c.execute(
+            "UPDATE tickets SET status='replied', unread_for_user=1, unread_for_admin=0, updated_at=? WHERE id=?",
+            (now, tid),
+        )
+    return RedirectResponse("/admin/tickets?id=%d" % tid, status_code=303)
+
+@app.post("/admin/tickets/close")
+def admin_ticket_close(request: Request, tid: int = Form(0)):
+    if not is_admin(request):
+        return RedirectResponse("/admin", status_code=303)
+    now = site_now().isoformat(timespec="seconds")
+    with db() as c:
+        cur = c.execute(
+            "UPDATE tickets SET status='closed', closed_by='admin', unread_for_admin=0, unread_for_user=0, "
+            "updated_at=? WHERE id=? AND status!='closed'",
+            (now, tid),
+        )
+        if cur.rowcount == 0:
+            return RedirectResponse("/admin?tk_err=notfound#sec-tickets", status_code=303)
+    return RedirectResponse("/admin/tickets?id=%d" % tid, status_code=303)
 
 # ---------- 门禁 + 静态托管（必须放在最后） ----------
 @app.get("/{full_path:path}")
