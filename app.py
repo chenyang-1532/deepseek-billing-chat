@@ -289,6 +289,21 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_tickets_uid ON tickets(uid, id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status, id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ticket_replies_tid ON ticket_replies(ticket_id, id)")
+        # ── 工单图片附件：平滑升级（老库无表自动创建，老数据不受影响） ──
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS ticket_attachments(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                reply_id INTEGER NOT NULL,
+                stored_name TEXT NOT NULL,
+                orig_name TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mime TEXT NOT NULL,
+                created_at TEXT
+            )"""
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ticket_att_tid ON ticket_attachments(ticket_id, id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ticket_att_rid ON ticket_attachments(reply_id, id)")
 
 def today() -> str:
     return site_now().date().isoformat()
@@ -735,6 +750,10 @@ _BODY_LIMIT_RULES = (
     # 收款码上传：手机拍照二维码普遍 3-8MB，默认 2MB 会直接 413 且浏览器只收到
     # JSON 无跳转（用户侧表现就是"上传不了"）；放宽到 10MB，应用层再自动压缩
     ("/admin/wallet/qr", "QR_UPLOAD_MAX_BYTES"),
+    # 工单图片附件：单条消息最多 4 张、单张硬上限 25MB（>10MB 应用层自动压缩）
+    ("/tickets/create", "TICKET_BODY_MAX_BYTES"),
+    ("/tickets/reply", "TICKET_BODY_MAX_BYTES"),
+    ("/admin/tickets/reply", "TICKET_BODY_MAX_BYTES"),
 )
 QR_UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 
@@ -4382,6 +4401,15 @@ textarea{min-height:110px;resize:vertical;line-height:1.6}
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .chips a{padding:5px 12px;border-radius:999px;font-size:13px;background:#eceef2;color:#475569;text-decoration:none}
 .chips a.on{background:#4f46e5;color:#fff}
+.msg .atts{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.msg .atts a{display:block}
+.msg .atts img{width:96px;height:96px;object-fit:cover;border-radius:8px;display:block;border:1px solid rgba(15,23,42,.12);cursor:zoom-in}
+.msg.admin .atts img{border-color:rgba(255,255,255,.25)}
+.att-pick input[type=file]{padding:8px;background:#fafbfc}
+.att-pick .atts{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.tprev{position:relative;display:inline-block}
+.tprev img{width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid #d9dde3;display:block}
+.tprev .tx{position:absolute;top:-7px;right:-7px;width:22px;height:22px;border-radius:50%;border:0;background:#dc2626;color:#fff;font-size:13px;cursor:pointer;line-height:1;padding:0}
 @media (max-width:520px){.msg{max-width:94%}.frow form.tw{min-width:100%}}
 """
 
@@ -4405,22 +4433,214 @@ _TICKET_FLASH_ERR = {
     "invalid": "请选择分类并填写标题与问题描述。",
     "notfound": "工单不存在或无权访问。",
     "empty": "回复内容不能为空。",
+    "atttype": "图片格式不支持：仅支持 png/jpg/jpeg/webp/gif（已识别伪装文件并拒绝）。",
+    "attsize": "图片处理失败：单张超过 10MB 且自动压缩未能压到限制以内。",
+    "attcount": "图片数量超限：单条消息最多 4 张。",
 }
 
+# ---------- 工单图片附件 ----------
+# 安全基线：存储名一律 secrets.token_hex 随机生成（绝不使用用户原始文件名拼路径）；
+# 类型按魔数校验（不看扩展名）；>10MB 用 Pillow 等比压缩；目录/文件不带可执行位；
+# 读取走受控端点（属主或 admin），响应带 nosniff。
+TICKET_ATT_DIR = os.path.join(BASE, "data", "ticket_attachments")
+TICKET_IMG_MAX = 10 * 1024 * 1024          # 单张 ≤10MB，超过自动压缩
+TICKET_IMG_UPLOAD_HARD_MAX = 25 * 1024 * 1024  # 超过此值直接拒绝（防止为压缩巨型上传白白耗内存）
+TICKET_IMG_MAX_COUNT = 4                   # 单条消息最多 4 张
+# 请求体中间件上限：4×25MB 图片 + 文本字段/表单编码余量
+TICKET_BODY_MAX_BYTES = TICKET_IMG_UPLOAD_HARD_MAX * TICKET_IMG_MAX_COUNT + (1 << 20)
+TICKET_IMG_EXT = {                         # 允许的图片 mime（存库后按真实 mime 出响应）
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+def _ticket_img_magic(data: bytes):
+    """按魔数识别图片类型，返回 mime 或 None（伪装文件一律拒绝，不看扩展名）"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return None
+
+def _ticket_compress_image(data: bytes, limit: int = TICKET_IMG_MAX):
+    """>10MB 图片等比压缩：优先 PNG（截图清晰），仍超限退 JPEG 逐级降边长。
+    返回 (bytes, mime) 或 None（无 Pillow / 压不进限制 / 无法解码）。"""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        img.load()
+        prefer_png = data[:8] == b"\x89PNG\r\n\x1a\n" or img.mode in ("RGBA", "LA", "P")
+        for side in (1600, 1200, 900, 640):
+            w, h = img.size
+            scale = min(1.0, side / max(w, h))
+            im = img
+            if scale < 1.0:
+                im = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            buf = io.BytesIO()
+            if prefer_png:
+                im.save(buf, format="PNG", optimize=True)
+                mime = "image/png"
+            else:
+                if im.mode != "RGB":
+                    im = im.convert("RGB")
+                im.save(buf, format="JPEG", quality=82, optimize=True)
+                mime = "image/jpeg"
+            out = buf.getvalue()
+            if len(out) <= limit:
+                return out, mime
+            if not prefer_png:   # PNG 压不进则换 JPEG 再试一轮
+                prefer_png = False
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+async def _ticket_prep_images(files) -> tuple:
+    """校验上传的图片列表。返回 (err_code|None, [(mime, orig_name, bytes), ...])。
+    任一文件不合法即整体失败（提前于落库，避免产生半截工单）。"""
+    prepared = []
+    if not files:
+        return None, prepared
+    files = [f for f in files if f and f.filename]
+    if len(files) > TICKET_IMG_MAX_COUNT:
+        return "attcount", prepared
+    for f in files:
+        try:
+            data = await f.read()
+        except Exception:  # noqa: BLE001
+            return "atttype", prepared
+        if not data:
+            return "atttype", prepared
+        if len(data) > TICKET_IMG_UPLOAD_HARD_MAX:
+            return "attsize", prepared
+        mime = _ticket_img_magic(data)
+        if mime is None:
+            return "atttype", prepared
+        if len(data) > TICKET_IMG_MAX:
+            shrunk = _ticket_compress_image(data)
+            if shrunk is None:
+                return "attsize", prepared
+            data, mime = shrunk
+        orig = re.sub(r"[\x00-\x1f\x7f]", "", os.path.basename(f.filename or "图片"))[:120]
+        prepared.append((mime, orig or "图片", data))
+    return None, prepared
+
+def _ticket_write_attachments(ticket_id: int, reply_id: int, prepared) -> None:
+    """附件落盘（按 ticket_id 分目录，随机存储名）并入库。"""
+    if not prepared:
+        return
+    d = os.path.join(TICKET_ATT_DIR, str(int(ticket_id)))
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o755)   # 目录不带组/其他写位，更无可执行语义滥用空间
+    now = site_now().isoformat(timespec="seconds")
+    rows = []
+    for mime, orig, data in prepared:
+        name = secrets.token_hex(16) + TICKET_IMG_EXT[mime]
+        p = os.path.join(d, name)
+        with open(p, "wb") as fh:
+            fh.write(data)
+        os.chmod(p, 0o644)
+        rows.append((ticket_id, reply_id, name, orig, len(data), mime, now))
+    with db() as c:
+        c.executemany(
+            "INSERT INTO ticket_attachments(ticket_id,reply_id,stored_name,orig_name,size,mime,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            rows,
+        )
+
+def _ticket_attachments_by_reply(reply_ids) -> dict:
+    """reply_id -> [attachment row]，一次查询取齐（渲染会话气泡缩略图用）"""
+    ids = [int(r) for r in reply_ids]
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    with db() as c:
+        rows = c.execute(
+            f"SELECT * FROM ticket_attachments WHERE reply_id IN ({ph}) ORDER BY id", ids
+        ).fetchall()
+    out: dict[int, list] = {}
+    for a in rows:
+        out.setdefault(a["reply_id"], []).append(a)
+    return out
+
+def _ticket_att_thumbs(atts) -> str:
+    """气泡内缩略图（点击看原图）；orig_name 只进 title 且经 HTML 转义"""
+    if not atts:
+        return ""
+    imgs = "".join(
+        f'<a href="/tickets/att/{a["id"]}" target="_blank" rel="noopener">'
+        f'<img src="/tickets/att/{a["id"]}" alt="附件图片" loading="lazy" '
+        f'title="{html.escape(str(a["orig_name"]))}"></a>'
+        for a in atts
+    )
+    return f'<div class="atts">{imgs}</div>'
+
+_TICKET_PICKER_JS = """
+function _tpInit(inp,box){
+  var MAX=4,sel=[];
+  if(inp.dataset.tpInit){return}
+  inp.dataset.tpInit='1';
+  function sync(){
+    try{
+      var dt=new DataTransfer();
+      sel.forEach(function(f){dt.items.add(f)});
+      inp.files=dt.files;
+    }catch(e){ if(sel.length===0){inp.value=''} }
+  }
+  function render(){
+    box.innerHTML='';
+    sel.forEach(function(f,i){
+      var d=document.createElement('div');d.className='tprev';
+      var img=document.createElement('img');img.src=URL.createObjectURL(f);img.alt='预览';
+      var b=document.createElement('button');b.type='button';b.className='tx';b.title='移除';b.textContent='\\u00d7';
+      b.onclick=function(){sel.splice(i,1);sync();render()};
+      d.appendChild(img);d.appendChild(b);box.appendChild(d);
+    });
+  }
+  inp.addEventListener('change',function(){
+    var fl=[].slice.call(inp.files);
+    for(var i=0;i<fl.length;i++){
+      if(sel.length>=MAX){alert('单条消息最多 '+MAX+' 张图片');break}
+      sel.push(fl[i]);
+    }
+    sync();render();
+  });
+}
+document.querySelectorAll('input[type=file][data-tpick]').forEach(function(i){
+  _tpInit(i,document.getElementById(i.getAttribute('data-tpick')));
+});
+"""
+
+def _ticket_att_picker(uid: str) -> str:
+    """图片选择控件：多选、缩略预览、可删选；accept=image/* 手机端唤起相册/拍照"""
+    return (
+        '<div class="att-pick" style="margin-top:10px">'
+        f'<label>图片（可选，最多 {TICKET_IMG_MAX_COUNT} 张，png/jpg/webp/gif，单张 ≤10MB 自动压缩）</label>'
+        f'<input type="file" name="files" accept="image/*" multiple data-tpick="{uid}">'
+        f'<div class="atts" id="{uid}"></div>'
+        f'<script>{_TICKET_PICKER_JS}</script></div>'
+    )
+
 def _conversation_html(replies) -> str:
+    atts_map = _ticket_attachments_by_reply(r["id"] for r in replies)
     parts = ['<div class="conv">']
     for r in replies:
+        thumbs = _ticket_att_thumbs(atts_map.get(r["id"], []))
         if r["sender"] == "admin":
             parts.append(
                 '<div class="msg admin"><div class="who">客服 · '
                 f'{html.escape(str(r["created_at"])[:16])}</div>'
-                f'{html.escape(str(r["body"]))}</div>'
+                f'{html.escape(str(r["body"]))}{thumbs}</div>'
             )
         else:
             parts.append(
                 '<div class="msg user"><div class="who">'
                 f'{html.escape(str(r["created_at"])[:16])}</div>'
-                f'{html.escape(str(r["body"]))}</div>'
+                f'{html.escape(str(r["body"]))}{thumbs}</div>'
             )
     parts.append("</div>")
     return "".join(parts)
@@ -4439,14 +4659,15 @@ def _user_tickets_home(user, rows, ok: str, err: str) -> str:
     return (
         _ticket_page_head("客服工单", "/", "返回首页")
         + flash
-        + '<div class="sec"><h2>提交新工单</h2>'
-        '<form method="post" action="/tickets/create">'
+        +         '<div class="sec"><h2>提交新工单</h2>'
+        '<form method="post" action="/tickets/create" enctype="multipart/form-data">'
         f'<label>问题分类</label><select name="category">{cat_opts}</select>'
         f'<label>标题（{TICKET_SUBJECT_MAX} 字以内）</label>'
         f'<input name="subject" maxlength="{TICKET_SUBJECT_MAX}" required placeholder="一句话描述问题">'
         f'<label>问题描述（{TICKET_BODY_MAX} 字以内）</label>'
         '<textarea name="body" maxlength="%d" required placeholder="详细描述：做了什么操作、期望什么、实际发生什么；计费问题请附时间与金额"></textarea>'
-        '<div style="margin-top:12px"><button class="btn">提交工单</button></div></form></div>'
+        + _ticket_att_picker("tp-create")
+        + '<div style="margin-top:12px"><button class="btn">提交工单</button></div></form></div>'
         + f'<div class="sec"><h2>我的工单（{len(rows)}）</h2>{items}</div>'
         + _TICKET_PAGE_TAIL
     )
@@ -4473,10 +4694,11 @@ def _user_ticket_detail(user, t, replies, ok: str, err: str) -> str:
         f'{_ticket_cat_text(t["category"])} · 提交于 {html.escape(str(t["created_at"])[:16])}</div>'
         + _conversation_html(replies)
         + closed_note
-        + '<form method="post" action="/tickets/reply" class="frow" style="display:flex">'
+        + '<form method="post" action="/tickets/reply" class="frow" style="display:flex" enctype="multipart/form-data">'
         f'<input type="hidden" name="tid" value="{t["id"]}">'
         f'<textarea name="body" maxlength="{TICKET_BODY_MAX}" required class="tw" placeholder="{"补充说明 / 追问（发送后自动回到待处理）" if not closed else "补充回复将自动重新打开工单"}"></textarea>'
-        '<button class="btn">发送</button></form>'
+        + _ticket_att_picker("tp-reply")
+        + '<button class="btn">发送</button></form>'
         + ('<div class="frow">' + "".join(ops) + "</div>" if ops else "")
         + '</div>' + _TICKET_PAGE_TAIL
     )
@@ -4526,12 +4748,50 @@ def tickets_page(request: Request, id: int = 0):
         ).fetchall()
     return HTMLResponse(_user_tickets_home(user, rows, ok, err))
 
+@app.get("/tickets/att/{att_id}")
+def ticket_attachment_view(request: Request, att_id: int):
+    """在线显示工单图片。权限：工单属主或 admin，其余一律 404（不暴露存在性）。
+    安全：响应按库内真实 mime 下发 + nosniff；存储名不含用户输入，路径拼接前再防一遍 ../。"""
+    user = get_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    with db() as c:
+        row = c.execute(
+            "SELECT a.stored_name, a.mime, a.ticket_id, t.uid AS owner_uid "
+            "FROM ticket_attachments a JOIN tickets t ON t.id = a.ticket_id WHERE a.id=?",
+            (att_id,),
+        ).fetchone()
+    if row is None:
+        return Response(status_code=404)
+    if not is_admin(request) and row["owner_uid"] != user["id"]:
+        return Response(status_code=404)
+    stored = str(row["stored_name"])
+    if "/" in stored or "\\" in stored or ".." in stored:
+        return Response(status_code=404)
+    path = os.path.join(TICKET_ATT_DIR, str(row["ticket_id"]), stored)
+    if not os.path.isfile(path):
+        return Response(status_code=404)
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return Response(status_code=404)
+    return Response(
+        data,
+        media_type=str(row["mime"]) if str(row["mime"]) in TICKET_IMG_EXT else "application/octet-stream",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, max-age=86400",
+        },
+    )
+
 @app.post("/tickets/create")
 async def tickets_create(
     request: Request,
     category: str = Form(""),
     subject: str = Form(""),
     body: str = Form(""),
+    files: list[UploadFile] = File(None),
 ):
     user = get_user(request)
     if user is None:
@@ -4544,6 +4804,9 @@ async def tickets_create(
     body = body.strip()[:TICKET_BODY_MAX]
     if category not in _TICKET_CAT_SET or not subject or not body:
         return RedirectResponse("/tickets?err=invalid", status_code=303)
+    att_err, att_files = await _ticket_prep_images(files)
+    if att_err:
+        return RedirectResponse(f"/tickets?err={att_err}", status_code=303)
     now = site_now().isoformat(timespec="seconds")
     with db() as c:
         cur = c.execute(
@@ -4552,15 +4815,22 @@ async def tickets_create(
             (user["id"], user["username"], category, subject, now, now),
         )
         tid = cur.lastrowid
-        c.execute(
+        cur2 = c.execute(
             "INSERT INTO ticket_replies(ticket_id,sender,body,created_at) VALUES(?,'user',?,?)",
             (tid, body, now),
         )
-    print(f"[ticket] #{tid} 用户 {user['username']} 提交工单：{subject}")
+        rid = cur2.lastrowid
+    _ticket_write_attachments(tid, rid, att_files)
+    print(f"[ticket] #{tid} 用户 {user['username']} 提交工单：{subject}（图片 {len(att_files)} 张）")
     return RedirectResponse("/tickets?id=%d&ok=created" % tid, status_code=303)
 
 @app.post("/tickets/reply")
-async def tickets_reply(request: Request, tid: int = Form(0), body: str = Form("")):
+async def tickets_reply(
+    request: Request,
+    tid: int = Form(0),
+    body: str = Form(""),
+    files: list[UploadFile] = File(None),
+):
     user = get_user(request)
     if user is None:
         return RedirectResponse("/login", status_code=303)
@@ -4569,20 +4839,25 @@ async def tickets_reply(request: Request, tid: int = Form(0), body: str = Form("
     body = body.strip()[:TICKET_BODY_MAX]
     if not body:
         return RedirectResponse("/tickets?id=%d&err=empty" % tid, status_code=303)
+    att_err, att_files = await _ticket_prep_images(files)
+    if att_err:
+        return RedirectResponse("/tickets?id=%d&err=%s" % (tid, att_err), status_code=303)
     now = site_now().isoformat(timespec="seconds")
     with db() as c:
         t = c.execute("SELECT id FROM tickets WHERE id=? AND uid=?", (tid, user["id"])).fetchone()
         if t is None:
             return RedirectResponse("/tickets?err=notfound", status_code=303)
-        c.execute(
+        cur = c.execute(
             "INSERT INTO ticket_replies(ticket_id,sender,body,created_at) VALUES(?,'user',?,?)",
             (tid, body, now),
         )
+        rid = cur.lastrowid
         # 用户补充回复：状态回流待处理（已关闭的工单也自动重新打开）
         c.execute(
             "UPDATE tickets SET status='open', unread_for_admin=1, unread_for_user=0, updated_at=? WHERE id=?",
             (now, tid),
         )
+    _ticket_write_attachments(tid, rid, att_files)
     return RedirectResponse("/tickets?id=%d&ok=replied" % tid, status_code=303)
 
 @app.post("/tickets/close")
@@ -4604,8 +4879,9 @@ def tickets_close(request: Request, tid: int = Form(0)):
     print(f"[ticket] #{tid} 用户 {user['username']} 关闭工单")
     return RedirectResponse("/tickets?id=%d&ok=closed" % tid, status_code=303)
 
-def _admin_ticket_detail_html(t, replies) -> str:
+def _admin_ticket_detail_html(t, replies, err: str = "") -> str:
     closed = t["status"] == "closed"
+    flash = f'<div class="flash err">{err}</div>' if err else ""
     closed_note = ""
     if closed:
         closed_note = f'<div class="dim" style="margin-bottom:8px">该工单已关闭（{ "用户" if t["closed_by"] == "user" else "客服" }关闭）。再次回复会自动重新打开。</div>'
@@ -4617,6 +4893,7 @@ def _admin_ticket_detail_html(t, replies) -> str:
         )
     return (
         _ticket_page_head(f"工单 #{t['id']} · {t['username']}", "/admin?tf=open#sec-tickets", "返回管理面板")
+        + flash
         + '<div class="sec"><div class="r1" style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'
         f'<span class="subj" style="font-weight:600;word-break:break-all">{html.escape(t["subject"])}</span>'
         f'<span>{_ticket_status_tag(t)}</span></div>'
@@ -4625,10 +4902,11 @@ def _admin_ticket_detail_html(t, replies) -> str:
         f'提交于 {html.escape(str(t["created_at"])[:16])}</div>'
         + _conversation_html(replies)
         + closed_note
-        + '<form method="post" action="/admin/tickets/reply" class="frow" style="display:flex">'
+        + '<form method="post" action="/admin/tickets/reply" class="frow" style="display:flex" enctype="multipart/form-data">'
         f'<input type="hidden" name="tid" value="{t["id"]}">'
         f'<textarea name="body" maxlength="{TICKET_BODY_MAX}" required class="tw" placeholder="回复用户（发送后工单变为「已回复」）"></textarea>'
-        '<button class="btn">发送回复</button></form>'
+        + _ticket_att_picker("tp-admin-reply")
+        + '<button class="btn">发送回复</button></form>'
         + ('<div class="frow">' + "".join(ops) + "</div>" if ops else "")
         + '</div>' + _TICKET_PAGE_TAIL
     )
@@ -4639,6 +4917,7 @@ def admin_ticket_detail(request: Request, id: int = 0):
         return RedirectResponse("/admin", status_code=303)
     if id <= 0:
         return RedirectResponse("/admin#sec-tickets", status_code=303)
+    err = _TICKET_FLASH_ERR.get(request.query_params.get("tk_err", ""), "")
     with db() as c:
         t = c.execute("SELECT * FROM tickets WHERE id=?", (id,)).fetchone()
         if t is None:
@@ -4648,29 +4927,39 @@ def admin_ticket_detail(request: Request, id: int = 0):
         ).fetchall()
         if t["unread_for_admin"]:
             c.execute("UPDATE tickets SET unread_for_admin=0 WHERE id=?", (id,))
-    return HTMLResponse(_admin_ticket_detail_html(t, replies))
+    return HTMLResponse(_admin_ticket_detail_html(t, replies, err))
 
 @app.post("/admin/tickets/reply")
-async def admin_ticket_reply(request: Request, tid: int = Form(0), body: str = Form("")):
+async def admin_ticket_reply(
+    request: Request,
+    tid: int = Form(0),
+    body: str = Form(""),
+    files: list[UploadFile] = File(None),
+):
     if not is_admin(request):
         return RedirectResponse("/admin", status_code=303)
     body = body.strip()[:TICKET_BODY_MAX]
     if not body:
         return RedirectResponse("/admin/tickets?id=%d" % tid, status_code=303)
+    att_err, att_files = await _ticket_prep_images(files)
+    if att_err:
+        return RedirectResponse("/admin/tickets?id=%d&tk_err=%s" % (tid, att_err), status_code=303)
     now = site_now().isoformat(timespec="seconds")
     with db() as c:
         t = c.execute("SELECT id FROM tickets WHERE id=?", (tid,)).fetchone()
         if t is None:
             return RedirectResponse("/admin?tk_err=notfound#sec-tickets", status_code=303)
-        c.execute(
+        cur = c.execute(
             "INSERT INTO ticket_replies(ticket_id,sender,body,created_at) VALUES(?,'admin',?,?)",
             (tid, body, now),
         )
+        rid = cur.lastrowid
         # 已关闭工单被再次回复 = 自动重新打开
         c.execute(
             "UPDATE tickets SET status='replied', unread_for_user=1, unread_for_admin=0, updated_at=? WHERE id=?",
             (now, tid),
         )
+    _ticket_write_attachments(tid, rid, att_files)
     return RedirectResponse("/admin/tickets?id=%d" % tid, status_code=303)
 
 @app.post("/admin/tickets/close")
