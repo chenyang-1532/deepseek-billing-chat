@@ -1,6 +1,6 @@
 # Miandning AI（deepseek-billing-chat）技术文档
 
-> 更新日期：2026-11-21 · 代码版本：`c34c913`（v23 卡片化面板后）
+> 更新日期：2026-11-23 · 代码版本：`8566e64`（v25 角色群聊）
 > 本文档与生产部署状态同步，测试站开发新功能前请先阅读第 2、5 节。
 
 ## 1. 系统概述
@@ -70,7 +70,7 @@ DeepSeek 官方 API（渠道 Key，模型 deepseek-flash）
 ## 5. 测试站（新功能开发环境）
 
 - 目录：服务器（生产同机）`/tmp/chatsite-test`（git 仓库，与 GitHub `chenyang-1532/deepseek-billing-chat` main 同步；本地沙箱同名目录为开发副本）。⚠️ 服务器 `/tmp` 重启会被清空，重建方法：解压 `~/chat-site-backup-v23-full-20261121.tar.gz` → 覆盖为最新 GitHub 代码 → touch gateway.on
-- **当前状态**（2026-11-21 v24）：app.py = 生产版（md5 `7d70dc7ed94d65d294a8223549206663`），监听 `127.0.0.1:3100`（3000 被开源雷达 node 服务占用）；data.db / one-api.db 均为 v23 备份的**独立副本**，与生产库完全隔离
+- **当前状态**（2026-11-23 v25）：v25 角色群聊已在测试站开发完成并通过全部 e2e 验收（`tests/test_group_chat_e2e.py` 31/31 PASS），监听 `127.0.0.1:3100`（3000 被开源雷达 node 服务占用）；data.db / one-api.db 均为 v23 备份的**独立副本**，与生产库完全隔离。**v25 尚未部署到生产**，待站长验收后按第 6 节流程上线
 - 启动（服务器上）：
   ```bash
   cd /tmp/chatsite-test && RT_ALLOWED_DB_DIRS=/tmp ADMIN_PASSWORD='WIyWKVcl5Ey5sM4K' \
