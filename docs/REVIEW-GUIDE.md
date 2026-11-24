@@ -6,7 +6,7 @@
 ## 一、入口文件与推荐审查顺序
 
 - **唯一后端入口**：`app.py`（单文件 FastAPI，按区块从上到下组织；先读文头常量区与 `init_db()` 再看业务区）
-- **前端**：`static/index.html`（bundle 引用名）→ `static/static/js/main.fe540c09.js`（压缩主 bundle，改内容必须改名）→ `static/static/js/group-chat.v2.js`（v25 群聊独立模块）
+- **前端**：`static/index.html`（bundle 引用名）→ `static/static/js/main.fe540c09.js`（压缩主 bundle，改内容必须改名）→ `static/static/js/group-chat.v3.js`（v25 群聊独立模块）
 - **推荐顺序**（资金安全 → 资金正确性 → 上传/外部输入 → 群聊 → 前端纪律 → 测试）：
   1. 网关代理与扣费闸（`_gw_proxy`，grep `def _gw_proxy`）
   2. 充值/调账/卡密资金面（`admin_wallet_pay` / `admin_wallet_adjust` / `api_wallet_redeem`）
@@ -32,7 +32,7 @@
 | 9 | **并发/限流护栏** | `_gw_inflight_acquire()`（~L2969，grep `_gw_inflight`）、`_pay_rate_limited()`（~L3011）、`_gc_rate_limited()`（~L4299） | 单用户在途请求上限缓解 new-api pre-consume 并发透支窗口； acquired 必须在所有失败路径 release（对账 finally） |
 | 10 | **上传绕过 new-api 直连官方** | `api_upload()` + `gw_files_key()`（~L3061） | Files API 不走 new-api（new-api 对 `/v1/files` 强制要 model → 400）；key 从 new-api 渠道表读启用渠道（grep `gw_files_key`）；**单渠道部署正确；若未来多渠道轮询需改渠道亲和** |
 | 11 | **请求体上限「读之前拦」** | `_body_limit_middleware()`（grep `R8/R9\|_body_limit_for`，~L688-810） | 上限拦截必须发生在读取 body 之前；chunked 分块丢弃内存有界；导出/恢复另有 200MB 单账号上限（grep `BACKUP_MAX_BYTES`）与 zip bomb 防护（~L83-88：条目数/单文件/总解压/压缩比四道） |
-| 12 | **bundle 缓存改名纪律** | `static/index.html`（引用 `main.fe540c09.js` / `group-chat.v2.js`） | 主 bundle 内容变更必须改名版本号并同步改 index.html（30 天 immutable）；**群聊 v25 未改主 bundle，只动 group-chat.v2.js 时该文件自身需改名**；改 bundle 忘改名 = 用户 30 天看不到新功能 |
+| 12 | **bundle 缓存改名纪律** | `static/index.html`（引用 `main.fe540c09.js` / `group-chat.v3.js`） | 主 bundle 内容变更必须改名版本号并同步改 index.html（30 天 immutable）；**群聊 v25 未改主 bundle，只动 group-chat.v3.js 时该文件自身需改名**；改 bundle 忘改名 = 用户 30 天看不到新功能 |
 | 13 | **数据库迁移平滑性** | `init_db()`（grep `def init_db` / `_add_column`） | 所有新表/新列必须 `CREATE TABLE IF NOT EXISTS` / `ADD COLUMN` 式增量升级，老库（生产 data.db）直接热启动不丢数据 |
 
 ## 三、测试如何运行

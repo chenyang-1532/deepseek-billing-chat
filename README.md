@@ -4,7 +4,7 @@ DeepSeek 官网复刻风格的 AI 聊天站，采用**余额制计费**：用户
 
 **架构三件套**：
 
-- **前端**：DeepSeek 官网复刻 SPA（React 压缩 bundle），内容变更必须**改名 bundle** 绕过 30 天 immutable 缓存；v25 起另有独立群聊模块 `static/js/group-chat.v2.js`
+- **前端**：DeepSeek 官网复刻 SPA（React 压缩 bundle），内容变更必须**改名 bundle** 绕过 30 天 immutable 缓存；v25 起另有独立群聊模块 `static/js/group-chat.v3.js`
 - **后端**：单文件 FastAPI `app.py`（约 5000 行），SQLite `data.db`（用户/充值单/流水/云备份）
 - **计费网关**：new-api（本机内网端口），所有用户请求统一经网关改写为站点默认模型计费，用户无感知；定价 = 官方实时价 × 模型倍数 × 时段倍数，每 10 分钟自动抓取官方价
 
@@ -14,7 +14,7 @@ DeepSeek 官网复刻风格的 AI 聊天站，采用**余额制计费**：用户
 ├── app.py                 # 站点后端（单文件 FastAPI：注册/钱包/充值审批/云同步/网关代理/群聊编排/管理面板）
 ├── static/
 │   ├── index.html         # SPA 入口（bundle 引用名需与实际文件一致）
-│   ├── static/js/         # main.fe540c09.js（主 bundle）+ group-chat.v2.js（v25 群聊，独立模块）
+│   ├── static/js/         # main.fe540c09.js（主 bundle）+ group-chat.v3.js（v25 群聊，独立模块）
 │   └── static/css/        # main.56567ac0.css
 ├── tests/                 # 全量回归测试套件（运行方式见 tests/README.md）
 │   ├── regression_3000.sh # 基础回归（bash）

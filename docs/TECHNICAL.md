@@ -21,7 +21,7 @@ new-api (127.0.0.1:13001, 仅本机可访问)
 DeepSeek 官方 API（渠道 Key，模型 deepseek-flash）
 ```
 
-- 前端：DeepSeek 官网复刻 SPA（React 压缩 bundle），内容变更必须**改名 bundle**（fe540c06→07→08→09）绕过 30 天 immutable 缓存；v25 起另有独立群聊模块 `static/js/group-chat.v2.js`（同样按文件名版本绕缓存）
+- 前端：DeepSeek 官网复刻 SPA（React 压缩 bundle），内容变更必须**改名 bundle**（fe540c06→07→08→09）绕过 30 天 immutable 缓存；v25 起另有独立群聊模块 `static/js/group-chat.v3.js`（同样按文件名版本绕缓存）
 - 后端：单文件 `app.py`（~4400 行），SQLite `data.db`（用户/充值单/流水/云备份）+ `one-api.db`（new-api 计费库）
 
 ## 2. 生产环境（勿改动，仅供参照）
@@ -63,7 +63,7 @@ DeepSeek 官方 API（渠道 Key，模型 deepseek-flash）
     - 编排端点 `POST /api/groups/{gid}/messages` 返回 SSE（user/reply_start/delta/reply_end/reply_error/done）；单角色失败发 `reply_error(kind=persona_failed)` 不阻塞他人；余额不足（<¥0.005 或预估成本超余额）发 `kind=insufficient_balance` 并终止整轮；发消息前还有 402 第一道闸与 10 条/分钟限流
     - 计费：每个角色一次独立 LLM 调用，直连 `NEWAPI_BASE/v1/messages`（Bearer=发起用户 token），走 new-api 正常扣费；done 事件带回合总消耗（logs 表落账有延迟，最多等 10s，未落账则提示以钱包流水为准）
     - 记忆双写：每条角色回复完成后立即把「本轮用户消息+截至该角色的全部发言」追加进该角色的 `persona_group_memory`（单条目封顶 600 字/角色、总量 12000 字滚动裁剪，BEGIN IMMEDIATE 防并发写）；**单聊时**由 `_gw_proxy` 解析 system 里的`【角色名】`自动把记忆注入 system（`GET /api/persona-memory` 可查，`GC_SINGLE_INJECT_CHARS=3000` 控制注入成本）
-    - 前端：独立 overlay 模块 `static/js/group-chat.v2.js`（**主 bundle 未改动，无需改名**；本文件自身变更需改名版本号绕 immutable 缓存），index.html 追加引用。选人数据源是 `GET /api/personas`（服务端解析 cloud_sessions 里的 persona，头像服务端缩到 96px）——云端会话是权威数据源，本机 IndexedDB 只作回退；侧栏尝试注入「👥角色群聊」入口（中英文案都匹配），另有右下角 FAB 兜底；群面板自带群会话列表/消息渲染（角色名+头像）/费用提示与回合消耗条；402 时尝试原地打开钱包弹窗（window.__gwOpenWallet）
+    - 前端：独立 overlay 模块 `static/js/group-chat.v3.js`（**主 bundle 未改动，无需改名**；本文件自身变更需改名版本号绕 immutable 缓存），index.html 追加引用。选人数据源是 `GET /api/personas`（服务端解析 cloud_sessions 里的 persona，头像服务端缩到 96px）——云端会话是权威数据源，本机 IndexedDB 只作回退；侧栏尝试注入「👥角色群聊」入口（中英文案都匹配），另有右下角 FAB 兜底；群面板自带群会话列表/消息渲染（角色名+头像）/费用提示与回合消耗条；402 时尝试原地打开钱包弹窗（window.__gwOpenWallet）
     - 选人要求：群名 1-30 字；成员 2-8 个、角色名唯一≤24 字（来自已有单聊角色的 persona.name）
     - 已知取舍（待站长决策）：一轮制编排（不做 LLM 选人/多轮自动互聊）；群定义与消息存服务端、换设备一致；群成员头像取建群时快照，之后改单聊人设不会回写
 
@@ -73,15 +73,15 @@ DeepSeek 官方 API（渠道 Key，模型 deepseek-flash）
 - **当前状态**（2026-11-23 v25）：v25 角色群聊已在测试站开发完成并通过全部 e2e 验收（`tests/test_group_chat_e2e.py` 31/31 PASS），监听 `127.0.0.1:3100`（3000 被开源雷达 node 服务占用）；data.db / one-api.db 均为 v23 备份的**独立副本**，与生产库完全隔离。**v25 尚未部署到生产**，待站长验收后按第 6 节流程上线
 - 启动（服务器上）：
   ```bash
-  cd /tmp/chatsite-test && RT_ALLOWED_DB_DIRS=/tmp ADMIN_PASSWORD='WIyWKVcl5Ey5sM4K' \
+  cd /tmp/chatsite-test && RT_ALLOWED_DB_DIRS=/tmp ADMIN_PASSWORD='<ADMIN_PW>' \
     GATEWAY_ENABLED=1 NEWAPI_DB=/tmp/chatsite-test/one-api.db NEWAPI_BASE=http://127.0.0.1:13001 \
     nohup /home/admin/chat-site/venv/bin/uvicorn app:app --host 127.0.0.1 --port 3100 > /tmp/test3100.log 2>&1 &
   ```
-- 管理密码 `WIyWKVcl5Ey5sM4K`；上传链路测试直连真实 DeepSeek（用渠道 Key，测试上传会在官方账号留下小文件，无计费影响）
+- 管理密码经环境变量 `ADMIN_PASSWORD` 注入（不落库）；上传链路测试直连真实 DeepSeek（用渠道 Key，测试上传会在官方账号留下小文件，无计费影响）
 
 ### 测试纪律
 
-- 全套件入口：`RT_TAG=xx ADMIN_PW='WIyWKVcl5Ey5sM4K' RT_ALLOWED_DB_DIRS=/opt/newapi RT_SITE_DIR=/tmp/chatsite-test RT_NAPI_DB=/opt/newapi/one-api.db bash tests/run_all.sh`（18 套件）
+- 全套件入口：`RT_TAG=xx ADMIN_PW='<ADMIN_PW>' RT_ALLOWED_DB_DIRS=/opt/newapi RT_SITE_DIR=/tmp/chatsite-test RT_NAPI_DB=/opt/newapi/one-api.db bash tests/run_all.sh`（18 套件）
 - 资金类套件必须指向**运行中**的库路径（静态副本探测必失败）
 - 注册接口限流 5/分：套件间用不同 `RT_TAG`，撞限流时等 65s 再跑
 - 改动后最低回归：`regression_3000.sh`(58) + `test_pay_model.py`(62) + `test_ui_smoke.py`(35) 三件套
