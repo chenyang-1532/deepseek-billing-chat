@@ -4627,7 +4627,10 @@ def _gc_settings(group_row) -> dict:
 
 
 def _gc_clean_settings(body) -> dict | None:
-    """校验前端提交的群设置；非法返回 None。"""
+    """校验前端提交的群设置；非法返回 None。
+
+    站长规则（2026-11-24）：插科打诨（quip）默认开启且不对用户暴露开关——
+    客户端无论传什么都强制 True，前端不再渲染该选项。"""
     if not isinstance(body, dict):
         return None
     try:
@@ -4636,10 +4639,7 @@ def _gc_clean_settings(body) -> dict | None:
         return None
     if rounds not in GC_ROUNDS_CHOICES:
         return None
-    quip = body.get("quip", True)
-    if not isinstance(quip, bool):
-        return None
-    return {"rounds": rounds, "quip": quip}
+    return {"rounds": rounds, "quip": True}
 
 
 def _gc_parse_mentions(content: str, member_names) -> list:
@@ -5152,8 +5152,7 @@ async def api_group_settings(gid: int, request: Request):
     if clean is None:
         return JSONResponse(
             {"ok": False,
-             "msg": "设置不合法：rounds 需为 %s 之一，quip 需为布尔"
-                    % "/".join(str(x) for x in GC_ROUNDS_CHOICES)},
+             "msg": "设置不合法：rounds 需为 %s 之一" % "/".join(str(x) for x in GC_ROUNDS_CHOICES)},
             status_code=400)
     with db() as c:
         g = _gc_load_group(c, gid, user["id"])

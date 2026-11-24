@@ -142,10 +142,11 @@ check("新群默认设置 rounds=1 quip=true", s == {"rounds": 1, "quip": True},
 st, b = req(op1, "PUT", "/api/groups/%d/settings" % gid_d, {"rounds": 4, "quip": True})
 check("设置 rounds=4 被拒 400", st == 400, (st, b[:100]))
 st, b = req(op1, "PUT", "/api/groups/%d/settings" % gid_d, {"rounds": 2, "quip": "yes"})
-check("设置 quip 非布尔被拒 400", st == 400, (st, b[:100]))
+check("设置 rounds=2 成功（quip 非布尔被忽略）", st == 200 and json.loads(b)["settings"] == {"rounds": 2, "quip": True}, (st, b[:120]))
 st, b = req(op1, "PUT", "/api/groups/%d/settings" % gid_d, {"rounds": 3, "quip": False})
-check("设置 rounds=3 成功", st == 200 and json.loads(b)["settings"] == {"rounds": 3, "quip": False}, (st, b[:120]))
-st, b = req(op2, "PUT", "/api/groups/%d/settings" % gid_d, {"rounds": 1, "quip": False})
+check("设置 rounds=3 成功（站长规则：quip 强制开启，客户端关不掉）",
+      st == 200 and json.loads(b)["settings"] == {"rounds": 3, "quip": True}, (st, b[:120]))
+st, b = req(op2, "PUT", "/api/groups/%d/settings" % gid_d, {"rounds": 1})
 check("非群主改设置 404", st == 404, (st, b[:80]))
 
 # ── 互聊轮数 + 编排结构不变式 ──
@@ -194,16 +195,18 @@ st, b = req(op1, "POST", "/api/groups",
 gid_m = json.loads(b).get("id") if st == 200 else None
 check("点名群创建（带 settings）", st == 200 and gid_m, (st, b[:120]))
 st, b = req(op1, "GET", "/api/groups/%d" % gid_m)
-check("点名群 settings 生效", json.loads(b)["group"]["settings"] == {"rounds": 1, "quip": False},
+check("点名群 settings 生效（quip 强制开启）",
+      json.loads(b)["group"]["settings"] == {"rounds": 1, "quip": True},
       b[:150])
 st, raw = req(op1, "POST", "/api/groups/%d/messages" % gid_m,
               {"content": "@李小花 你拿主意吧"}, timeout=600)
 evs2 = sse_events(raw)
 ends2 = [dd.get("sender") for e, dd in evs2 if e == "reply_end"]
 d2 = [dd for e, dd in evs2 if e == "done"][0]
-check("@点名：只有被点名者回复", ends2 == ["李小花"], ends2)
-check("@点名：done.replies=1", d2.get("replies") == 1, d2)
-check("@点名：点名轮无判定调用（calls=1）", d2.get("calls") == 1, d2)
+check("@点名：只有被点名者回复（插科打诨触发时至多补一条）",
+      ends2 and ends2[0] == "李小花" and len(ends2) <= 2, ends2)
+check("@点名：done.replies=1（插科打诨触发时为 2）", d2.get("replies") in (1, 2), d2)
+check("@点名：点名轮无判定调用（calls ≤ 1+可选插科打诨）", d2.get("calls") in (1, 2), d2)
 
 # ── 闲聊泡泡：冷却窗 + 成功路径 ──
 st, b = req(op1, "POST", "/api/groups/%d/idle" % gid_m, {})
@@ -310,30 +313,45 @@ if st3 == 200:
 check("全失败会话不入云端备份", st3 == 200 and SID_FAIL not in stored, (st3, SID_FAIL in stored))
 check("正常会话照常备份", st3 == 200 and SID_OK in stored, (st3, SID_OK in stored))
 
-# ── UI 入口：bundle 改名 fe540c10 + group-chat.v4 + index.html 同步 ──
-b10 = os.path.join(STATIC_DIR, "static/js/main.fe540c10.js")
-v4 = os.path.join(STATIC_DIR, "static/js/group-chat.v4.js")
+# ── UI 入口：bundle fe540c12 + group-chat.v5 + index.html 同步（v27 UI 改造） ──
+b11 = os.path.join(STATIC_DIR, "static/js/main.fe540c12.js")
+v5 = os.path.join(STATIC_DIR, "static/js/group-chat.v5.js")
 idx = open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8").read()
-check("main.fe540c10.js 存在", os.path.exists(b10), b10)
-check("group-chat.v4.js 存在", os.path.exists(v4), v4)
-check("index.html 引用 fe540c10 + v4",
-      "main.fe540c10.js" in idx and "group-chat.v4.js" in idx, idx[:200])
-check("index.html 不再引用 c09/v3",
-      "main.fe540c09.js" not in idx and "group-chat.v3.js" not in idx, idx[:200])
-b10src = open(b10, encoding="utf-8").read()
-v4src = open(v4, encoding="utf-8").read()
-check("bundle 注入侧栏群聊按钮（系统同款样式 sK.dp）",
-      'className:sK.dp,onClick:()=>{window.__gcOpenGroupChat&&window.__gcOpenGroupChat()}' in b10src,
+check("main.fe540c12.js 存在", os.path.exists(b11), b11)
+check("group-chat.v5.js 存在", os.path.exists(v5), v5)
+check("index.html 引用 fe540c12 + v5",
+      "main.fe540c12.js" in idx and "group-chat.v5.js" in idx, idx[:200])
+check("index.html 不再引用 c10/v4",
+      "main.fe540c10.js" not in idx and "group-chat.v4.js" not in idx, idx[:200])
+b11src = open(b11, encoding="utf-8").read()
+v5src = open(v5, encoding="utf-8").read()
+check("bundle 群聊按钮直达创建表单（系统同款样式 sK.dp）",
+      'className:sK.dp,onClick:()=>{window.__gcOpenGroupChat&&window.__gcOpenGroupChat("new")}' in b11src,
       "")
-check("bundle i18n groupChat 文案", 'groupChat:"角色群聊"' in b10src and 'groupChat:"Group chat"' in b10src, "")
-check("v4 暴露 __gcOpenGroupChat hook", "window.__gcOpenGroupChat" in v4src, "")
-check("v4 含群设置/闲聊泡泡/@点名能力",
-      all(k in v4src for k in ("/settings", "/idle", "@角色名")), "")
-check("v4 保留 402 原地开钱包链路", "__gwOpenWallet" in v4src, "")
-st, raw = req(op1, "GET", "/static/js/main.fe540c10.js")
-check("站点可服务 fe540c10 bundle", st == 200 and len(raw) > 400000, (st, len(raw)))
-st, raw = req(op1, "GET", "/static/js/group-chat.v4.js")
-check("站点可服务 group-chat.v4.js", st == 200 and "__gcOpenGroupChat" in raw, (st, len(raw)))
+check("bundle 注入工单按钮（同款样式，跳 /tickets）",
+      'className:sK.dp,onClick:()=>{window.location.href="/tickets"}' in b11src, "")
+check("bundle 批量管理按钮统一同款样式（不再用 manageBtn 旧样式）",
+      'className:sK.dp,onClick:()=>y(!0)' in b11src and 'sK.aX,onClick:()=>y(!0)' not in b11src, "")
+check("bundle i18n：新建群聊/工单/批量管理",
+      'groupChat:"新建群聊"' in b11src and 'tickets:"工单"' in b11src
+      and 'batchManage:"批量管理对话"' in b11src, "")
+check("v5 暴露 __gcOpenGroupChat hook（支持 new/群号直达）",
+      "window.__gcOpenGroupChat = openPanel" in v5src and 'mode === "new"' in v5src
+      and 'typeof mode === "number"' in v5src, "")
+check("v5 会话列表混入（群聊同栏 + 群聊徽标）",
+      'data-gc-block' in v5src and '"群聊"' in v5src and 'list-ac14ac' in v5src
+      and 'section-ac14ac' in v5src, "")
+check("v5 @ 弹层 + 长按头像",
+      'gc-mention' in v5src and 'bindMentionAvatar' in v5src and 'mentionQuery' in v5src, "")
+check("v5 无插科打诨开关（前端不展示，后端强制开启）",
+      "gc-quip" not in v5src and "插科打诨开关" not in v5src, "")
+check("v5 含群设置/闲聊泡泡/@点名能力",
+      all(k in v5src for k in ("/settings", "/idle", "@点名必答")), "")
+check("v5 保留 402 原地开钱包链路", "__gwOpenWallet" in v5src, "")
+st, raw = req(op1, "GET", "/static/js/main.fe540c12.js")
+check("站点可服务 fe540c12 bundle", st == 200 and len(raw) > 400000, (st, len(raw)))
+st, raw = req(op1, "GET", "/static/js/group-chat.v5.js")
+check("站点可服务 group-chat.v5.js", st == 200 and "__gcOpenGroupChat" in raw, (st, len(raw)))
 
 # ── 清理（双侧库零残留） ──
 def cleanup_pair(uid):

@@ -1,13 +1,18 @@
-/* Miandning AI 角色群聊（v26）——独立 overlay 模块
+/* Miandning AI 角色群聊（v27）——独立 overlay 模块
  * 不修改主 bundle 计费逻辑；群聊入口由主 bundle（main.fe540c10.js）侧栏按钮
  * 调用本模块暴露的 window.__gcOpenGroupChat() 打开（系统同款样式）。
  * 本文件作为新静态资源随 index.html 引用，更新时需改名（group-chat.v4.js）绕 immutable 缓存。
  * 数据面：群定义/群消息/群设置/角色记忆全部存服务端（/api/groups*），换设备一致；
  * 人设来源：云端会话（服务端 /api/personas，权威数据源）。
+ * v27 变更（站长反馈 2026-11-24）：
+ *  - 群聊混入主会话列表（与单人会话同栏，带「群聊」紫徽标），侧栏按钮改为「新建群聊」直达创建表单
+ *  - @ 弹层：输入框键入 @ 自动浮出成员列表（头像+名字，点击插入）；长按成员头像亦可 @
+ *  - 侧栏入口三件套统一：新建群聊 / 工单（跳 /tickets）/ 批量管理对话，全部系统同款按钮样式
+ *  - 插科打诨默认开启且不再在前端展示（服务端强制 quip=true）
  * v26 变更：
  *  - 入口整合进左侧菜单（主 bundle 注入系统同款按钮），移除右下角 FAB 与 DOM 注入
  *  - 微信式布局：左侧群列表 + 右侧气泡（面板加宽）
- *  - 群设置面板：互聊轮数（1/2/3，默认 1）、回合结束插科打诨开关（默认开）
+ *  - 群设置面板：互聊轮数（1/2/3，默认 1）；插科打诨默认开启、不设前端开关
  *  - @点名必答（服务端解析），输入框提示
  *  - 打开群聊按概率（30%）补发闲聊泡泡（POST /api/groups/{gid}/idle，
  *    服务端有冷却窗 + 回合锁频控；不做后台定时器，服务端只在被请求时调用一次）
@@ -50,6 +55,15 @@
     "#gc-chathead{flex:none;display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid #e2e6ea;background:#fff}",
     "#gc-chathead b{font-size:15px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
     "#gc-msgs{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px}",
+"#gc-input{position:relative}",
+".gc-mention{position:absolute;bottom:calc(100% + 6px);left:0;right:74px;background:#fff;",
+"border:1px solid #e2e6ea;border-radius:10px;box-shadow:0 10px 34px rgba(15,23,42,.18);",
+"z-index:60;max-height:236px;overflow-y:auto}",
+".gc-mitem{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;font-size:13px}",
+".gc-mitem:hover,.gc-mitem.on{background:#eef2ff}",
+".gc-mitem .gc-avatar{width:26px;height:26px;font-size:11px}",
+".gc-gbadge{flex:none;font-size:10px;line-height:1;padding:3px 5px;border-radius:4px;",
+"background:#eef2ff;color:#4f46e5;font-weight:600}",
     ".gc-empty{color:#94a3b8;text-align:center;margin:auto;font-size:13px;line-height:1.8}",
     ".gc-row{display:flex;gap:8px;align-items:flex-start}",
     ".gc-row.me{flex-direction:row-reverse}",
@@ -227,7 +241,7 @@
     '    <div id="gc-msgs"></div>' +
     '    <div id="gc-costbar"></div>' +
     '    <div id="gc-input">' +
-    '      <textarea id="gc-text" placeholder="发消息（输入 @角色名 可点名必答）"></textarea>' +
+    '      <textarea id="gc-text" placeholder="发消息（输入 @ 选择成员，可点名必答）"></textarea>' +
     '      <button class="gc-btn" id="gc-send">发送</button>' +
     '    </div>' +
     '  </div>' +
@@ -236,7 +250,7 @@
     '  <div class="gc-head" style="display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid #e7eaee"><b>创建群聊</b><span style="flex:1"></span><button class="gc-btn ghost sm" id="gc-cback">返回</button></div>' +
     '  <div class="bd">' +
     '    <div class="gc-warn">费用提示：群聊按实时计费，每条消息会触发一次或多次模型调用（判定该谁说话 + 选中角色依次发言，' +
-    '       各自独立计费到你的钱包）。可先在「群设置」里调整互聊轮数与插科打诨开关。</div>' +
+    '       各自独立计费到你的钱包）。可先在「群设置」里调整互聊轮数。</div>' +
     '    <div class="gc-field"><label>群聊名称（1-30 字）</label><input type="text" id="gc-gname" maxlength="30" placeholder="例如：产品讨论群"></div>' +
     '    <div class="gc-field"><label>选择角色（<span id="gc-selcnt">0</span>/' + MAX_MEMBERS + '，至少 ' + MIN_MEMBERS + ' 个，来自已有单聊角色）</label>' +
     '      <div id="gc-selchips"></div>' +
@@ -256,10 +270,7 @@
     '      </select>' +
     '      <div class="gc-hint" style="margin-top:6px">结构上限：单回合总调用数 ≤ 角色数 × 轮数 × 2（防互聊失控，不是计费限制）。</div>' +
     '    </div>' +
-    '    <div class="gc-field"><label class="gc-switch"><input type="checkbox" id="gc-quip"> 回合结束后小概率（15%）插科打诨</label>' +
-    '      <div class="gc-hint" style="margin-top:6px">关闭后角色只在被选中时发言，不再随机补一句。</div>' +
-    '    </div>' +
-    '    <div class="gc-err" id="gc-serr"></div>' +
+        '    <div class="gc-err" id="gc-serr"></div>' +
     '    <button class="gc-btn" id="gc-sok" style="width:100%">保存设置</button>' +
     '  </div>' +
     '</div>';
@@ -349,6 +360,7 @@
       wrap.appendChild(el("div", "gc-cost", "¥" + m.cost_cny));
     }
     r.appendChild(av); r.appendChild(wrap);
+    bindMentionAvatar(av, m.sender_name);
     return r;
   }
   function appendMsg(m) {
@@ -500,6 +512,7 @@
       bub.innerHTML = '<span class="gc-typing"><i></i><i></i><i></i></span>';
       wrap.appendChild(bub);
       row.appendChild(av); row.appendChild(wrap);
+      bindMentionAvatar(av, d.sender);
       msgsEl.appendChild(row);
       scrollBottom();
     } else if (ev === "delta") {
@@ -637,7 +650,6 @@
   function openSettings() {
     if (!currentGid) return;
     $("gc-rounds").value = String(ROUNDS_CHOICES.indexOf(curSettings.rounds) >= 0 ? curSettings.rounds : 1);
-    $("gc-quip").checked = curSettings.quip !== false;
     $("gc-serr").style.display = "none";
     $("gc-settings").style.display = "flex";
   }
@@ -647,7 +659,6 @@
     err.style.display = "none";
     var body = {
       rounds: parseInt($("gc-rounds").value, 10) || 1,
-      quip: $("gc-quip").checked,
     };
     var btn = $("gc-sok");
     btn.disabled = true;
@@ -656,7 +667,7 @@
       curSettings = d.settings || body;
       $("gc-settings").style.display = "none";
       appendMsg({ sender_type: "system",
-        content: "群设置已更新：互聊 " + curSettings.rounds + " 轮 · 插科打诨" + (curSettings.quip ? "开" : "关") });
+        content: "群设置已更新：互聊 " + curSettings.rounds + " 轮" });
     } catch (e) {
       err.textContent = e.message;
       err.style.display = "block";
@@ -665,15 +676,153 @@
     }
   }
 
+
+  // ---------- @ 成员选择弹层（v27） ----------
+  function hideMention() {
+    var mb = document.getElementById("gc-mention");
+    if (mb) mb.remove();
+  }
+  function mentionQuery() {
+    var pos = textEl.selectionStart;
+    var val = textEl.value.slice(0, pos);
+    var m = val.match(/@([^@\n]*)$/);
+    return m ? { start: pos - m[0].length, q: m[1] } : null;
+  }
+  function showMention() {
+    hideMention();
+    if (!currentGid) return;
+    var st = mentionQuery();
+    if (!st) return;
+    var ms = (membersCache[currentGid] || []).filter(function (x) {
+      return x.name && x.name.toLowerCase().indexOf(st.q.toLowerCase()) >= 0;
+    });
+    if (!ms.length) return;
+    var box = el("div", "gc-mention");
+    box.id = "gc-mention";
+    ms.slice(0, 8).forEach(function (mem) {
+      var it = el("div", "gc-mitem");
+      var av = el("div", "gc-avatar");
+      av.innerHTML = avatarHTML(mem);
+      it.appendChild(av);
+      it.appendChild(el("span", null, mem.name));
+      it.onmousedown = function (ev) {
+        ev.preventDefault();
+        var val = textEl.value, pos = textEl.selectionStart;
+        textEl.value = val.slice(0, st.start) + "@" + mem.name + " " + val.slice(pos);
+        var np = st.start + mem.name.length + 2;
+        textEl.focus();
+        textEl.setSelectionRange(np, np);
+        hideMention();
+      };
+      box.appendChild(it);
+    });
+    $("gc-input").appendChild(box);
+  }
+  textEl.addEventListener("input", showMention);
+  textEl.addEventListener("keyup", showMention);
+  textEl.addEventListener("blur", function () { setTimeout(hideMention, 150); });
+  textEl.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") hideMention();
+  });
+
+  // ---------- 长按成员头像 @（v27） ----------
+  function bindMentionAvatar(avEl, name) {
+    if (!name || !avEl) return;
+    var timer = null;
+    var clear = function () { if (timer) { clearTimeout(timer); timer = null; } };
+    avEl.addEventListener("pointerdown", function () {
+      if (!currentGid || sending) return;
+      timer = setTimeout(function () {
+        timer = null;
+        var add = "@" + name + " ";
+        textEl.value = (textEl.value && textEl.value.slice(-1) !== " " && textEl.value !== ""
+          ? textEl.value + " " : textEl.value) + add;
+        textEl.focus();
+        textEl.setSelectionRange(textEl.value.length, textEl.value.length);
+        hideMention();
+      }, 500);
+    });
+    ["pointerup", "pointerleave", "pointercancel", "pointermove"].forEach(function (evn) {
+      avEl.addEventListener(evn, clear);
+    });
+    avEl.style.cursor = "pointer";
+    avEl.title = "长按 @" + name;
+  }
+
+  // ---------- 会话列表混入（v27）：群聊与单人会话同栏，带「群聊」徽标 ----------
+  var GC_LIST_CLASS = "list-ac14ac", GC_ITEM_CLASS = "section-ac14ac";
+  var gcGroupsCache = [], gcLastFetch = 0, gcPending = false;
+  function gcEnsureSidebar() {
+    var list = document.querySelector("." + GC_LIST_CLASS);
+    if (!list) return;
+    var block = null;
+    for (var i = 0; i < list.children.length; i++) {
+      if (list.children[i].getAttribute && list.children[i].getAttribute("data-gc-block")) { block = list.children[i]; break; }
+    }
+    var groups = gcGroupsCache;
+    if (!groups.length) { if (block) block.remove(); return; }
+    if (block && block.childElementCount === groups.length) return;  // 已是最新
+    if (block) block.remove();
+    block = el("div");
+    block.setAttribute("data-gc-block", "1");
+    groups.forEach(function (g) {
+      var it = el("div", GC_ITEM_CLASS);
+      it.style.cssText = "display:flex;align-items:center;gap:9px;padding:10px 12px;cursor:pointer";
+      var av = el("div", null, "👥");
+      av.style.cssText = "width:34px;height:34px;border-radius:8px;background:#4f46e5;color:#fff;" +
+        "display:flex;align-items:center;justify-content:center;font-size:15px;flex:none";
+      var gi = el("div");
+      gi.style.cssText = "flex:1;min-width:0";
+      var nrow = el("div");
+      nrow.style.cssText = "display:flex;align-items:center;gap:6px";
+      var nm = el("div", null, g.name || "未命名群聊");
+      nm.style.cssText = "font-weight:600;font-size:13px;flex:1;min-width:0;" +
+        "white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      nrow.appendChild(nm);
+      nrow.appendChild(el("span", "gc-gbadge", "群聊"));
+      gi.appendChild(nrow);
+      var sub = el("div", null, (g.member_count || 0) + " 人" +
+        (g.last && g.last.content ? " · " + g.last.content.slice(0, 16) : ""));
+      sub.style.cssText = "color:#94a3b8;font-size:11px;margin-top:2px;" +
+        "white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      gi.appendChild(sub);
+      it.appendChild(av); it.appendChild(gi);
+      it.onclick = function () { window.__gcOpenGroupChat(g.id); };
+      block.appendChild(it);
+    });
+    list.insertBefore(block, list.firstChild);
+  }
+  function gcRefreshSidebarGroups() {
+    var now = Date.now();
+    if (now - gcLastFetch < 3000) { gcEnsureSidebar(); return; }
+    gcLastFetch = now;
+    api("/api/groups").then(function (d) {
+      gcGroupsCache = d.groups || [];
+      gcEnsureSidebar();
+    }).catch(function () { /* 未登录等，静默 */ });
+  }
+  function gcSchedule() {
+    if (gcPending) return;
+    gcPending = true;
+    setTimeout(function () { gcPending = false; gcEnsureSidebar(); }, 60);
+  }
+  new MutationObserver(gcSchedule).observe(document.body, { childList: true, subtree: true });
+  gcRefreshSidebarGroups();
+  setInterval(gcRefreshSidebarGroups, 60000);
+
   // ---------- 面板开关（入口：主 bundle 侧栏按钮 → window.__gcOpenGroupChat） ----------
-  function openPanel() {
+  function openPanel(mode) {
     mask.style.display = "block";
     panel.style.display = "flex";
     $("gc-create").style.display = "none";
     $("gc-settings").style.display = "none";
     if (!groups.length && !currentGid) renderEmpty();
     refreshGroups();
-    loadPersonas().then(function (ps) { personas = ps; });
+    loadPersonas().then(function (ps) {
+      personas = ps;
+      if (mode === "new") openCreate();                   // 侧栏「新建群聊」直达创建表单
+      else if (typeof mode === "number") openGroup(mode); // 会话列表点群项直达该群
+    });
   }
   function closePanel() {
     mask.style.display = "none";
