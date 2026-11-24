@@ -1,9 +1,12 @@
-/* Miandning AI 角色群聊（v27）——独立 overlay 模块
+/* Miandning AI 角色群聊（v28）——独立 overlay 模块
  * 不修改主 bundle 计费逻辑；群聊入口由主 bundle（main.fe540c10.js）侧栏按钮
  * 调用本模块暴露的 window.__gcOpenGroupChat() 打开（系统同款样式）。
  * 本文件作为新静态资源随 index.html 引用，更新时需改名（group-chat.v4.js）绕 immutable 缓存。
  * 数据面：群定义/群消息/群设置/角色记忆全部存服务端（/api/groups*），换设备一致；
  * 人设来源：云端会话（服务端 /api/personas，权威数据源）。
+ * v28 变更（站长反馈 2026-11-24）：
+ *  - 面板全屏化（inset:0），观感对齐单聊页面
+ *  - 去掉底部计费小字（服务端延迟提示与前端费用文案一并移除；余额不足警告保留）
  * v27 变更（站长反馈 2026-11-24）：
  *  - 群聊混入主会话列表（与单人会话同栏，带「群聊」紫徽标），侧栏按钮改为「新建群聊」直达创建表单
  *  - @ 弹层：输入框键入 @ 自动浮出成员列表（头像+名字，点击插入）；长按成员头像亦可 @
@@ -33,13 +36,11 @@
   // ---------- 样式 ----------
   var css = [
     "#gc-mask{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:9100;display:none}",
-    "#gc-panel{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);",
-    "width:min(860px,100vw);height:min(620px,100vh);z-index:9200;background:#f5f6f7;",
-    "color:#0f172a;display:none;flex-direction:column;border-radius:12px;overflow:hidden;",
-    "box-shadow:0 18px 60px rgba(0,0,0,.28);font-size:14px}",
-    "@media (max-width:640px){#gc-panel{width:100vw;height:100vh;border-radius:0;transform:none;top:0;left:0}}",
+    "#gc-panel{position:fixed;inset:0;width:100%;height:100%;z-index:9200;background:#f5f6f7;",
+    "color:#0f172a;display:none;flex-direction:column;overflow:hidden;",
+    "font-size:15px}",
     "#gc-body{flex:1;display:flex;min-height:0}",
-    "#gc-groups{width:220px;border-right:1px solid #e2e6ea;overflow-y:auto;flex:none;background:#f0f2f5;display:flex;flex-direction:column}",
+    "#gc-groups{width:240px;border-right:1px solid #e2e6ea;overflow-y:auto;flex:none;background:#f0f2f5;display:flex;flex-direction:column}",
     "#gc-groups .gc-ghead{padding:14px 14px 8px;font-weight:700;font-size:15px;flex:none;display:flex;align-items:center;justify-content:space-between}",
     "#gc-groups .gc-ghead .gc-btn{flex:none}",
     "#gc-glist{flex:1;overflow-y:auto}",
@@ -77,7 +78,7 @@
     ".gc-row.sys .gc-bubble{background:#fffbeb;color:#92400e;font-size:12px;max-width:92%}",
     ".gc-who{font-size:11px;color:#64748b;margin-bottom:3px}",
     ".gc-row.me .gc-who{text-align:right}",
-    ".gc-cost{color:#94a3b8;font-size:11px;margin-top:2px}",
+    ".gc-cost{display:none}",   // 计费小字不再展示
     ".gc-typing{display:inline-flex;gap:3px;align-items:center}",
     ".gc-typing i{width:5px;height:5px;border-radius:50%;background:#94a3b8;animation:gc-b 1.2s infinite}",
     ".gc-typing i:nth-child(2){animation-delay:.2s}.gc-typing i:nth-child(3){animation-delay:.4s}",
@@ -528,7 +529,7 @@
     } else if (ev === "reply_end") {
       if (d.sender) {
         roundCostShown += 1;
-        costbar.textContent = "已完成 " + roundCostShown + " 条回复…（费用以钱包流水为准）";
+        costbar.textContent = "已完成 " + roundCostShown + " 条回复…";
       }
     } else if (ev === "reply_error") {
       // 移除该角色的 typing 占位
@@ -536,19 +537,13 @@
       if (rr) rr.remove();
       appendMsg({ sender_type: "system", content: d.message || "该角色本次未回复" });
       if (d.kind === "insufficient_balance") {
-        costbar.textContent = "⚠️ 余额不足，本轮已停止（已扣到多少算多少）";
+        costbar.textContent = "⚠️ 余额不足，本轮已停止";
         if (typeof window.__gwOpenWallet === "function") {
           try { window.__gwOpenWallet(); } catch (e) { /* 忽略 */ }
         }
       }
     } else if (ev === "done") {
-      var note = d.note || "";
-      if (d.total_cny != null) {
-        costbar.textContent = "本轮群聊消耗 ¥" + d.total_cny + "（" + d.replies + " 条回复，" +
-          (d.rounds || 1) + " 轮编排）" + (note ? " · " + note : "");
-      } else {
-        costbar.textContent = note || "本轮完成，计费落账中…";
-      }
+      costbar.style.display = "none";   // 计费小字不再展示（站长规则 2026-11-24）
       // 以服务端为准刷一遍（含 system 错误行）
       if (currentGid) {
         api("/api/groups/" + currentGid + "/messages?limit=200").then(function (m2) {

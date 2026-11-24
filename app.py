@@ -5071,8 +5071,6 @@ async def _gc_round_impl(user, group, content: str):
     note = ""
     if cap_hit:
         note = "本回合达到结构上限（成员数×轮数×%d），已提前收尾；" % GC_STRUCT_CAP_MULT
-    if not total_quota:
-        note += "计费落账有延迟，实际费用以钱包流水为准"
     yield _gc_sse("done", {
         "ok": True,
         "replies": ok_calls,
