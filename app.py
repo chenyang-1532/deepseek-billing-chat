@@ -2460,6 +2460,78 @@ async def admin_action(request: Request, uid: int = Form(...), action: str = For
 DEEPSEEK_BASE = os.environ.get("DEEPSEEK_BASE", "https://api.deepseek.com")
 FILES_BETA = "files-api-2025-04-14"
 UPLOAD_MAX_BYTES = 64 * 1024 * 1024  # 与前端限制一致
+# ── 文档解析费（站长 2026-11-24 批准，勿改）──
+# DeepSeek 官方 ¥1.5/千页 × 1.2 倍率 = ¥0.0018/页，按上传响应的实际页数扣
+# （cny_to_quota 换算恰为 125 quota/页，无舍入误差）。上传响应拿不到页数
+# （见 _ocr_resp_pages 实测注释）→ 不扣费，为标准内置兜底规则。
+OCR_FEE_CNY_PER_PAGE = 0.0018
+
+
+def _ocr_resp_pages(data) -> int:
+    """从 DeepSeek 上传响应里提取实际页数，拿不到返回 0（→ 不扣费）。
+
+    实测（2026-11-24，官方文档 schema + 原生 /files 与 Anthropic 兼容端点各传
+    2 页 PDF）：上传响应仅有 id/object|type、bytes|size_bytes、created_at、
+    filename、purpose，无页数字段。此处预留候选字段名——上游一旦补充
+    page_count（或 pages 数组）扣费即自动生效，无需再改代码。
+    """
+    if not isinstance(data, dict):
+        return 0
+    n = data.get("page_count")
+    if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+        return n
+    pages = data.get("pages")
+    if isinstance(pages, list) and pages:
+        return len(pages)
+    return 0
+
+
+def _ocr_fee_charge(uid: int, nid: int, resp_body: bytes, upload_ok: bool) -> bytes:
+    """文档解析费扣费（仅 rich_layout_recognition 且网关模式的成功上传）。
+
+    - 触发：上传成功且响应带实际页数；拿不到页数 → 原样返回不扣费
+    - 幂等：op_id="ocrfee:<file_id>" 走 quota_ops 唯一表（同 gw_add_quota 机制），
+      同一 file_id 只扣一次；wallet_tx.ref 写同一 op_id（唯一索引），账务侧
+      幂等且可逐笔对账
+    - 余额不足照扣（allow_negative，允许小幅为负），响应 JSON 附 fee 字段（元）
+    - 扣费异常绝不阻断上传响应本身：只记日志留痕，后台可按 ref 人工对账
+    - 流水记法沿用日常消费：wallet_tx 一条普通消费记录，备注不带「文档解析」字样
+    """
+    try:
+        data = json.loads(resp_body)
+    except Exception:  # noqa: BLE001  非 JSON 响应原样透传
+        return resp_body
+    if not isinstance(data, dict) or not upload_ok:
+        return resp_body
+    file_id = data.get("id")
+    pages = _ocr_resp_pages(data)
+    if not file_id or not isinstance(file_id, str) or pages <= 0:
+        return resp_body
+    fee_cny = round(pages * OCR_FEE_CNY_PER_PAGE, 6)
+    fee_quota = cny_to_quota(fee_cny)
+    if fee_quota <= 0:
+        return resp_body
+    op_id = "ocrfee:%s" % file_id
+    try:
+        newq = gw_add_quota(nid, -fee_quota, op_id=op_id, allow_negative=True)
+    except Exception as e:  # noqa: BLE001
+        print("[ocrfee] 扣费失败 uid=%s file_id=%s pages=%d fee=%s err=%s"
+              % (uid, file_id, pages, fee_cny, e))
+        return resp_body
+    try:
+        with db() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO wallet_tx(uid,type,cny,balance_cny,note,created_at,ref) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (uid, "consume", -fee_cny, quota_to_cny(newq), "消费",
+                 site_now().strftime("%Y-%m-%d %H:%M:%S"), op_id),
+            )
+    except Exception as e:  # noqa: BLE001
+        print("[ocrfee] 流水落库失败 uid=%s ref=%s err=%s（quota 已扣，按 ref 对账）"
+              % (uid, op_id, e))
+    out = dict(data)
+    out["fee"] = fee_cny
+    return json.dumps(out, ensure_ascii=False).encode("utf-8")
 
 @app.post("/api/upload")
 async def api_upload(request: Request):
@@ -2475,7 +2547,7 @@ async def api_upload(request: Request):
     # 与聊天共用同一 DeepSeek 账号，file_id 在对话请求里照常引用；上传本身不计费，
     # 解析出的 token 在聊天时仍走 new-api 正常扣费。
     if gw_enabled():
-        gw_provision(user)  # 保留开通/对账副作用
+        gw_nid = gw_provision(user)[1]  # 保留开通/对账副作用；[1] 为 new-api 计费用户 id
         _plat_key = gw_files_key()
         if not _plat_key:
             return JSONResponse({"error": {"message": "计费网关未配置可用渠道，暂时无法上传文件"}}, status_code=503)
@@ -2539,7 +2611,11 @@ async def api_upload(request: Request):
     def _do_upload():
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
-                return Response(r.read(), status_code=r.status, media_type="application/json")
+                body = r.read()
+                # 文档解析费：仅网关模式 + rich_layout_recognition（user_data 等不计费）
+                if r.status == 200 and purpose == "rich_layout_recognition" and gw_enabled():
+                    body = _ocr_fee_charge(user["id"], gw_nid, body, upload_ok=True)
+                return Response(body, status_code=r.status, media_type="application/json")
         except urllib.error.HTTPError as e:
             # DeepSeek 的错误原样透传，前端按既有逻辑展示
             detail = e.read().decode("utf-8", "replace")
@@ -3250,21 +3326,25 @@ def gw_napi_uid(user) -> int:
     return row["napi_uid"] if row else gw_provision(user)[1]
 
 
-def gw_add_quota(napi_uid: int, delta_quota: int, op_id: str | None = None) -> int:
-    """给 new-api 用户加减余额，返回调整后余额（quota）
+def gw_add_quota(napi_uid: int, delta_quota: int, op_id: str | None = None,
+                 allow_negative: bool = False) -> int:
+    """给 new-api 用户加减余额，返回调整后余额（quota，可为负）
 
     单语句原子更新 + IMMEDIATE 事务，防止并发读-改-写丢失更新。
     幂等（审查 P0-1/P0-3）：传 op_id 时，在 new-api 库内以 quota_ops 唯一表
     实现「操作号记账 + 余额变更」同一事务原子提交——进程崩溃要么都没发生、
     要么都已生效，重试绝不会重复加款。
+    allow_negative：允许扣成小幅负余额（文档解析费场景，站长 2026-11-24 批准）。
+    默认 False 保持既有「余额不足整体失败」语义不变。
     """
+    # 幂等命中/读余额路径同样返回真实值（负数不截 0），流水 balance_cny 快照才不失真
     if not isinstance(delta_quota, int) or delta_quota == 0:
         # delta==0 直接读当前值，避免无意义写库
         with napi_connect() as nc:
             row = nc.execute("SELECT quota FROM users WHERE id=?", (napi_uid,)).fetchone()
         if row is None:
             raise RuntimeError("new-api 用户不存在: %s" % napi_uid)
-        return max(0, row["quota"] or 0)
+        return row["quota"] or 0
     with napi_connect() as nc:
         nc.execute("BEGIN IMMEDIATE")
         try:
@@ -3308,16 +3388,17 @@ def gw_add_quota(napi_uid: int, delta_quota: int, op_id: str | None = None) -> i
                     if row is None:
                         raise RuntimeError("new-api 用户不存在: %s" % napi_uid)
                     print("[quota] op_id=%s 已生效过，跳过重复加款(幂等)" % op_id)
-                    return max(0, row["quota"] or 0)
+                    return row["quota"] or 0
                 nc.execute(
                     "INSERT INTO quota_ops(op_id, napi_uid, delta, done_at, payload_hash) "
                     "VALUES(?,?,?,?,?)",
                     (op_id, napi_uid, delta_quota,
                      site_now().strftime("%Y-%m-%d %H:%M:%S"), payload_hash),
                 )
-            # 负向扣减改为单语句原子条件更新（审查 R1/P1-02）：余额不足整体失败回滚，
-            # 禁止 MAX(0,...) 截断——否则实际扣 0 但 quota_ops 记完整负数，账目永久失配。
-            if delta_quota < 0:
+            # 负向扣减：默认单语句原子条件更新（审查 R1/P1-02）——余额不足整体失败
+            # 回滚，禁止 MAX(0,...) 截断——否则实际扣 0 但 quota_ops 记完整负数，
+            # 账目永久失配。allow_negative=True（文档解析费）例外：照扣成负数。
+            if delta_quota < 0 and not allow_negative:
                 upd = nc.execute(
                     "UPDATE users SET quota = COALESCE(quota,0) + ? "
                     "WHERE id=? AND COALESCE(quota,0) + ? >= 0",
@@ -3340,7 +3421,7 @@ def gw_add_quota(napi_uid: int, delta_quota: int, op_id: str | None = None) -> i
         except Exception:
             nc.rollback()
             raise
-    return max(0, row["quota"] or 0)
+    return row["quota"] or 0
 
 
 @app.get("/api/wallet")
