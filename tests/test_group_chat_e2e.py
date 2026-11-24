@@ -195,7 +195,8 @@ check("第二条消息编排正常", any(e == "done" for e, _ in evs2), [e for e
 st, b = req(op1, "GET", "/api/groups/%d/messages?limit=200" % gid)
 msgs = json.loads(b)["messages"]
 types = [m["sender_type"] for m in msgs]
-check("消息持久化：1 user + 2 persona/轮", types.count("user") == 2 and types.count("persona") >= 4, types)
+check("消息持久化：user 2 条 + persona 每轮至少一人（判定选人）",
+      types.count("user") == 2 and types.count("persona") >= 2, types)
 check("消息带角色名", any(m["sender_name"] == "诸葛明" for m in msgs), [m["sender_name"] for m in msgs])
 
 # ── 记忆双写 ──
@@ -237,6 +238,7 @@ st, b = req(op2, "POST", "/api/groups/%d/messages" % gid2, {"content": "嗨"}, t
 check("余额为 0 发群消息 402", st == 402, (st, b[:120]))
 
 # ── 测试 1：上游 500 → persona_failed，不写记忆，system 行落库 ──
+# 用 @点名保证确定性：判定选人随机，只有点名才能确保张失败被要求发言。
 P_T = {"name": "张失败", "avatar": "", "persona": {
     "description": "TRIGGER_500 一位专门触发上游故障的测试角色", "personality": "稳定失败",
     "style": "", "example": "", "firstMes": ""}}
@@ -244,12 +246,19 @@ st, b = req(op1, "POST", "/api/groups", {"name": "故障注入群", "members": [
 gid_t = json.loads(b).get("id") if st == 200 else None
 check("故障注入群创建", st == 200 and gid_t, (st, b[:120]))
 st, raw = req(op1, "POST", "/api/groups/%d/messages" % gid_t,
-              {"content": "请介绍一下自己"}, timeout=300)
+              {"content": "@张失败 请介绍一下自己"}, timeout=300)
 evs_t = sse_events(raw)
 fails = [d for e, d in evs_t if e == "reply_error" and d.get("kind") == "persona_failed"]
 check("上游 500 → persona_failed", any(d.get("sender") == "张失败" for d in fails), fails)
-ends_t = [d.get("sender") for e, d in evs_t if e == "reply_end"]
-check("单角色失败不阻塞其他角色（诸葛明仍回复）", "诸葛明" in ends_t, ends_t)
+dones_t = [d for e, d in evs_t if e == "done"]
+check("失败即停本轮（aborted 不误报成功）",
+      dones_t and dones_t[0].get("replies", 0) == 0, dones_t)
+# 失败后群仍可用：点名诸葛明确认可正常回复（失败不损坏群状态）
+st, raw = req(op1, "POST", "/api/groups/%d/messages" % gid_t,
+              {"content": "@诸葛明 你在吗"}, timeout=300)
+evs_t2 = sse_events(raw)
+ends_t = [d.get("sender") for e, d in evs_t2 if e == "reply_end"]
+check("单角色失败不阻塞群聊（诸葛明仍回复）", "诸葛明" in ends_t, ends_t)
 c = sqlite3.connect(SITE_DB)
 sys_rows = c.execute(
     "SELECT sender_name, content FROM chat_group_messages WHERE group_id=? AND sender_type='system'",
@@ -261,24 +270,29 @@ c.close()
 check("失败角色 system 行落库", any(r[0] == "张失败" for r in sys_rows), sys_rows)
 check("失败角色不写记忆", not mem_t, mem_t)
 
-# ── 测试 2：402 中途耗尽（mock 在回复时抽干发起人余额 → 第二角色 insufficient_balance） ──
+# ── 测试 2：402 中途耗尽（两轮式：触发器放用户消息，对 mock/真实判定都确定生效） ──
 req(adm, "POST", "/admin/wallet/adjust", {"uid": str(uid2), "amount": "1", "dir": "add"}, form=True)
 P_D = {"name": "钱烧光", "avatar": "", "persona": {
-    "description": "DRAIN_402 一位回复前把钱包烧光的测试角色", "personality": "挥霍",
+    "description": "一位回复前把钱包烧光的测试角色", "personality": "挥霍",
     "style": "", "example": "", "firstMes": ""}}
 st, b = req(op2, "POST", "/api/groups", {"name": "中途耗尽群", "members": [P_D, P_B]})
 gid_d = json.loads(b).get("id") if st == 200 else None
 check("中途耗尽群创建", st == 200 and gid_d, (st, b[:120]))
 st, raw = req(op2, "POST", "/api/groups/%d/messages" % gid_d,
-              {"content": "嗨"}, timeout=300)
+              {"content": "先热热身"}, timeout=300)
 evs_d = sse_events(raw)
 ends_d = [d.get("sender") for e, d in evs_d if e == "reply_end"]
-check("第一角色照常回复（钱已花有产出）", "钱烧光" in ends_d, ends_d)
+check("正常轮至少一名角色照常回复（钱已花有产出）", len(ends_d) >= 1, ends_d)
+st, raw = req(op2, "POST", "/api/groups/%d/messages" % gid_d,
+              {"content": "DRAIN_402 烧钱环节开始"}, timeout=300)
+evs_d = sse_events(raw)
+ends_d = [d.get("sender") for e, d in evs_d if e == "reply_end"]
 ib = [d for e, d in evs_d if e == "reply_error" and d.get("kind") == "insufficient_balance"]
-check("第二角色 insufficient_balance", any(d.get("sender") == "李小花" for d in ib), ib)
+check("抽干轮至多一名角色发言（没钱即停）", len(ends_d) <= 1, ends_d)
+check("insufficient_balance 事件已推送", len(ib) >= 1, ib)
 dones_d = [d for e, d in evs_d if e == "done"]
-check("done.aborted=true 且 replies=1",
-      dones_d and dones_d[0].get("aborted") is True and dones_d[0].get("replies") == 1, dones_d)
+check("done.aborted=true",
+      dones_d and dones_d[0].get("aborted") is True, dones_d)
 
 # ── 测试 3：并发回合 → 第二个请求 429 ──
 op1b = mkop()

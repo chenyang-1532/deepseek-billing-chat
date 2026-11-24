@@ -5,6 +5,7 @@
 import asyncio
 import json
 import os
+import re
 import sqlite3
 
 from fastapi import FastAPI, Request, Response
@@ -24,29 +25,45 @@ MOCK_OFFICIAL_KEY = os.environ.get("MOCK_OFFICIAL_KEY", "")
 MOCK_OFFICIAL_BASE = os.environ.get(
     "MOCK_OFFICIAL_BASE", "https://api.deepseek.com/anthropic")
 
+# 发起用户名提取：群聊 user_text 的记录段首行是「<站点用户名>：<内容>」。
+# v26 修正：原先按 tokens.accessed_time 最新挑用户，但 new-api 对 accessed_time
+# 是批量延迟落库的——判定调用/前序测试刚发生时，发起人 token 的 accessed_time
+# 可能尚未刷进 DB，导致 drain 误伤上一个活跃用户（v26 e2e 实测）。
+# 站点 napi 侧用户名 = "site<uid>_<站点用户名截断>"，含发起用户名，可反查。
+_USERNAME_RE = re.compile(r"([A-Za-z0-9_]{3,32})：")
 
-def _drain_quota() -> None:
+
+def _drain_quota(prompt: str) -> None:
     """把发起用户钱包余额抽干（群聊中途耗尽测试用）。
 
-    注意：new-api 转发 Anthropic 渠道时 Authorization 会被换成渠道自己的 key，
-    无法从请求头识别发起用户——改借 tokens.accessed_time：发起用户的 token 刚
-    被 new-api 校验过（秒级新鲜），串行测试场景下即唯一活跃 token。置 quota=1
-    让后续余额闸全部命中（相对扣减仍由 new-api postConsume 完成）。"""
+    主路径：从 prompt 记录段提取最后一个 ASCII 用户名（= 最近的用户消息发起人），
+    按用户名模糊匹配 new-api 用户。兜底：退回 tokens.accessed_time 最新（v25 行为）。"""
     if not MOCK_NAPI_DB:
         return
+    targets = []
+    names = _USERNAME_RE.findall(prompt or "")
+    if names:
+        targets = [names[-1]]   # 最后一个 ASCII 用户名 = 最近一条用户消息的发起人
     try:
         c = sqlite3.connect(MOCK_NAPI_DB, timeout=10)
-        # 只 drain 最新被访问的那 1 个 token 的用户：DRAIN_402 请求本身刚经 new-api
-        # 校验发起人 token（accessed_time 秒级最新）；宽窗口会误伤其他测试号的 token
-        # （如上一测试刚用过的 u1），导致后续并发用例被第一道余额闸 402。
-        rows = c.execute(
-            "SELECT user_id FROM tokens WHERE status=1 "
-            "ORDER BY accessed_time DESC LIMIT 1").fetchall()
+        rows = []
+        for nm in targets:
+            rows = c.execute(
+                "SELECT id FROM users WHERE username LIKE ? ORDER BY id DESC LIMIT 1",
+                ("%" + nm + "%",)).fetchall()
+            if rows:
+                break
+        if not rows:
+            # 兜底：只 drain 最新被访问的那 1 个 token 的用户（accessed_time 落库有延迟，不可靠）
+            rows = c.execute(
+                "SELECT user_id FROM tokens WHERE status=1 "
+                "ORDER BY accessed_time DESC LIMIT 1").fetchall()
         for (uid,) in rows:
             c.execute("UPDATE users SET quota=1 WHERE id=?", (uid,))
         c.commit()
         c.close()
-        print("[mock_upstream] DRAIN_402: drained token user(s) %s" % [r[0] for r in rows])
+        print("[mock_upstream] DRAIN_402: drained user(s) %s (match=%s)" %
+              ([r[0] for r in rows], targets))
     except Exception as e:  # noqa: BLE001
         print("[mock_upstream] drain 失败:", e)
 
@@ -117,7 +134,7 @@ async def messages(request: Request):
         if "TRIGGER_500" in prompt or "TRIGGER_500" in system_text:
             return JSONResponse({"error": {"message": "mock upstream triggered 500"}}, status_code=500)
         if "DRAIN_402" in prompt or "DRAIN_402" in system_text:
-            _drain_quota()
+            _drain_quota(prompt)
         # 无触发器 → 透传官方真实回复（语义类断言依赖真 LLM）；失败回退固定文案
         real = _passthrough_official(body)
         if real is not None:
