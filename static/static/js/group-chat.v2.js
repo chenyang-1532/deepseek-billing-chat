@@ -93,7 +93,16 @@
     if (text != null) e.textContent = text;
     return e;
   }
-  function esc(s) { return String(s == null ? "" : s); }
+  // M-5（审查 R-v25）：真 HTML 转义（原实现原样返回，等于没有转义——
+  // 角色名/头像 data URL 一旦含 " 或 < 即可逃出属性/标签上下文形成 XSS）
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
   async function api(path, opts) {
     var o = opts || {};
     var r = await fetch(path, {
@@ -279,7 +288,8 @@
   // ---------- 群消息渲染 ----------
   function avatarHTML(m) {
     if (m && m.avatar && m.avatar.indexOf("data:image/") === 0) {
-      return '<img src="' + m.avatar + '" alt="">';
+      // 属性值必须转义（后端另有白名单+魔数强校验，此处纵深防御）
+      return '<img src="' + esc(m.avatar) + '" alt="">';
     }
     return esc((m && m.name ? m.name : "?").slice(0, 1));
   }
@@ -397,6 +407,10 @@
     } catch (e) {
       appendMsg({ sender_type: "system", content: "发送失败：" + e.message +
         (e.status === 402 ? "（余额不足，请充值后再试）" : "") });
+      // L-1（审查 R-v25）：402 与 SSE 内 insufficient_balance 行为对齐——原地开钱包
+      if (e.status === 402 && typeof window.__gwOpenWallet === "function") {
+        try { window.__gwOpenWallet(); } catch (e2) { /* 忽略 */ }
+      }
     } finally {
       setSending(false);
       refreshGroups();

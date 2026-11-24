@@ -319,7 +319,8 @@ def main():
             bal_ok = False
             if row.count():
                 rtext = row.evaluate("e => e.textContent")
-                bal_ok = ("¥" in rtext) or ("未开通" in rtext)
+                # 171e9bb 起：实时余额异步填充，未就绪/无映射时显示「—」（原「未开通」已弃用）
+                bal_ok = ("¥" in rtext) or ("未开通" in rtext) or ("—" in rtext)
             ck("管理UI：用户行显示余额列(余额制)", bal_ok)
             save_shot(pageAdm, "admin_approve")
             # 注册即开通：C 直接登录进入聊天页（原「审批后登录」语义）

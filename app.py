@@ -4288,6 +4288,21 @@ GC_UPSTREAM_TIMEOUT = (10, 300)
 GC_COST_WAIT_SECONDS = 10          # 回合结束后等 new-api 落账的最长时间
 _GC_NAME_RE = re.compile(r"【角色名】([^\n】]{1,32})")
 _GC_ATTEMPTS = {}
+# M-4（审查 R-v25）：群头像 data URL 白名单。此前只查前缀 data:image/ 且只限长度，
+# `data:image/svg+xml;base64,...` 可携带脚本（存储型 XSS：头像 URL 原样进 <img src>）。
+_GC_AVATAR_RE = re.compile(r"^data:image/(png|jpeg);base64,[A-Za-z0-9+/=]+$")
+
+
+def _gc_avatar_valid(avatar: str) -> bool:
+    """头像 data URL 强校验：格式白名单 + 解码后 PNG/JPEG 魔数（同 admin_wallet_qr 口径）。
+    解码失败/魔数不符（伪装成图片的任意文件、SVG 脚本、超长截断）一律 False。"""
+    if not _GC_AVATAR_RE.match(avatar):
+        return False
+    try:
+        raw = base64.b64decode(avatar.split(",", 1)[1], validate=True)
+    except Exception:  # noqa: BLE001
+        return False
+    return raw[:8] == b"\x89PNG\r\n\x1a\n" or raw[:3] == b"\xff\xd8\xff"
 
 
 class _GCUpstreamError(Exception):
@@ -4300,12 +4315,42 @@ class _GCUpstreamError(Exception):
 def _gc_rate_limited(uid: int) -> bool:
     """群聊发送限流（结构同 _REDEEM_ATTEMPTS：{uid: [窗口起始, 次数]}，进程内）"""
     now = time.time()
+    # L-2（审查 R-v25）：对齐其他限流表，加 _prune 防内存无上限增长
+    _prune_attempts(_GC_ATTEMPTS, ttl=60, cap=4096, ts_idx=0)
     arr = _GC_ATTEMPTS.get(uid)
     if not arr or now - arr[0] >= 60:
         _GC_ATTEMPTS[uid] = [now, 1]
         return False
     arr[1] += 1
     return arr[1] > GC_SEND_RATE_LIMIT
+
+
+# ── M-2（审查 R-v25）：回合并发锁 ──
+# 同一用户同时只允许一个群聊回合在跑：两条消息并发会触发两套角色调用，
+# 上下文互相看不到对方（读库时序不定）、扣费翻倍且 SSE 交错。进程内布尔锁
+# （{uid: [held, ts]}），结构对齐 _GW_PROVISION_LOCK / _GW_INFLIGHT 风格。
+_GC_ROUND_LOCKS: dict = {}
+_GC_ROUND_LOCK_GUARD = threading.Lock()
+_GC_ROUND_LOCK_TTL = 3000  # 僵尸自愈：整轮最坏 = 8 角色 ×(10+300)s 上游超时 + 落账等待 ≈ 2500s，TTL 必须大于它防误收正常长回合
+
+
+def _gc_round_trylock(uid: int) -> bool:
+    with _GC_ROUND_LOCK_GUARD:
+        now = time.time()
+        ent = _GC_ROUND_LOCKS.get(uid)
+        if ent and ent[0] and now - ent[1] < _GC_ROUND_LOCK_TTL:
+            return False
+        # 无锁 / 已释放 / 超 TTL（生成器从未被消费，finally 未执行 → 强收自愈）
+        _GC_ROUND_LOCKS[uid] = [True, now]
+        return True
+
+
+def _gc_round_unlock(uid: int) -> None:
+    with _GC_ROUND_LOCK_GUARD:
+        ent = _GC_ROUND_LOCKS.get(uid)
+        if ent:
+            ent[0] = False
+            ent[1] = time.time()
 
 
 def _gc_extract_persona_name(system) -> str:
@@ -4451,6 +4496,9 @@ def _gc_call_llm(token_key: str, system: str, user_text: str) -> str:
         "system": system,
         "max_tokens": GC_MAX_TOKENS,
         "thinking": {"type": "disabled"},
+        # 显式非流式：期望拿到整体 JSON 解析 content；缺省时部分上游/网关组合
+        # 会按流式中继（实测 new-api+mock 渠道缺省 stream 返回 SSE → 非 JSON 502）
+        "stream": False,
         "messages": [{"role": "user", "content": user_text}],
     }
     r = http_requests.post(
@@ -4523,7 +4571,66 @@ def _gc_parse_members(raw) -> list:
         return []
 
 
+def _gc_task_done_callback(task: "asyncio.Task") -> None:
+    """M-1：断开后台落库任务的异常兜底（无人 await 时防 'exception never retrieved'）"""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        print("[group-chat] 断开后的落库任务失败:", e)
+
+
+async def _gc_call_persist(token_key, uid, name, gid, system, user_text,
+                           content, username, group_name, round_lines):
+    """M-1（审查 R-v25）：调用 + 落库 + 记忆 打包为原子 task，配合 asyncio.shield。
+
+    客户端中途断开时回合协程被取消（CancelledError），若落库裸露在外会随取消
+    一起丢掉——钱已花、库没写（「花钱必有产出」被打破）。此协程作为独立 task：
+    外层取消只中断 SSE 下发与后续角色循环，本 task 在事件循环里继续跑完
+    落库 + 记忆双写。返回 (text, mid, rnow)；空回复返回 ("", None, None)；
+    调用失败抛异常（调用方转 persona_failed）。
+    """
+    text = await run_in_threadpool(_gc_call_llm, token_key, system, user_text)
+    if not text:
+        return "", None, None
+    text = text[:GC_REPLY_MAX_CHARS]
+    rnow = site_now().strftime("%Y-%m-%d %H:%M:%S")
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO chat_group_messages(group_id,sender_type,sender_name,content,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (gid, "persona", name, text, rnow),
+        )
+        mid = cur.lastrowid
+    # ── 记忆双写：该角色亲眼见过的本轮内容（用户消息 + 先前发言 + 自己这条）──
+    seen = [("用户", username, content[:GC_MSG_MAX_CHARS])] + \
+           [(n, n, t) for n, t in round_lines] + [(name, name, text)]
+    entry_lines = ["［群聊「%s」 %s］" % (group_name, rnow)]
+    for _w, _n, _t in seen:
+        entry_lines.append("%s：%s" % (_w, _t[:600]))
+    entry_lines.append("（以上是你以「%s」身份参与的一段群聊经历）" % name)
+    try:
+        await run_in_threadpool(
+            _gc_memory_append, uid, name, "\n".join(entry_lines))
+    except Exception as e:  # noqa: BLE001
+        print("[group-chat] 记忆写入失败 uid=%s name=%s err=%s" % (uid, name, e))
+    return text, mid, rnow
+
+
 async def _gc_round(user, group, content: str):
+    """回合编排包装：M-2 回合锁持有方。入口（api_group_chat）拿锁，这里在
+    finally 无条件释放——done 前的提前 return、余额终止 break、客户端断开、
+    生成器被 close 全覆盖。生成器从未被消费时 finally 不执行（Python 语义），
+    由 _gc_round_trylock 的 TTL 僵尸回收兜底（同 _GW_INFLIGHT 自愈思路）。"""
+    try:
+        async for chunk in _gc_round_impl(user, group, content):
+            yield chunk
+    finally:
+        _gc_round_unlock(user["id"])
+
+
+async def _gc_round_impl(user, group, content: str):
     """群聊回合编排器（SSE 事件流）。角色失败不阻塞后续角色；余额不足立即终止整轮。"""
     gid = group["id"]
     uid = user["id"]
@@ -4555,9 +4662,30 @@ async def _gc_round(user, group, content: str):
         if not name:
             continue
         seq = i
+        # ── 删群护栏：回合进行中群被删除则立即终止（防继续烧钱 + 向已删群写孤儿消息） ──
+        with db() as c:
+            gdel = c.execute(
+                "SELECT deleted FROM chat_groups WHERE id=?", (gid,)
+            ).fetchone()
+        if gdel is None or gdel["deleted"]:
+            yield _gc_sse("reply_error", {
+                "seq": seq, "sender": name, "kind": "group_deleted",
+                "message": "群聊已删除，本轮提前结束",
+            })
+            aborted = True
+            break
         # ── 余额预检（第二道闸同款口径）：不足则终止整轮并明确告知 ──
         bal = await run_in_threadpool(_gc_balance, nid)
-        if bal is None or bal < cny_to_quota(0.005):
+        if bal is None:
+            # M-7（审查 R-v25）：查询失败（DB 连接失败/锁超时）≠ 余额不足。
+            # 误报 insufficient_balance 会弹充值提示吓用户；此处跳过该角色继续，
+            # 只有真实余额低于阈值才走 insufficient_balance。
+            yield _gc_sse("reply_error", {
+                "seq": seq, "sender": name, "kind": "upstream_error",
+                "message": "钱包查询暂时不可用，%s 本轮跳过（不影响其他角色）" % name,
+            })
+            continue
+        if bal < cny_to_quota(0.005):
             yield _gc_sse("reply_error", {
                 "seq": seq, "sender": name, "kind": "insufficient_balance",
                 "message": "钱包余额不足，本轮未发言的角色已停止（充值后可继续使用群聊）",
@@ -4599,10 +4727,17 @@ async def _gc_round(user, group, content: str):
                 "message": "当前在途请求过多，%s 这轮没排上，请稍后再发一条" % name,
             })
             continue
+        task = asyncio.ensure_future(_gc_call_persist(
+            token_key, uid, name, gid, system, user_text,
+            content, username, group["name"], round_lines))
+        task.add_done_callback(_gc_task_done_callback)
         try:
-            text = await run_in_threadpool(_gc_call_llm, token_key, system, user_text)
+            # M-1：shield 只包「调用+落库+记忆」段——客户端断开（CancelledError
+            # 是 BaseException，绕过下方 except Exception）时 task 在后台继续
+            # 完成落库，已计费的回复不丢；shield 之外无 await 挂点，取消会立即
+            # 传播终止后续角色循环。
+            text, mid, rnow = await asyncio.shield(task)
         except Exception as e:  # noqa: BLE001  单角色失败不阻塞其他角色
-            _gw_inflight_release(uid)
             detail = ""
             status = 0
             if isinstance(e, _GCUpstreamError):
@@ -4623,22 +4758,17 @@ async def _gc_round(user, group, content: str):
                 "message": "%s 这次没回复成功，其他角色继续" % name,
             })
             continue
-        _gw_inflight_release(uid)
+        finally:
+            # finally 而非紧跟调用：客户端中途断开时任务被取消，CancelledError
+            # 是 BaseException，绕过上方 except Exception——必须保证释放，
+            # 否则计数泄漏（僵尸回收最长 330s，期间该用户持续撞 429）
+            _gw_inflight_release(uid)
         if not text:
             yield _gc_sse("reply_error", {
                 "seq": seq, "sender": name, "kind": "persona_failed",
                 "message": "%s 这次返回了空内容，本轮跳过" % name,
             })
             continue
-        text = text[:GC_REPLY_MAX_CHARS]
-        rnow = site_now().strftime("%Y-%m-%d %H:%M:%S")
-        with db() as c:
-            cur = c.execute(
-                "INSERT INTO chat_group_messages(group_id,sender_type,sender_name,content,created_at) "
-                "VALUES(?,?,?,?,?)",
-                (gid, "persona", name, text, rnow),
-            )
-            mid = cur.lastrowid
         ok_calls += 1
         round_lines.append((name, text))
         # 逐 token 观感的分段下发（上游为非流式，切小块回填）
@@ -4646,18 +4776,6 @@ async def _gc_round(user, group, content: str):
         for k in range(0, len(text), CH):
             yield _gc_sse("delta", {"seq": seq, "text": text[k:k + CH]})
         yield _gc_sse("reply_end", {"seq": seq, "sender": name, "message_id": mid, "created_at": rnow})
-        # ── 记忆双写：该角色亲眼见过的本轮内容（用户消息 + 至自己的全部发言）──
-        seen = [("用户", username, content[:GC_MSG_MAX_CHARS])] + \
-               [(n, n, t) for n, t in round_lines]
-        entry_lines = ["［群聊「%s」 %s］" % (group["name"], rnow)]
-        for _w, _n, _t in seen:
-            entry_lines.append("%s：%s" % (_w, _t[:600]))
-        entry_lines.append("（以上是你以「%s」身份参与的一段群聊经历）" % name)
-        try:
-            await run_in_threadpool(
-                _gc_memory_append, uid, name, "\n".join(entry_lines))
-        except Exception as e:  # noqa: BLE001
-            print("[group-chat] 记忆写入失败 uid=%s name=%s err=%s" % (uid, name, e))
 
     # ── 费用汇总：等 new-api 落账（实测落账可延迟 >2s），超时按已落账部分返回 ──
     total_quota = 0
@@ -4764,6 +4882,10 @@ async def api_groups_create(request: Request):
         avatar = m.get("avatar") or ""
         if not isinstance(avatar, str) or len(avatar) > GC_AVATAR_MAX_CHARS:
             avatar = ""   # 超限头像直接丢弃（前端已预缩，正常不触发）
+        elif avatar and not _gc_avatar_valid(avatar):
+            # M-4：非空头像必须过白名单 + 魔数校验，不合法拒绝建群（防存储型 XSS）
+            return JSONResponse(
+                {"ok": False, "msg": "头像格式不合法（仅支持 PNG/JPEG）"}, status_code=400)
         total_avatar += len(avatar)
         p = m.get("persona") or {}
         if isinstance(p, str):
@@ -4856,10 +4978,23 @@ async def api_group_chat(gid: int, request: Request):
     # 第一道余额闸：余额为 0 直接拒绝（不打扰任何角色）
     _, nid = gw_provision(user)
     bal = await run_in_threadpool(_gc_balance, nid)
-    if bal is None or bal < cny_to_quota(0.005):
+    if bal is None:
+        # M-7（审查 R-v25）：查询失败（DB 连接失败/锁超时）≠ 余额不足。
+        # 原实现把 None 与真实 0 余额同等弹 insufficient_balance（402 会唤起
+        # 钱包面板诱导充值）——现在按上游类故障返回 503，不弹钱包。
+        return JSONResponse(
+            {"error": {"type": "upstream_error", "message": "钱包查询暂时不可用，请稍后重试"}},
+            status_code=503)
+    if bal < cny_to_quota(0.005):
         return JSONResponse(
             {"error": {"type": "insufficient_balance", "message": "钱包余额不足，请充值后再使用"}},
             status_code=402)
+    # M-2：回合并发锁——同用户上一轮还在回复中时直接拒绝，防止两条消息并发
+    # 触发两套角色调用（上下文互不可见、扣费翻倍、SSE 交错）。
+    if not _gc_round_trylock(user["id"]):
+        return JSONResponse(
+            {"error": {"type": "rate_limited", "message": "上一轮仍在回复中，请稍候"}},
+            status_code=429)
     return StreamingResponse(
         _gc_round(user, g, content),
         status_code=200,
