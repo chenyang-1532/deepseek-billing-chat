@@ -1715,6 +1715,13 @@ def admin_page(request: Request):
                 "FROM cloud_sessions WHERE deleted=0 GROUP BY uid"
             ).fetchall()
         }
+        # 最近使用：每用户云端会话的最后一次更新时间（单条聚合 SQL 防 N+1），无记录显示「—」
+        last_use = {
+            r["uid"]: r["last"]
+            for r in c.execute(
+                "SELECT uid, MAX(updated_at) AS last FROM cloud_sessions GROUP BY uid"
+            ).fetchall()
+        }
     announcement = get_setting("announcement", "")
     # 待审充值数徽标（导航"充值审批(N)"，网关关闭时不显示）
     paybadge = ""
@@ -2252,12 +2259,18 @@ def admin_page(request: Request):
             + (' <span class="badge b-amber">接近上限</span>' if sizes.get(r["id"], 0) >= warn_line else "")
             if sizes.get(r["id"]) else '<span class="dim">—</span>'
         )
+        # created_at/updated_at 历史上既有空格分隔也有 ISO「T」分隔，统一显示 YYYY-MM-DD HH:MM
+        created_cell = html.escape(str(r["created_at"] or "").replace("T", " ")[:16]) or '<span class="dim">—</span>'
+        _lu = last_use.get(r["id"])
+        last_cell = html.escape(str(_lu).replace("T", " ")[:16]) if _lu else '<span class="dim">—</span>'
         row_cls = ' class="hot"' if hot else ""
         user_rows.append(
             f'<tr{row_cls}><td class="uname" data-l="用户">{html.escape(str(r["username"]))}</td>'
             f'<td data-l="状态">{status_tag}</td>'
             f'<td class="num2" data-l="余额">{bal_cell}</td>'
             f'<td class="num2" data-l="云端备份">{backup_cell}</td>'
+            f'<td class="num2 dim" data-l="注册时间">{created_cell}</td>'
+            f'<td class="num2 dim" data-l="最近使用">{last_cell}</td>'
             f'<td><div class="ops">{"".join(ops)}</div></td></tr>'
         )
     parts.append(
@@ -2266,8 +2279,8 @@ def admin_page(request: Request):
         + action_flash
         + backup_strip
         + '<div class="tscroll opsfix"><table class="cardable"><thead><tr>'
-        '<th>用户</th><th>状态</th><th>余额</th><th>云端备份</th><th>操作</th></tr></thead><tbody>'
-        + ("".join(user_rows) or '<tr><td colspan="5" class="dim" style="text-align:center;padding:18px">暂无用户</td></tr>')
+        '<th>用户</th><th>状态</th><th>余额</th><th>云端备份</th><th>注册时间</th><th>最近使用</th><th>操作</th></tr></thead><tbody>'
+        + ("".join(user_rows) or '<tr><td colspan="7" class="dim" style="text-align:center;padding:18px">暂无用户</td></tr>')
         + '</tbody></table></div></section>'
     )
     if wallet_html:
@@ -2461,19 +2474,20 @@ DEEPSEEK_BASE = os.environ.get("DEEPSEEK_BASE", "https://api.deepseek.com")
 FILES_BETA = "files-api-2025-04-14"
 UPLOAD_MAX_BYTES = 64 * 1024 * 1024  # 与前端限制一致
 # ── 文档解析费（站长 2026-11-24 批准，勿改）──
-# DeepSeek 官方 ¥1.5/千页 × 1.2 倍率 = ¥0.0018/页，按上传响应的实际页数扣
-# （cny_to_quota 换算恰为 125 quota/页，无舍入误差）。上传响应拿不到页数
-# （见 _ocr_resp_pages 实测注释）→ 不扣费，为标准内置兜底规则。
+# DeepSeek 官方 ¥1.5/千页 × 1.2 倍率 = ¥0.0018/页，网关模式所有成功上传均扣费
+# （不分 purpose、不分格式；BYOK 用户自持 Key 直传不扣）。页数优先取上传响应的
+# page_count，拿不到则按文件格式本地估算（见 _local_upload_pages），解析失败兜底 1 页。
+# 扣费对用户完全静默：响应 JSON 不携带任何收费信息（站长口径②）。
 OCR_FEE_CNY_PER_PAGE = 0.0018
 
 
 def _ocr_resp_pages(data) -> int:
-    """从 DeepSeek 上传响应里提取实际页数，拿不到返回 0（→ 不扣费）。
+    """从 DeepSeek 上传响应里提取上游页数，拿不到返回 0（→ 本地估算兜底）。
 
     实测（2026-11-24，官方文档 schema + 原生 /files 与 Anthropic 兼容端点各传
     2 页 PDF）：上传响应仅有 id/object|type、bytes|size_bytes、created_at、
     filename、purpose，无页数字段。此处预留候选字段名——上游一旦补充
-    page_count（或 pages 数组）扣费即自动生效，无需再改代码。
+    page_count（或 pages 数组）即优先按上游页数扣费。
     """
     if not isinstance(data, dict):
         return 0
@@ -2486,14 +2500,62 @@ def _ocr_resp_pages(data) -> int:
     return 0
 
 
-def _ocr_fee_charge(uid: int, nid: int, resp_body: bytes, upload_ok: bool) -> bytes:
-    """文档解析费扣费（仅 rich_layout_recognition 且网关模式的成功上传）。
+# 本地页数估算依据（站长批准的费率口径，¥0.0018/页）：
+_DOCX_PAGE_CHARS = 600      # docx：全文字数 ÷600 向上取整（估算，非真实分页）
+_BIN_PAGE_BYTES = 300000    # doc/ppt 旧二进制格式：按 ~300KB/页 粗估
+_TEXT_PAGE_BYTES = 5000     # txt 及其他文本/未知格式：按 ~5KB/页 粗估
+_IMG_EXTS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff",
+             "svg", "heic", "heif", "avif"}
 
-    - 触发：上传成功且响应带实际页数；拿不到页数 → 原样返回不扣费
+
+def _local_upload_pages(name: str, data: bytes) -> int:
+    """按文件格式本地估算页数（最少 1 页）；解析失败由调用方兜底为 1 页。
+
+    - pdf：pypdf 本地精确页数
+    - pptx：python-pptx 数 slides，每 slide=1 页
+    - docx：python-docx 全文字数 ÷600 向上取整，最少 1 页（估算值，
+      非真实分页——docx 无固定页数概念，600 字/页为站长批准的计费口径）
+    - doc/ppt：旧二进制格式无轻量解析库，按字节数粗估（~300KB/页）
+    - txt 及其他文本、未知格式：按字节数粗估（~5KB/页）
+    - 图片：固定 1 页
+    """
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext == "pdf":
+        from pypdf import PdfReader
+        return len(PdfReader(io.BytesIO(data or b"")).pages)
+    if ext == "pptx":
+        from pptx import Presentation
+        return len(Presentation(io.BytesIO(data or b"")).slides)
+    if ext == "docx":
+        from docx import Document
+        doc = Document(io.BytesIO(data or b""))
+        n = sum(len(p.text) for p in doc.paragraphs)
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    n += sum(len(p.text) for p in cell.paragraphs)
+        return max(1, math.ceil(n / _DOCX_PAGE_CHARS))
+    if ext in ("doc", "ppt"):
+        return max(1, math.ceil(len(data or b"") / _BIN_PAGE_BYTES))
+    if ext in _IMG_EXTS:
+        return 1
+    return max(1, math.ceil(len(data or b"") / _TEXT_PAGE_BYTES))
+
+
+def _ocr_fee_charge(uid: int, nid: int, resp_body: bytes, upload_ok: bool,
+                    filename: str = "", file_bytes: bytes = b"") -> bytes:
+    """文档解析费扣费（网关模式的所有成功上传）。
+
+    - 触发：上传成功即扣（rich_layout_recognition 与 user_data 等一视同仁，
+      不分 purpose、不分格式，站长 2026-11-24 口径①：任何文件上传都要收费）；
+      仅上传本身失败不扣
+    - 页数：优先取上游响应 page_count；拿不到则按文件格式本地估算
+      （_local_upload_pages），估算异常（库缺失/文件损坏）兜底按最少 1 页
     - 幂等：op_id="ocrfee:<file_id>" 走 quota_ops 唯一表（同 gw_add_quota 机制），
       同一 file_id 只扣一次；wallet_tx.ref 写同一 op_id（唯一索引），账务侧
       幂等且可逐笔对账
-    - 余额不足照扣（allow_negative，允许小幅为负），响应 JSON 附 fee 字段（元）
+    - 余额不足照扣（allow_negative，允许小幅为负）
+    - 扣费对用户完全静默：响应 JSON 不携带任何收费信息（站长口径②）
     - 扣费异常绝不阻断上传响应本身：只记日志留痕，后台可按 ref 人工对账
     - 流水记法沿用日常消费：wallet_tx 一条普通消费记录，备注不带「文档解析」字样
     """
@@ -2504,9 +2566,19 @@ def _ocr_fee_charge(uid: int, nid: int, resp_body: bytes, upload_ok: bool) -> by
     if not isinstance(data, dict) or not upload_ok:
         return resp_body
     file_id = data.get("id")
+    if not isinstance(file_id, str) or not file_id:
+        # 响应异常无 id：用文件内容摘要兜底幂等号，扣费照常且防重放
+        file_id = "noid-" + hashlib.sha256(file_bytes or resp_body).hexdigest()[:16]
     pages = _ocr_resp_pages(data)
-    if not file_id or not isinstance(file_id, str) or pages <= 0:
-        return resp_body
+    if pages <= 0:
+        try:
+            pages = _local_upload_pages(filename, file_bytes)
+        except Exception as e:  # noqa: BLE001  库缺失/文件损坏 → 最少 1 页
+            pages = 1
+            print("[ocrfee] 本地页数解析失败，按 1 页扣 uid=%s file=%s err=%s"
+                  % (uid, filename, e))
+    if pages <= 0:
+        pages = 1
     fee_cny = round(pages * OCR_FEE_CNY_PER_PAGE, 6)
     fee_quota = cny_to_quota(fee_cny)
     if fee_quota <= 0:
@@ -2529,9 +2601,8 @@ def _ocr_fee_charge(uid: int, nid: int, resp_body: bytes, upload_ok: bool) -> by
     except Exception as e:  # noqa: BLE001
         print("[ocrfee] 流水落库失败 uid=%s ref=%s err=%s（quota 已扣，按 ref 对账）"
               % (uid, op_id, e))
-    out = dict(data)
-    out["fee"] = fee_cny
-    return json.dumps(out, ensure_ascii=False).encode("utf-8")
+    # 口径②：响应原样透传，不附加 fee 字段、不做任何收费提示
+    return resp_body
 
 @app.post("/api/upload")
 async def api_upload(request: Request):
@@ -2611,11 +2682,16 @@ async def api_upload(request: Request):
     def _do_upload():
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
-                body = r.read()
-                # 文档解析费：仅网关模式 + rich_layout_recognition（user_data 等不计费）
-                if r.status == 200 and purpose == "rich_layout_recognition" and gw_enabled():
-                    body = _ocr_fee_charge(user["id"], gw_nid, body, upload_ok=True)
-                return Response(body, status_code=r.status, media_type="application/json")
+                resp_body = r.read()
+                # 文档解析费：网关模式所有成功上传均扣费（rich_layout_recognition
+                # 与 user_data 等不分 purpose、不分格式，站长口径①）。
+                # BYOK 直传路径用用户自己的 Key，不走本分支，不扣费。
+                if r.status == 200:
+                    resp_body = _ocr_fee_charge(
+                        user["id"], gw_nid, resp_body, upload_ok=True,
+                        filename=name, file_bytes=body,
+                    )
+                return Response(resp_body, status_code=r.status, media_type="application/json")
         except urllib.error.HTTPError as e:
             # DeepSeek 的错误原样透传，前端按既有逻辑展示
             detail = e.read().decode("utf-8", "replace")
