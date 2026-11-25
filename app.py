@@ -732,7 +732,9 @@ TICKET_SUBJECT_MAX = 100     # 标题上限（字符）
 TICKET_BODY_MAX = 2000       # 正文/回复上限（字符）
 TICKET_RATE_LIMIT = 5        # 每用户每小时最多提 5 条新工单（防刷）
 TICKET_RATE_WINDOW = 3600
+TICKET_REPLY_RATE_LIMIT = 30  # 审查 R26 P3-2：回复限流（每用户每小时 30 条，防灌水刷库）
 _TICKET_CREATE_ATTEMPTS: dict[int, list] = {}   # uid -> [窗口起点, 次数]（内存态，重启清零）
+_TICKET_REPLY_ATTEMPTS: dict[int, list] = {}    # 同上，回复限流窗口
 
 def _ticket_rate_limited(uid: int) -> bool:
     now = time.time()
@@ -744,6 +746,17 @@ def _ticket_rate_limited(uid: int) -> bool:
         return False
     win[1] += 1
     return win[1] > TICKET_RATE_LIMIT
+
+def _ticket_reply_rate_limited(uid: int) -> bool:
+    now = time.time()
+    win = _TICKET_REPLY_ATTEMPTS.get(uid)
+    if win is None or now - win[0] >= TICKET_RATE_WINDOW:
+        if len(_TICKET_REPLY_ATTEMPTS) > 10000:
+            _TICKET_REPLY_ATTEMPTS.clear()
+        _TICKET_REPLY_ATTEMPTS[uid] = [now, 1]
+        return False
+    win[1] += 1
+    return win[1] > TICKET_REPLY_RATE_LIMIT
 
 def _ticket_cat_text(cat: str) -> str:
     for k, t in TICKET_CATEGORIES:
@@ -2529,6 +2542,8 @@ UPLOAD_MAX_BYTES = 64 * 1024 * 1024  # 与前端限制一致
 # page_count，拿不到则按文件格式本地估算（见 _local_upload_pages），解析失败兜底 1 页。
 # 扣费对用户完全静默：响应 JSON 不携带任何收费信息（站长口径②）。
 OCR_FEE_CNY_PER_PAGE = 0.0018
+OCR_FEE_MAX_PAGES = 5000     # 审查 R26 P3-1：单文件页数封顶（64MB PDF 可估 3 万+页，
+                             # 不封顶会单笔扣 54 元+；超出按封顶值扣，防账面巨幅负数噪声）
 
 
 def _ocr_resp_pages(data) -> int:
@@ -2629,6 +2644,10 @@ def _ocr_fee_charge(uid: int, nid: int, resp_body: bytes, upload_ok: bool,
                   % (uid, filename, e))
     if pages <= 0:
         pages = 1
+    if pages > OCR_FEE_MAX_PAGES:   # R26 P3-1：页数封顶，超出按封顶值扣
+        print("[ocrfee] 页数超封顶 uid=%s file=%s pages=%d → 按 %d 扣"
+              % (uid, filename, pages, OCR_FEE_MAX_PAGES))
+        pages = OCR_FEE_MAX_PAGES
     fee_cny = round(pages * OCR_FEE_CNY_PER_PAGE, 6)
     fee_quota = cny_to_quota(fee_cny)
     if fee_quota <= 0:
@@ -5061,6 +5080,8 @@ async def tickets_reply(
         return RedirectResponse("/login", status_code=303)
     if user["status"] != "approved":
         return HTMLResponse(status_page_html(user), status_code=403)
+    if _ticket_reply_rate_limited(user["id"]):   # R26 P3-2：回复限流 30/时
+        return RedirectResponse("/tickets?id=%d&err=rate" % tid, status_code=303)
     body = body.strip()[:TICKET_BODY_MAX]
     if not body:
         return RedirectResponse("/tickets?id=%d&err=empty" % tid, status_code=303)
