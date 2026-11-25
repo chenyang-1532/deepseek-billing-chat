@@ -1,9 +1,12 @@
-/* Miandning AI 角色群聊（v28）——独立 overlay 模块
+/* Miandning AI 角色群聊（v29）——独立 overlay 模块
  * 不修改主 bundle 计费逻辑；群聊入口由主 bundle（main.fe540c10.js）侧栏按钮
  * 调用本模块暴露的 window.__gcOpenGroupChat() 打开（系统同款样式）。
  * 本文件作为新静态资源随 index.html 引用，更新时需改名（group-chat.v4.js）绕 immutable 缓存。
  * 数据面：群定义/群消息/群设置/角色记忆全部存服务端（/api/groups*），换设备一致；
  * 人设来源：云端会话（服务端 /api/personas，权威数据源）。
+ * v29 变更（站长反馈 2026-11-25）：
+ *  - 移除面板内部左侧群列表栏：聊天区全宽（与私聊一致），入口统一走主会话列表
+ *    （群聊项混入）与侧栏「新建群聊」；右上角「关闭」退出
  * v28 变更（站长反馈 2026-11-24）：
  *  - 面板全屏化（inset:0），观感对齐单聊页面
  *  - 去掉底部计费小字（服务端延迟提示与前端费用文案一并移除；余额不足警告保留）
@@ -40,18 +43,6 @@
     "color:#0f172a;display:none;flex-direction:column;overflow:hidden;",
     "font-size:15px}",
     "#gc-body{flex:1;display:flex;min-height:0}",
-    "#gc-groups{width:240px;border-right:1px solid #e2e6ea;overflow-y:auto;flex:none;background:#f0f2f5;display:flex;flex-direction:column}",
-    "#gc-groups .gc-ghead{padding:14px 14px 8px;font-weight:700;font-size:15px;flex:none;display:flex;align-items:center;justify-content:space-between}",
-    "#gc-groups .gc-ghead .gc-btn{flex:none}",
-    "#gc-glist{flex:1;overflow-y:auto}",
-    ".gc-gitem{padding:12px 14px;cursor:pointer;display:flex;gap:9px;align-items:center}",
-    ".gc-gitem:hover{background:#e7eaee}",
-    ".gc-gitem.on{background:#e2e8f0}",
-    ".gc-gitem .gav{width:34px;height:34px;border-radius:8px;background:#4f46e5;color:#fff;flex:none;",
-    "display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}",
-    ".gc-gitem .gi{flex:1;min-width:0}",
-    ".gc-gitem .n{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-    ".gc-gitem .m{color:#94a3b8;font-size:11px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
     "#gc-chatwrap{flex:1;display:flex;flex-direction:column;min-width:0;background:#f5f6f7}",
     "#gc-chathead{flex:none;display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid #e2e6ea;background:#fff}",
     "#gc-chathead b{font-size:15px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
@@ -231,10 +222,6 @@
   panel.id = "gc-panel";
   panel.innerHTML =
     '<div id="gc-body">' +
-    '  <div id="gc-groups">' +
-    '    <div class="gc-ghead"><span>群聊</span><button class="gc-btn sm" id="gc-new">＋ 新建</button></div>' +
-    '    <div id="gc-glist"></div>' +
-    '  </div>' +
     '  <div id="gc-chatwrap">' +
     '    <div id="gc-chathead"><b id="gc-title">角色群聊</b>' +
     '      <button class="gc-btn ghost sm" id="gc-gear">群设置</button>' +
@@ -278,32 +265,14 @@
   document.body.appendChild(panel);
 
   var $ = function (id) { return document.getElementById(id); };
-  var msgsEl = $("gc-msgs"), glistEl = $("gc-glist"), textEl = $("gc-text"),
+  var msgsEl = $("gc-msgs"), textEl = $("gc-text"),
       sendBtn = $("gc-send"), costbar = $("gc-costbar");
 
-  // ---------- 群列表 ----------
-  function renderGroups() {
-    glistEl.innerHTML = "";
-    groups.forEach(function (g) {
-      var it = el("div", "gc-gitem" + (g.id === currentGid ? " on" : ""));
-      var gav = el("div", "gav", (g.name || "?").slice(0, 1));
-      var gi = el("div", "gi");
-      gi.appendChild(el("div", "n", g.name));
-      gi.appendChild(el("div", "m", g.member_count + " 人 · " + (g.last && g.last.content ? g.last.content.slice(0, 12) : "")));
-      it.appendChild(gav); it.appendChild(gi);
-      it.onclick = function () { openGroup(g.id); };
-      glistEl.appendChild(it);
-    });
-    if (!groups.length) {
-      glistEl.appendChild(el("div", "gc-empty", "还没有群聊\n点上方「＋ 新建」创建"));
-    }
-  }
-
+  // ---------- 群列表（数据层；入口为主会话列表混入项，不再有面板内列表） ----------
   async function refreshGroups() {
     try {
       var d = await api("/api/groups");
       groups = d.groups || [];
-      renderGroups();
       if (currentGid && !groups.some(function (g) { return g.id === currentGid; })) {
         currentGid = null;
         renderEmpty();
@@ -319,8 +288,13 @@
   }
   function renderEmpty() {
     msgsEl.innerHTML = "";
-    msgsEl.appendChild(el("div", "gc-empty",
-      "选择左侧群聊，或点「＋ 新建」创建\n把几个单聊里的人物拉进一个群里畅聊"));
+    var box = el("div", "gc-empty", "还没有打开的群聊\n从左侧会话列表点「群聊」进入，或创建新群");
+    var b = el("button", "gc-btn", "＋ 创建群聊");
+    b.style.marginTop = "10px";
+    b.onclick = openCreate;
+    box.appendChild(document.createElement("br"));
+    box.appendChild(b);
+    msgsEl.appendChild(box);
     costbar.style.display = "none";
     sendBtn.disabled = true;
     textEl.disabled = true;
@@ -388,7 +362,6 @@
 
   async function openGroup(gid) {
     currentGid = gid;
-    renderGroups();
     sendBtn.disabled = false;
     textEl.disabled = false;
     $("gc-gear").disabled = false;
@@ -817,6 +790,8 @@
       personas = ps;
       if (mode === "new") openCreate();                   // 侧栏「新建群聊」直达创建表单
       else if (typeof mode === "number") openGroup(mode); // 会话列表点群项直达该群
+      else if (currentGid) openGroup(currentGid);         // 无参重开：恢复上次群
+      else openCreate();                                  // 兜底：直接进创建表单
     });
   }
   function closePanel() {
@@ -824,11 +799,11 @@
     panel.style.display = "none";
     $("gc-create").style.display = "none";
     $("gc-settings").style.display = "none";
+    gcRefreshSidebarGroups();   // 回到主界面时立刻刷新会话列表里的群聊预览
   }
   window.__gcOpenGroupChat = openPanel;   // 主 bundle（fe540c10）侧栏入口调用
   mask.onclick = closePanel;
   $("gc-close").onclick = closePanel;
-  $("gc-new").onclick = openCreate;
   $("gc-gear").onclick = openSettings;
   $("gc-send").onclick = sendCurrent;
   textEl.addEventListener("keydown", function (e) {
@@ -837,7 +812,7 @@
       sendCurrent();
     }
   });
-  $("gc-cback").onclick = function () { $("gc-create").style.display = "none"; };
+  $("gc-cback").onclick = function () { $("gc-create").style.display = "none"; if (!currentGid) renderEmpty(); };
   $("gc-cok").onclick = submitCreate;
   $("gc-sback").onclick = function () { $("gc-settings").style.display = "none"; };
   $("gc-sok").onclick = saveSettings;
