@@ -41,7 +41,16 @@ ck("登录成功", s == 200 and b'"ok":true' in b, (s, b[:120]))
 
 c = sqlite3.connect("/tmp/chatsite-test/data.db")
 uid = c.execute("SELECT id FROM users WHERE username=?", (U,)).fetchone()[0]
-nid = c.execute("SELECT napi_uid FROM gateway_map WHERE uid=?", (uid,)).fetchone()[0]
+nid = c.execute("SELECT napi_uid FROM gateway_map WHERE uid=?", (uid,)).fetchone()
+if nid is None:   # 新注册用户尚未建档（首次走网关时才 provision），此处手动建档
+    import importlib.util as _ilu
+    spec0 = _ilu.spec_from_file_location("appmod0", "/tmp/chatsite-test/app.py")
+    m0 = importlib.util.module_from_spec(spec0)
+    spec0.loader.exec_module(m0)
+    urow = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    nid = m0.gw_provision({"id": uid, "username": U})[1]
+else:
+    nid = nid[0]
 
 # 2) 找工单（复用上轮 P3验证 工单；无则新建）
 row = c.execute("SELECT id FROM tickets WHERE subject='P3验证' ORDER BY id DESC LIMIT 1").fetchone()
