@@ -1,9 +1,12 @@
-/* Miandning AI 角色群聊（v30）——独立 overlay 模块
+/* Miandning AI 角色群聊（v31）——独立 overlay 模块
  * 不修改主 bundle 计费逻辑；群聊入口由主 bundle（main.fe540c10.js）侧栏按钮
  * 调用本模块暴露的 window.__gcOpenGroupChat() 打开（系统同款样式）。
  * 本文件作为新静态资源随 index.html 引用，更新时需改名（group-chat.v4.js）绕 immutable 缓存。
  * 数据面：群定义/群消息/群设置/角色记忆全部存服务端（/api/groups*），换设备一致；
  * 人设来源：云端会话（服务端 /api/personas，权威数据源）。
+ * v31 变更（站长反馈 2026-11-25）：
+ *  - 头部左上角改为系统同款三横按钮：点击拉起系统侧栏抽屉（提层盖在群聊上），
+ *    在抽屉里可直接切私聊/其他群聊；点群聊项自动收抽屉直达该群；选私聊自动退出群聊视图
  * v30 变更（站长反馈 2026-11-25）：
  *  - 头部左侧「←」返回箭头（对齐私聊返回交互）
  *  - 点群名弹出群聊切换列表（面板内快速切群，无需退出再进）
@@ -51,8 +54,8 @@
     "#gc-chathead{flex:none;display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid #e2e6ea;background:#fff}",
     "#gc-chathead b{font-size:15px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;",
     "cursor:pointer;position:relative}",
-    "#gc-back{flex:none;width:30px;height:30px;border:none;background:none;font-size:19px;line-height:1;",
-    "color:#0f172a;cursor:pointer;padding:0;border-radius:8px}",
+    "#gc-back{flex:none;width:32px;height:32px;border:none;background:none;display:flex;",
+    "align-items:center;justify-content:center;color:#0f172a;cursor:pointer;padding:0;border-radius:8px}",
     "#gc-back:hover{background:#eef2f5}",
     ".gc-swi{position:absolute;top:calc(100% + 8px);left:0;min-width:210px;max-width:78vw;background:#fff;",
     "border:1px solid #e2e6ea;border-radius:10px;box-shadow:0 10px 34px rgba(15,23,42,.18);",
@@ -241,7 +244,11 @@
   panel.innerHTML =
     '<div id="gc-body">' +
     '  <div id="gc-chatwrap">' +
-    '    <div id="gc-chathead"><button id="gc-back" aria-label="返回">←</button><b id="gc-title" title="点击切换群聊">角色群聊</b>' +
+    '    <div id="gc-chathead"><button id="gc-back" aria-label="侧栏菜单">' +
+    '      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+    '        <path d="M17.2027 4.90034V6.43655H2.79724V4.90034H17.2027Z" fill="currentColor"></path>' +
+    '        <path d="M10.9603 13.0634V14.5996H2.79724V13.0634H10.9603Z" fill="currentColor"></path>' +
+    '      </svg></button><b id="gc-title" title="点击切换群聊">角色群聊</b>' +
     '      <button class="gc-btn ghost sm" id="gc-gear">群设置</button>' +
     '      <button class="gc-btn ghost sm" id="gc-close">关闭</button></div>' +
     '    <div id="gc-msgs"></div>' +
@@ -773,7 +780,11 @@
         "white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
       gi.appendChild(sub);
       it.appendChild(av); it.appendChild(gi);
-      it.onclick = function () { window.__gcOpenGroupChat(g.id); };
+      it.onclick = function () {
+        var cb = document.querySelector('button[aria-label="Close sidebar"]');
+        if (cb) cb.click();
+        window.__gcOpenGroupChat(g.id);
+      };
       block.appendChild(it);
     });
     list.insertBefore(block, list.firstChild);
@@ -864,7 +875,40 @@
   window.__gcOpenGroupChat = openPanel;   // 主 bundle（fe540c10）侧栏入口调用
   mask.onclick = closePanel;
   $("gc-close").onclick = closePanel;
-  $("gc-back").onclick = closePanel;
+  // —— 系统侧栏抽屉联动（v31）：三横 = 系统同款侧栏 ——
+  function gcRaiseDrawer() {
+    var m = document.querySelector(".drawerMask-ac14ac");
+    var d = document.querySelector(".drawer-ac14ac");
+    if (m && !m.style.zIndex) m.style.zIndex = "9300";
+    if (d && !d.style.zIndex) d.style.zIndex = "9310";
+  }
+  function gcCloseDrawer() {
+    var b = document.querySelector('button[aria-label="Close sidebar"]');
+    if (b) { b.click(); return true; }
+    var m = document.querySelector(".drawerMask-ac14ac");
+    if (m) { m.click(); return true; }
+    return false;
+  }
+  function gcOpenDrawer() {
+    var b = document.querySelector('button[aria-label="Open sidebar"]');
+    if (!b) return false;
+    b.click();
+    gcRaiseDrawer();
+    setTimeout(gcRaiseDrawer, 80);   // React 渲染抽屉后再提一次层
+    return true;
+  }
+  $("gc-back").onclick = function () {
+    if (!gcOpenDrawer()) closePanel();   // 找不到系统按钮时退化为关闭群聊
+  };
+  // 抽屉里点私聊项 → 自动退出群聊视图，落到所选私聊
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    var sec = t && t.closest ? t.closest(".section-ac14ac") : null;
+    if (!sec || sec.closest("[data-gc-block]")) return;   // 群聊项走自身逻辑
+    var d = document.querySelector(".drawer-ac14ac");
+    var p = document.getElementById("gc-panel");
+    if (d && p && p.style.display === "flex") closePanel();
+  }, true);
   $("gc-title").onclick = function (e) { e.stopPropagation(); toggleSwi(); };
   $("gc-gear").onclick = openSettings;
   $("gc-send").onclick = sendCurrent;
