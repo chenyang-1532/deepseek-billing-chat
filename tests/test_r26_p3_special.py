@@ -45,7 +45,7 @@ nid = c.execute("SELECT napi_uid FROM gateway_map WHERE uid=?", (uid,)).fetchone
 if nid is None:   # 新注册用户尚未建档（首次走网关时才 provision），此处手动建档
     import importlib.util as _ilu
     spec0 = _ilu.spec_from_file_location("appmod0", "/tmp/chatsite-test/app.py")
-    m0 = importlib.util.module_from_spec(spec0)
+    m0 = _ilu.module_from_spec(spec0)
     spec0.loader.exec_module(m0)
     urow = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
     nid = m0.gw_provision({"id": uid, "username": U})[1]
