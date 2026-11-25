@@ -16,3 +16,4 @@ data.db-wal
 # 用户数据
 snapshots/
 gateway.on
+.local_test_admin_pw.txt
