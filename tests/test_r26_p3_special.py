@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """R26 P3 专项验证 v2：回复限流 30/时 + 页数封顶（进程内构造 page_count=30000）"""
-import json, sys, sqlite3, http.cookiejar, urllib.request, urllib.parse, urllib.error
+import json, sys, time, sqlite3, http.cookiejar, urllib.request, urllib.parse, urllib.error
 
 sys.path.insert(0, "/tmp/chatsite-test")
 BASE = "http://127.0.0.1:3100"
-TAG = "p3chk"
+TAG = "p3chk%d" % (int(time.time()) % 100000)
 U = "rttest%s_x" % TAG
 PW = "probetest12345"
 PASS, FAIL = [], []
