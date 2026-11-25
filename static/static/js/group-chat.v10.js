@@ -1,9 +1,12 @@
-/* Miandning AI 角色群聊（v31）——独立 overlay 模块
+/* Miandning AI 角色群聊（v32）——独立 overlay 模块
  * 不修改主 bundle 计费逻辑；群聊入口由主 bundle（main.fe540c10.js）侧栏按钮
  * 调用本模块暴露的 window.__gcOpenGroupChat() 打开（系统同款样式）。
  * 本文件作为新静态资源随 index.html 引用，更新时需改名（group-chat.v4.js）绕 immutable 缓存。
  * 数据面：群定义/群消息/群设置/角色记忆全部存服务端（/api/groups*），换设备一致；
  * 人设来源：云端会话（服务端 /api/personas，权威数据源）。
+ * v32 变更（站长反馈 2026-11-25）：
+ *  - 修复「切到私聊后再点左上角又冒出群聊页面」：抽屉里选中任何会话（私聊或群聊）
+ *    立即收起抽屉，避免抽屉滞留导致的连环误触
  * v31 变更（站长反馈 2026-11-25）：
  *  - 头部左上角改为系统同款三横按钮：点击拉起系统侧栏抽屉（提层盖在群聊上），
  *    在抽屉里可直接切私聊/其他群聊；点群聊项自动收抽屉直达该群；选私聊自动退出群聊视图
@@ -900,14 +903,17 @@
   $("gc-back").onclick = function () {
     if (!gcOpenDrawer()) closePanel();   // 找不到系统按钮时退化为关闭群聊
   };
-  // 抽屉里点私聊项 → 自动退出群聊视图，落到所选私聊
+  // 抽屉里点私聊项 → 自动退出群聊视图，落到所选私聊，并收起抽屉（v32 修复误触）
   document.addEventListener("click", function (e) {
     var t = e.target;
     var sec = t && t.closest ? t.closest(".section-ac14ac") : null;
     if (!sec || sec.closest("[data-gc-block]")) return;   // 群聊项走自身逻辑
     var d = document.querySelector(".drawer-ac14ac");
     var p = document.getElementById("gc-panel");
-    if (d && p && p.style.display === "flex") closePanel();
+    if (d && p && p.style.display === "flex") {
+      closePanel();
+      gcCloseDrawer();   // 选中即收抽屉，防止抽屉滞留引发下一次误触
+    }
   }, true);
   $("gc-title").onclick = function (e) { e.stopPropagation(); toggleSwi(); };
   $("gc-gear").onclick = openSettings;
