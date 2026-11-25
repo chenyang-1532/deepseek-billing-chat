@@ -1,9 +1,13 @@
-/* Miandning AI 角色群聊（v29）——独立 overlay 模块
+/* Miandning AI 角色群聊（v30）——独立 overlay 模块
  * 不修改主 bundle 计费逻辑；群聊入口由主 bundle（main.fe540c10.js）侧栏按钮
  * 调用本模块暴露的 window.__gcOpenGroupChat() 打开（系统同款样式）。
  * 本文件作为新静态资源随 index.html 引用，更新时需改名（group-chat.v4.js）绕 immutable 缓存。
  * 数据面：群定义/群消息/群设置/角色记忆全部存服务端（/api/groups*），换设备一致；
  * 人设来源：云端会话（服务端 /api/personas，权威数据源）。
+ * v30 变更（站长反馈 2026-11-25）：
+ *  - 头部左侧「←」返回箭头（对齐私聊返回交互）
+ *  - 点群名弹出群聊切换列表（面板内快速切群，无需退出再进）
+ *  - 接管浏览器/手机返回手势：返回键=退出群聊回到主界面，不丢页面
  * v29 变更（站长反馈 2026-11-25）：
  *  - 移除面板内部左侧群列表栏：聊天区全宽（与私聊一致），入口统一走主会话列表
  *    （群聊项混入）与侧栏「新建群聊」；右上角「关闭」退出
@@ -45,7 +49,21 @@
     "#gc-body{flex:1;display:flex;min-height:0}",
     "#gc-chatwrap{flex:1;display:flex;flex-direction:column;min-width:0;background:#f5f6f7}",
     "#gc-chathead{flex:none;display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid #e2e6ea;background:#fff}",
-    "#gc-chathead b{font-size:15px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    "#gc-chathead b{font-size:15px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;",
+    "cursor:pointer;position:relative}",
+    "#gc-back{flex:none;width:30px;height:30px;border:none;background:none;font-size:19px;line-height:1;",
+    "color:#0f172a;cursor:pointer;padding:0;border-radius:8px}",
+    "#gc-back:hover{background:#eef2f5}",
+    ".gc-swi{position:absolute;top:calc(100% + 8px);left:0;min-width:210px;max-width:78vw;background:#fff;",
+    "border:1px solid #e2e6ea;border-radius:10px;box-shadow:0 10px 34px rgba(15,23,42,.18);",
+    "z-index:70;max-height:300px;overflow-y:auto;padding:4px}",
+    ".gc-swi .si{display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:8px;cursor:pointer;font-size:13px}",
+    ".gc-swi .si:hover{background:#eef2ff}",
+    ".gc-swi .si.on{background:#e2e8f0}",
+    ".gc-swi .si .gav{width:26px;height:26px;border-radius:7px;background:#4f46e5;color:#fff;flex:none;",
+    "display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600}",
+    ".gc-swi .si .nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    ".gc-swi .si .ct{color:#94a3b8;font-size:11px;flex:none}",
     "#gc-msgs{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px}",
 "#gc-input{position:relative}",
 ".gc-mention{position:absolute;bottom:calc(100% + 6px);left:0;right:74px;background:#fff;",
@@ -223,7 +241,7 @@
   panel.innerHTML =
     '<div id="gc-body">' +
     '  <div id="gc-chatwrap">' +
-    '    <div id="gc-chathead"><b id="gc-title">角色群聊</b>' +
+    '    <div id="gc-chathead"><button id="gc-back" aria-label="返回">←</button><b id="gc-title" title="点击切换群聊">角色群聊</b>' +
     '      <button class="gc-btn ghost sm" id="gc-gear">群设置</button>' +
     '      <button class="gc-btn ghost sm" id="gc-close">关闭</button></div>' +
     '    <div id="gc-msgs"></div>' +
@@ -778,10 +796,43 @@
   gcRefreshSidebarGroups();
   setInterval(gcRefreshSidebarGroups, 60000);
 
+  // ---------- 群聊快速切换弹层（点群名弹出，v30） ----------
+  function hideSwi() {
+    var s = document.querySelector(".gc-swi");
+    if (s) s.remove();
+  }
+  function toggleSwi() {
+    var old = document.querySelector(".gc-swi");
+    if (old) { old.remove(); return; }
+    var b = $("gc-title");
+    if (!b) return;
+    var box = el("div", "gc-swi");
+    if (!groups.length) {
+      box.appendChild(el("div", "si", "还没有群聊"));
+    }
+    groups.forEach(function (g) {
+      var it = el("div", "si" + (g.id === currentGid ? " on" : ""));
+      it.appendChild(el("div", "gav", (g.name || "?").slice(0, 1)));
+      it.appendChild(el("div", "nm", g.name || "未命名群聊"));
+      it.appendChild(el("div", "ct", (g.member_count || 0) + " 人"));
+      it.onclick = function () {
+        hideSwi();
+        if (g.id !== currentGid) openGroup(g.id);
+      };
+      box.appendChild(it);
+    });
+    b.appendChild(box);
+  }
+  document.addEventListener("click", function (e) {
+    var s = document.querySelector(".gc-swi");
+    if (s && !s.contains(e.target) && e.target !== $("gc-title")) hideSwi();
+  });
+
   // ---------- 面板开关（入口：主 bundle 侧栏按钮 → window.__gcOpenGroupChat） ----------
   function openPanel(mode) {
     mask.style.display = "block";
     panel.style.display = "flex";
+    if (!gcHistOpen) { try { history.pushState({ gc: 1 }, ""); gcHistOpen = true; } catch (e) { /* 忽略 */ } }
     $("gc-create").style.display = "none";
     $("gc-settings").style.display = "none";
     if (!groups.length && !currentGid) renderEmpty();
@@ -794,16 +845,27 @@
       else openCreate();                                  // 兜底：直接进创建表单
     });
   }
-  function closePanel() {
+  function hidePanelDom() {
     mask.style.display = "none";
     panel.style.display = "none";
     $("gc-create").style.display = "none";
     $("gc-settings").style.display = "none";
+    hideSwi();
     gcRefreshSidebarGroups();   // 回到主界面时立刻刷新会话列表里的群聊预览
   }
+  var gcHistOpen = false;       // 已为本次群聊视图压入一条历史记录
+  function closePanel() {
+    if (gcHistOpen) { try { history.back(); } catch (e) { gcHistOpen = false; hidePanelDom(); } }
+    else hidePanelDom();
+  }
+  window.addEventListener("popstate", function () {
+    if (gcHistOpen) { gcHistOpen = false; hidePanelDom(); }
+  });
   window.__gcOpenGroupChat = openPanel;   // 主 bundle（fe540c10）侧栏入口调用
   mask.onclick = closePanel;
   $("gc-close").onclick = closePanel;
+  $("gc-back").onclick = closePanel;
+  $("gc-title").onclick = function (e) { e.stopPropagation(); toggleSwi(); };
   $("gc-gear").onclick = openSettings;
   $("gc-send").onclick = sendCurrent;
   textEl.addEventListener("keydown", function (e) {
