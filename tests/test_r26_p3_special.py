@@ -75,17 +75,18 @@ import importlib.util
 spec = importlib.util.spec_from_file_location("appmod", "/tmp/chatsite-test/app.py")
 appmod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(appmod)
-fake_resp = json.dumps({"id": "p3chk-cap-2", "page_count": 30000}).encode()
+FID = "p3chk-cap-%d" % (int(time.time()) % 1000000)
+fake_resp = json.dumps({"id": FID, "page_count": 30000}).encode()
 out = appmod._ocr_fee_charge(uid, nid, fake_resp, True, "big.pdf", b"PK")
-ck("响应原样透传（静默扣费）", json.loads(out).get("id") == "p3chk-cap-2", out[:80])
+ck("响应原样透传（静默扣费）", json.loads(out).get("id") == FID, out[:80])
 c2 = sqlite3.connect("/tmp/chatsite-test/data.db")
-row = c2.execute("SELECT cny, balance_cny, ref FROM wallet_tx WHERE uid=? AND ref='ocrfee:p3chk-cap-2'", (uid,)).fetchone()
+row = c2.execute("SELECT cny, balance_cny, ref FROM wallet_tx WHERE uid=? AND ref=?", (uid, 'ocrfee:'+FID)).fetchone()
 ck("扣费按封顶 5000 页 = -9.0 元", row is not None and abs(row[0] - (-9.0)) < 0.001, row)
 print("wallet_tx:", row)
 
 # 幂等复扣验证：同 file_id 再调一次不重复扣
 out2 = appmod._ocr_fee_charge(uid, nid, fake_resp, True, "big.pdf", b"PK")
-n = c2.execute("SELECT COUNT(*) FROM wallet_tx WHERE ref='ocrfee:p3chk-cap-2'").fetchone()[0]
+n = c2.execute("SELECT COUNT(*) FROM wallet_tx WHERE ref=?", ('ocrfee:'+FID,)).fetchone()[0]
 ck("同 file_id 幂等不重扣", n == 1, n)
 
 print("==== 结果: %d PASS / %d FAIL ====" % (len(PASS), len(FAIL)))
