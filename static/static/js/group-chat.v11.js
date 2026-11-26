@@ -804,7 +804,30 @@
   function gcSchedule() {
     if (gcPending) return;
     gcPending = true;
-    setTimeout(function () { gcPending = false; gcEnsureSidebar(); }, 60);
+    setTimeout(function () { gcPending = false; gcEnsureSidebar(); gcEnsureLogout(); }, 60);
+  }
+  // —— 手动退出登录（抽屉底栏上方固定项，v11） ——
+  function gcEnsureLogout() {
+    var s = document.querySelector(".drawer-ac14ac .sider-ac14ac");
+    var bar = s && s.querySelector(".bottom-ac14ac");
+    if (!bar || s.querySelector("[data-gc-logout]")) return;
+    var it = el("div");
+    it.setAttribute("data-gc-logout", "1");
+    it.style.cssText = "display:flex;align-items:center;gap:9px;padding:8px 14px;cursor:pointer;color:#64748b;" +
+      "border-top:1px solid #e2e8f0;flex:none";
+    var ic = el("div", null, "⎋");
+    ic.style.cssText = "width:28px;height:28px;border-radius:8px;background:#f1f5f9;color:#64748b;" +
+      "display:flex;align-items:center;justify-content:center;font-size:14px;flex:none";
+    var tx = el("div", null, "退出登录");
+    tx.style.cssText = "font-weight:600;font-size:13px";
+    it.appendChild(ic); it.appendChild(tx);
+    it.onclick = function () {
+      if (!confirm("确定退出当前账号？")) return;
+      var cb = document.querySelector('button[aria-label="Close sidebar"]');
+      if (cb) cb.click();
+      location.href = "/api/logout";
+    };
+    s.insertBefore(it, bar);
   }
   new MutationObserver(gcSchedule).observe(document.body, { childList: true, subtree: true });
   gcRefreshSidebarGroups();

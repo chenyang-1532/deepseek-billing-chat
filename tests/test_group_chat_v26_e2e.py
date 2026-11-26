@@ -313,14 +313,14 @@ if st3 == 200:
 check("全失败会话不入云端备份", st3 == 200 and SID_FAIL not in stored, (st3, SID_FAIL in stored))
 check("正常会话照常备份", st3 == 200 and SID_OK in stored, (st3, SID_OK in stored))
 
-# ── UI 入口：bundle fe540c12 + group-chat.v10 + index.html 同步（v27 UI 改造） ──
+# ── UI 入口：bundle fe540c12 + group-chat.v11 + index.html 同步（v27 UI 改造） ──
 b11 = os.path.join(STATIC_DIR, "static/js/main.fe540c12.js")
-v5 = os.path.join(STATIC_DIR, "static/js/group-chat.v10.js")
+v5 = os.path.join(STATIC_DIR, "static/js/group-chat.v11.js")
 idx = open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8").read()
 check("main.fe540c12.js 存在", os.path.exists(b11), b11)
-check("group-chat.v10.js 存在", os.path.exists(v5), v5)
+check("group-chat.v11.js 存在", os.path.exists(v5), v5)
 check("index.html 引用 fe540c12 + v5",
-      "main.fe540c12.js" in idx and "group-chat.v10.js" in idx, idx[:200])
+      "main.fe540c12.js" in idx and "group-chat.v11.js" in idx, idx[:200])
 check("index.html 不再引用 c10/v4",
       "main.fe540c10.js" not in idx and "group-chat.v5.js" not in idx, idx[:200])
 b11src = open(b11, encoding="utf-8").read()
@@ -361,6 +361,9 @@ check("v9 三横按钮 = 系统同款 SVG + 抽屉提层联动",
       and "drawerMask-ac14ac" in v5src and 'button[aria-label="Open sidebar"]' in v5src, "")
 check("v10 抽屉选中会话即收起（防连环误触）",
       "closePanel();\n      gcCloseDrawer();" in v5src, "")
+check("v11 抽屉底部退出登录项（手动退出）",
+      "gcEnsureLogout" in v5src and "data-gc-logout" in v5src
+      and "/api/logout" in v5src and "确定退出当前账号" in v5src, "")
 check("v6 无计费小字（前端文案清理）",
       all(k not in v5src for k in ("计费落账", "费用以钱包流水", "本轮群聊消耗")), "")
 app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
@@ -369,8 +372,8 @@ check("服务端已移除计费延迟小字",
       "计费落账有延迟" not in appsrc, "")
 st, raw = req(op1, "GET", "/static/js/main.fe540c12.js")
 check("站点可服务 fe540c12 bundle", st == 200 and len(raw) > 400000, (st, len(raw)))
-st, raw = req(op1, "GET", "/static/js/group-chat.v10.js")
-check("站点可服务 group-chat.v10.js", st == 200 and "__gcOpenGroupChat" in raw, (st, len(raw)))
+st, raw = req(op1, "GET", "/static/js/group-chat.v11.js")
+check("站点可服务 group-chat.v11.js", st == 200 and "__gcOpenGroupChat" in raw, (st, len(raw)))
 
 # ── 清理（双侧库零残留） ──
 def cleanup_pair(uid):
